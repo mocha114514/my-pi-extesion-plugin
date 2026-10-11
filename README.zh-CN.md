@@ -137,6 +137,42 @@ Token 用量、费用、每日汇总和模型价格编辑。
 
 已针对 Node.js 安装版 Pi 0.85.1 完成本地 loopback 合成验证，覆盖原生 provider 集成、取消、超时、连接隔离和 HTTP CONNECT 代理；仅包含生产依赖的插件副本也已通过 Pi 的真实扩展加载器验证，包括没有本地 Pi SDK，以及存在本地伪代理模块的场景。扩展从宿主安装目录解析 Pi 的公开代理辅助模块；宿主没有该模块时会明确报兼容性错误，不会绕过代理设置。独立可执行文件发行版以及真实官方／中转 API 尚未验证。服务端必须支持 Responses WebSocket。
 
+### Responses 官方网页搜索（`responses-OpenAI-offical-search`）
+
+开启 Responses API 的服务端内置 `web_search`，不是 Pi 执行的普通函数，也不调用独立搜索端点。它内部包含 `search`、`open_page`、`find_in_page` 操作，由模型和服务端支持情况决定，无需分别声明多个工具。`file_search` 和 `tool_search` 是其他能力，不随此插件开启。参见[官方网页搜索说明](https://developers.openai.com/api/docs/guides/tools-web-search)。
+
+插件在 `/m-mng` 中默认开启，但模型需要在 Pi 的 `models.json` 中显式写 **`"offical-search": true`**（保留这个拼写）。provider 和模型 ID 必须精确匹配；模型解析后的 API 必须已经是 `openai-responses`。不检查 provider 名称、域名、模型归属，也不预探测端点能力。
+
+已有模型可以合并到对应 provider 的 `modelOverrides`：
+
+```jsonc
+{
+  "providers": {
+    "example-provider": {
+      "modelOverrides": {
+        "existing-responses-model": {
+          "offical-search": true,
+          // Optional: the same request can use the responses-ws plugin.
+          "ws": true,
+        },
+      },
+    },
+  },
+}
+```
+
+自定义模型已在 `models[]` 中定义时，在该条目添加 `"offical-search": true`，保留其他 Pi 必需字段。同一模型的 `modelOverrides` 显式值优先，包括 `false`；未写关闭。支持 JSONC 注释与行尾逗号。配置出错时，本插件停止为该会话添加搜索，并给出不含凭据的错误提示；正常请求仍由 Pi 处理。
+
+- 每次请求都重新判断当前模型，切换后即时遵守新模型的标记。其他 API 和未标记模型不受影响。
+- 保留已有 Pi/MCP 工具、请求参数和 `tool_choice`。已有 `web_search`、预览版或日期版本配置时，保留其控制参数，不重复添加或替换。这里只开放能力，不强制模型执行搜索。
+- `ws: true` 时由现有 Responses WS 插件发送同一请求，否则保持 Pi 原传输。本插件不注册 provider 或本地执行工具，不替换全局 `fetch`，不预探测端点；服务端不支持工具时按正常路径报错。
+- 引用补全需要 **Pi 0.99.0 或更高版本**，以及能够发出 `provider_stream_event` 的 provider 适配器（Pi 内置 Responses 适配器支持）。插件在标准解析前只读收集引用，在最终消息中补成可点击 Markdown 链接；原始正文与 URL 引用元数据保留在文本块的 `mpepWebSearch` 字段。不把危险 URL 转为链接；引用区间不确定时，显示来源链接而不改写任意正文。
+- 引用按输出消息 ID 匹配，并按 provider、模型、会话隔离；本轮结束后清理。不会伪造 Pi 工具执行记录或搜索日志。其他消息内容、签名、用量与结束原因保持不变。
+- 修改 `models.json` 或通过 `/m-mng enable|disable responses-OpenAI-offical-search` 切换插件后，需要重启或 `/reload`。新启动子代理也默认加载此插件并遵守相同开关；已有子进程需重启才能应用加载变更。
+- 搜索由服务端执行，可能产生额外工具费用；Pi 原有的 Token 费用显示不等于包含搜索费的完整账单。
+
+已通过 87 项隔离的搜索/引用合成测试，包含 Pi 1.1.0 原生 HTTP/WS 流事件和真实 SessionManager 持久化验证；原有 WS 的 98 项回归也全部通过。代码块、引用式链接与回退来源的渲染行为使用宿主 TUI 的实际 Markdown 解析器验证。没有使用真实用户配置或付费端点。真实官方／中转 API、独立可执行文件发行版，以及不发出原始事件钩子的第三方适配器尚未验证。
+
 ### 快捷键优化
 
 - 取消了Ctrl+C清空输入框文本的行为。
@@ -166,7 +202,7 @@ pi remove git:github.com/mocha114514/better-pi-appearance
 
 | 指令                 | 用途                                |
 | -------------------- | ----------------------------------- |
-| `/m-mng`             | 启用和禁用扩展，包括 `responses-ws` |
+| `/m-mng`             | 启用和禁用扩展，包括 Responses WS 与网页搜索 |
 | `/m-mng list`        | 查看插件状态                        |
 | `/m-lgg`             | 中文/英文选择                       |
 | `/m-usg` / `/-usg n` | 查看用量与费用统计                  |

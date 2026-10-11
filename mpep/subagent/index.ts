@@ -69,6 +69,8 @@ export default function (pi: ExtensionAPI): void {
 	const compactForewarnPath = fileURLToPath(new URL("../compact-forewarn/index.ts", import.meta.url));
 	/** Each child owns its WS pool; the sibling's manager/model guards still apply. */
 	const responsesWsPath = fileURLToPath(new URL("../responses-ws/index.ts", import.meta.url));
+	/** Hosted search and citation repair keep the same opt-in rules in each child. */
+	const responsesSearchPath = fileURLToPath(new URL("../responses-OpenAI-offical-search/index.ts", import.meta.url));
 
 	let ctx: ExtensionContext | undefined;
 	let pool: InstancePool | undefined;
@@ -125,6 +127,7 @@ export default function (pi: ExtensionAPI): void {
 		const extensionPaths = new Set<string>([
 			compactForewarnPath,
 			responsesWsPath,
+			responsesSearchPath,
 		]);
 		for (const extension of agent.extensions) {
 			extensionPaths.add(path.resolve(cwd, extension));

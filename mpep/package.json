@@ -35,7 +35,8 @@
       "./export/index.ts",
       "./stderr-guard/index.ts",
       "./user-bubble/index.ts",
-      "./responses-ws/index.ts"
+      "./responses-ws/index.ts",
+      "./responses-OpenAI-offical-search/index.ts"
     ]
   }
 }

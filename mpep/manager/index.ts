@@ -23,6 +23,7 @@ const builtinIds = [
 	"stderr-guard",
 	"user-bubble",
 	"responses-ws",
+	"responses-OpenAI-offical-search",
 ] as const;
 
 // Lifecycle hooks: some plugins own files outside mpep-cache and must clean up

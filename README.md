@@ -137,6 +137,42 @@ For a model already supplied by a built-in provider, use `modelOverrides` rather
 
 Verified with local loopback synthetic tests against the Node.js installation of Pi 0.85.1, including native-provider integration, cancellation, timeouts, connection isolation, an HTTP CONNECT proxy, and production-only package copies loaded through Pi's actual extension loader (with no local Pi SDK and with an extension-local decoy helper). The extension resolves Pi's public proxy helper from the host installation; hosts without that helper report a compatibility error rather than bypassing proxy settings. Standalone executable distributions and real official/intermediary APIs have not been verified. The server must support Responses WebSocket.
 
+### Responses Official Web Search (`responses-OpenAI-offical-search`)
+
+Enables the Responses API's hosted `web_search` tool, not a Pi-executed function or a separate search endpoint. Its `search`, `open_page`, and `find_in_page` actions are managed by the model/server; no extra tool declarations are needed. `file_search` and `tool_search` are different capabilities and are not enabled here. See the [official web search guide](https://developers.openai.com/api/docs/guides/tools-web-search).
+
+The plugin is enabled by default in `/m-mng`, but individual models opt in with the intentionally spelled **`"offical-search": true`** in Pi's `models.json`. Provider and model IDs must match exactly. The resolved model API must already be `openai-responses`; provider names, domains, and model families are not checked or probed.
+
+For an existing model, merge this into its provider's `modelOverrides`:
+
+```jsonc
+{
+  "providers": {
+    "example-provider": {
+      "modelOverrides": {
+        "existing-responses-model": {
+          "offical-search": true,
+          // Optional: the same request can use the responses-ws plugin.
+          "ws": true,
+        },
+      },
+    },
+  },
+}
+```
+
+For a custom model already defined in `models[]`, add `"offical-search": true` to that entry; keep its other required Pi fields. An explicit `modelOverrides` value wins over the entry, including `false`. Missing means off. JSONC comments and trailing commas are accepted. Configuration errors disable this plugin's additions for that session, with a credential-blind diagnostic; the normal provider request remains Pi's responsibility.
+
+- Each request rechecks the selected model. Other APIs and unmarked models are unchanged.
+- Existing Pi/MCP tools, request parameters, and `tool_choice` are retained. An existing `web_search`/preview/versioned declaration is preserved with its controls, not duplicated or replaced. The plugin makes search available; it does not force the model to search.
+- `ws: true` uses the existing Responses WS transport; otherwise Pi's original transport is retained. This plugin registers neither a provider nor a client-executed tool, does not patch global `fetch`, and does not preflight endpoint capability. Unsupported tools fail through the provider normally.
+- URL citations require **Pi 0.99.0 or later** and a provider adapter that emits `provider_stream_event` (the built-in Responses adapter does). The plugin observes those events before normalization, then restores clickable Markdown links in the finalized message. Original source text and URL citation metadata are retained in the text block's `mpepWebSearch` field. Unsafe URLs are not made clickable; uncertain ranges use visible source links rather than rewriting arbitrary text.
+- Citation records are matched by output-message IDs and separated by provider/model/session, then cleared after the run. No synthetic Pi tool execution or search log is added. Other message content, signatures, usage, and stop reasons are preserved.
+- Changes to `models.json` or `/m-mng enable|disable responses-OpenAI-offical-search` require a restart or `/reload`. Newly started subagents also load this plugin and obey the same plugin/model rules; restart existing children to apply that change.
+- Search runs on the server and may incur tool charges. Pi's existing token-cost display is not a complete search-inclusive bill.
+
+Verified with 87 isolated synthetic search/citation tests, including Pi 1.1.0's native HTTP/WS stream hooks and actual SessionManager persistence, plus 98 existing WS regressions. Code/reference-link fallback behavior was checked with the host TUI's actual Markdown parser. No real user configuration or paid endpoint was used. Real official/intermediary APIs, standalone executable distributions, and third-party adapters without the raw event hook have not been verified.
+
 ### Keyboard Shortcuts
 
 - Ctrl+C no longer clears the input box text.
@@ -166,7 +202,7 @@ Then manually delete `~/.pi/agent/mpep-cache/` if you want a full cleanup.
 
 | Command              | Purpose                                                |
 | -------------------- | ------------------------------------------------------ |
-| `/m-mng`             | Enable or disable extensions, including `responses-ws` |
+| `/m-mng`             | Enable or disable extensions, including Responses WS and web search |
 | `/m-mng list`        | List plugin states                                     |
 | `/m-lgg`             | Chinese/English selection                              |
 | `/m-usg` / `/-usg n` | View usage and cost statistics                         |

@@ -124,5 +124,12 @@
     "path": "./responses-ws/index.ts",
     "desc": "仅对 openai-responses 且 ws: true 的模型启用 WS，沿用 Pi 的请求构造与响应解析",
     "enabled": true
+  },
+  {
+    "id": "responses-OpenAI-offical-search",
+    "name": "Responses 官方网页搜索",
+    "path": "./responses-OpenAI-offical-search/index.ts",
+    "desc": "仅对 openai-responses 且 offical-search: true 的模型开启内置网页搜索，并补全可点击引用",
+    "enabled": true
   }
 ]
