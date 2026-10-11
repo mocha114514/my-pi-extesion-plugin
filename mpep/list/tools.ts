@@ -115,6 +115,7 @@ export function registerListTools(
 		promptSnippet: "Create and update a persistent checklist with descriptions and enforced dependencies.",
 		promptGuidelines: [
 			"For multi-step work, create an ordered checklist, explicitly specify dependencies, and mark finished items complete as you work.",
+			"Numeric dotted IDs are displayed in hierarchical order; other IDs keep their positions.",
 			"Numbering and display order do not imply dependencies. Fill dependsOn explicitly.",
 		],
 		parameters: writeSchema,

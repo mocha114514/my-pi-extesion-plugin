@@ -1,7 +1,7 @@
 // Full plain-text rendering of a list.
 //
 // This is a view, not a summary and not a parser. List id, revision, title,
-// and every item in stored order are always present. Completed items use [x]
+// and every item in display order are always present. Completed items use [x]
 // and still include their description, dependencies, and blockers. Nothing is
 // truncated and completed rows are not collapsed.
 //
@@ -10,6 +10,7 @@
 // blockedBy comes from the model (direct incomplete dependencies only).
 
 import { blockedBy, type ListState } from "./model.ts";
+import { itemsInDisplayOrder } from "./order.ts";
 
 function quote(value: string): string {
 	return JSON.stringify(value);
@@ -24,7 +25,7 @@ export function formatList(state: ListState): string {
 	lines.push("items:");
 	const completion = new Map(state.items.map(item => [item.id, item.done] as const));
 
-	for (const item of state.items) {
+	for (const item of itemsInDisplayOrder(state.items)) {
 		const mark = item.done ? "x" : " ";
 		lines.push(`- [${mark}] ${quote(item.id)}`);
 		lines.push(`  title: ${quote(item.title)}`);

@@ -22,6 +22,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { t } from "../shared/i18n/index.ts";
 import { blockedBy, type ListItem, type ListState } from "./model.ts";
+import { itemsInDisplayOrder } from "./order.ts";
 
 /** Preferred frame width. The controller still clamps it to the screen. */
 export const PANEL_WIDTH = 64;
@@ -185,7 +186,7 @@ export class ListPanel implements Component {
 			lines.push("");
 		}
 		let index = 0;
-		for (const item of state.items) {
+		for (const item of itemsInDisplayOrder(state.items)) {
 			if (index > 0) lines.push("");
 			lines.push(...this.itemLines(state, item, inner, completion));
 			index += 1;
