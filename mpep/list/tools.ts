@@ -36,6 +36,11 @@ const writeSchema = Type.Object({
 		minLength: 1,
 		description: [
 			"Required for create; the overall goal is fixed for the lifetime of this checklist. Paragraphs are allowed.",
+			"Because this goal cannot be edited after creation, write it carefully, completely and accurately.",
+			"Create the checklist and write its goal only after all necessary discussion and clarification are complete,",
+			"the user has confirmed the overall objective and key requirements, and explicitly authorized work to begin.",
+			"Discussion, comparison of options, or agreement with an idea is not by itself authorization to start work.",
+			"If questions that could affect the goal remain unresolved, ask the user and do not create the checklist yet.",
 			"Before creating the checklist and starting execution, record the overall task, core requirements, expected outcomes,",
 			"scope and boundaries, constraints, acceptance criteria, and completion or convergence conditions",
 			"already discussed and confirmed with the user.",
@@ -134,8 +139,12 @@ export function registerListTools(
 		].join(" "),
 		promptSnippet: "Create and update a persistent checklist anchored to a confirmed overall goal, with descriptions and enforced dependencies.",
 		promptGuidelines: [
-			"For multi-step work, clarify and confirm the overall task with the user, then create an ordered checklist " +
-				"with a self-contained goal before starting execution. Put detailed tasks in items and specify dependencies explicitly.",
+			"For multi-step work, complete necessary discussion and clarification, confirm the overall task and key requirements " +
+				"with the user, and obtain explicit authorization to begin work before creating the checklist or starting execution. " +
+				"Only then create an ordered checklist with a carefully written, complete, accurate and self-contained goal; " +
+				"put detailed tasks in items and specify dependencies explicitly.",
+			"Discussion, option comparison, or agreement with an idea alone is not authorization to begin work. " +
+				"If goal-affecting questions remain unresolved, ask the user and do not create the checklist yet.",
 			"After context compaction, revisit the overall goal and use list_read for the live checklist; " +
 				"do not let a local problem or an old snapshot redefine the task.",
 			"Mark items complete only after their actual work is done. Before completing the final item, " +
