@@ -20,6 +20,7 @@ const builtinIds = [
 	"export",
 	"theme-distributor",
 	"compact-forewarn",
+	"drop-useless-reasoning-item-before-compact",
 	"stderr-guard",
 	"user-bubble",
 	"responses-ws",

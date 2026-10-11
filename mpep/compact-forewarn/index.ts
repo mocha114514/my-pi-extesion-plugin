@@ -5,6 +5,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { t } from "../shared/i18n/index.ts";
+import { buildCompactionCompletedNotice, NativeCompactionContinuation } from "./continuation.ts";
 
 /**
  * Compact Forewarn (/m-ask)
@@ -100,6 +101,8 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	let compactionStarted = false;
 	let pendingInstructions: string | undefined;
 	let marginTokens = DEFAULT_MARGIN_TOKENS;
+	let requestedCompactionAborted = false;
+	const nativeContinuation = new NativeCompactionContinuation();
 
 	const thresholdFor = (contextWindow: number, cwd?: string): number =>
 		contextWindow - getCompactionReserveTokens(cwd) - marginTokens;
@@ -116,6 +119,8 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	const startQueuedCompaction = (ctx: { isIdle(): boolean; compact: ExtensionContext["compact"] }) => {
 		if (!pending || compactionStarted || !ctx.isIdle()) return;
 		compactionStarted = true;
+		requestedCompactionAborted = false;
+		nativeContinuation.cancel();
 		const customInstructions = pendingInstructions;
 		pendingInstructions = undefined;
 		try {
@@ -124,16 +129,14 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 				onComplete: () => {
 					resetCompactionRequest();
 					pi.sendUserMessage(
-						`[System Notice: Context compaction has completed successfully at ${new Date().toISOString()}. ` +
-							"Any compaction forewarning (<system-reminder> about an approaching context limit) with an " +
-							"earlier timestamp still visible in the kept history is now OBSOLETE — do not call " +
-							"request_compaction again unless the extension issues a brand-new forewarning. Please review " +
-							"your previous plan and resume your remaining work seamlessly.]",
+						buildCompactionCompletedNotice(new Date().toISOString()),
 						{ deliverAs: "followUp" },
 					);
 				},
 				onError: () => {
 					resetCompactionRequest();
+					// A cancelled compaction must not undo the user's interruption.
+					if (requestedCompactionAborted) return;
 					// The requesting run already terminated, so nothing would wake the
 					// agent up otherwise (in practice it used to linger until some
 					// unrelated notification happened to trigger a turn). Resume with a
@@ -232,11 +235,46 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 
 	pi.on("session_start", () => {
 		armed = false;
+		requestedCompactionAborted = false;
 		resetCompactionRequest();
+		nativeContinuation.reset();
 	});
 
-	pi.on("agent_settled", (_event, ctx) => {
-		startQueuedCompaction(ctx);
+	pi.on("agent_start", () => {
+		nativeContinuation.cancel();
+	});
+	pi.on("message_start", (event) => {
+		if (event.message.role === "user" || event.message.role === "assistant") {
+			nativeContinuation.cancel();
+		}
+	});
+	pi.on("input", (event) => nativeContinuation.handleInput(event.source, event.text));
+	pi.on("turn_end", (event) => {
+		// Observe the raw completed response even if a later boundary handler
+		// omits it. Length is a continuation signal, not a cleanup condition.
+		nativeContinuation.recordTurn(event.message, TOOL_NAME);
+	});
+
+	pi.on("agent_settled", (event, ctx) => {
+		// SDK 0.85.1 lacks this newer flag; Pi 1.1.0 supplies it at runtime.
+		const aborted = "aborted" in event && event.aborted === true;
+		if (aborted) {
+			nativeContinuation.cancel();
+			resetCompactionRequest();
+			return;
+		}
+		if (pending) {
+			startQueuedCompaction(ctx);
+			return;
+		}
+		// Do not add a native wake when an older runtime cannot confirm the
+		// cancellation outcome. Its existing queued-request path still works.
+		const notice = nativeContinuation.takeNoticeAtSettlement({
+			aborted: !("aborted" in event && event.aborted === false),
+			idle: ctx.isIdle(),
+			hasPendingMessages: ctx.hasPendingMessages(),
+		}, new Date().toISOString());
+		if (notice) pi.sendUserMessage(notice, { deliverAs: "followUp" });
 	});
 
 	pi.on("tool_execution_end", (_event, ctx) => {
@@ -265,11 +303,21 @@ export default function compactForewarn(pi: ExtensionAPI): void {
 	// A failed or aborted one only drops the queued request; `armed` stays set so
 	// the forewarn is not re-sent immediately (the tool itself remains callable
 	// at any time, so the model can retry on its own).
-	pi.on("session_compact", () => {
+	pi.on("session_compact", (event) => {
+		// Native compaction can preempt a queued request before ctx.compact()
+		// starts; capture that case before clearing the cross-plugin slot.
+		const requestQueued = pending && !compactionStarted;
+		nativeContinuation.observeCompaction({
+			id: event.compactionEntry.id,
+			reason: event.reason,
+			willRetry: event.willRetry,
+		}, requestQueued);
 		armed = false;
 		resetCompactionRequest();
 	});
-	pi.on("session_compact_failed", () => {
+	pi.on("session_compact_failed", (event) => {
+		if (compactionStarted) requestedCompactionAborted = event.aborted;
+		nativeContinuation.cancel();
 		resetCompactionRequest();
 	});
 }

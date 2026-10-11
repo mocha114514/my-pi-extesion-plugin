@@ -87,7 +87,14 @@
     "id": "compact-forewarn",
     "name": "压缩前问询与主动压缩 (/m-ask)",
     "path": "./compact-forewarn/index.ts",
-    "desc": "临近窗口上限时提前注入英文提醒，让 AI 收尾原子工作后主动触发压缩；AI 也可在里程碑或任务节点随时自由调用",
+    "desc": "临近窗口上限时提前提醒，支持 AI 在安全节点主动压缩；原生自动压缩后仅在需要续跑且 Pi 未自行继续时补发引导",
+    "enabled": true
+  },
+  {
+    "id": "drop-useless-reasoning-item-before-compact",
+    "name": "压缩前纯思考残留清理",
+    "path": "./drop-useless-reasoning-item-before-compact/index.ts",
+    "desc": "在回合结束时扫描有效上下文，省略只有思考且无正文、工具调用或其他输出的响应；保留原始记录，不自动重试",
     "enabled": true
   },
   {

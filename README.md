@@ -48,6 +48,18 @@ After every successful context compaction, the extension appends one **full chec
 
 `list_write` supports `create`, `append`, `update`, and `complete`; only `create` accepts `goal`. `list_read` always returns the entire checklist, including the full goal and completed work. The extension enforces a valid non-empty goal and dependency rules; the AI remains responsible for accurately recording the user's confirmed objective and verifying that the actual work and overall acceptance criteria are satisfied. Toggle the plugin independently through `/m-mng`.
 
+### Context Compaction
+
+`compact-forewarn` provides an early warning and the `request_compaction` tool so the AI can compact at a safe milestone. Successful native automatic compaction also receives the same English continuation guide when the final response was truncated or native compaction preempted a queued tool request, and Pi has not already resumed or arranged a retry. The guide is delivered once at settlement, not during the active run. Manual compaction, normal completed answers, and cancelled runs do not start an extra response.
+
+### Thinking-only Response Cleanup
+
+`drop-useless-reasoning-item-before-compact` is enabled by default and has its own `/m-mng` switch. After each completed model/tool turn, it scans the **full effective context**, including older retained history, and omits whole assistant responses containing only thinking and empty/whitespace text. Stop reasons do not matter. Nonempty body text, tool calls, any other output, and all non-assistant messages are preserved.
+
+Omissions are persisted as native context edits: original session records stay inspectable, while subsequent model requests and compaction retention use the edited context. Cleanup never retries the model or forces compaction. If cleanup makes compaction unnecessary, no compaction-completion guide is sent. The two plugins are independent.
+
+Requires Pi's editable boundary/context-edit support (verified with **Pi 1.1.0**); unsupported runtimes warn once per session and leave history unchanged. After first enabling the plugin for an uncleaned old session, complete one ordinary reply, for example: **“Reply 收到 only; do not use tools or modify files.”** Cleanup runs when that turn ends, so the first request may still contain old data. A direct `/compact` or pre-prompt compaction before that first boundary is not pre-cleaned.
+
 ### Turn Navigator
 
 Adds a navigator on the right side to quickly review each round's user prompt and jump to it with a click.

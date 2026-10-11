@@ -31,6 +31,7 @@
       "./theme-distributor.ts",
       "./usage/index.ts",
       "./compact-forewarn/index.ts",
+      "./drop-useless-reasoning-item-before-compact/index.ts",
       "./subagent/index.ts",
       "./export/index.ts",
       "./stderr-guard/index.ts",
