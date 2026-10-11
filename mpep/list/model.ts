@@ -32,21 +32,34 @@ export interface ListItemInput {
 	dependsOn?: string[];
 }
 
-export interface ListState {
-	schemaVersion: 1;
+interface ListStateFields {
 	id: string;
 	title: string;
 	revision: number;
 	items: ListItem[];
 }
 
-const LIST_FIELDS = new Set([
+// Only historical v1 records may omit the goal. Keeping this distinction makes
+// a missing goal in a modern saved list an error, not a silent legacy fallback.
+export type ListState = ListStateFields & (
+	| {
+		schemaVersion: 1;
+		goal?: never;
+	}
+	| {
+		schemaVersion: 2;
+		goal: string;
+	}
+);
+
+const LEGACY_LIST_FIELDS = new Set([
 	"schemaVersion",
 	"id",
 	"title",
 	"revision",
 	"items",
 ]);
+const LIST_FIELDS = new Set([...LEGACY_LIST_FIELDS, "goal"]);
 
 const ITEM_FIELDS = new Set([
 	"id",
@@ -74,7 +87,7 @@ function assertFields(
 	}
 }
 
-// allowMultiline is only for descriptions. Titles and ids are single line
+// Goals and descriptions allow paragraphs. Titles and ids are single line
 // because they are also printed as identifiers.
 function assertSafeText(value: string, label: string, allowMultiline: boolean): void {
 	for (let index = 0; index < value.length; index += 1) {
@@ -127,7 +140,14 @@ function nextRevision(revision: number): number {
 }
 
 function assertSchema(state: ListState): void {
-	if (state.schemaVersion !== 1) fail("List schemaVersion must be 1");
+	if (state.schemaVersion !== 1 && state.schemaVersion !== 2) {
+		fail("List schemaVersion must be 1 or 2");
+	}
+	if (state.schemaVersion === 2) {
+		requireText(state.goal, "List goal", false, true);
+	} else if (state.goal !== undefined) {
+		fail("Legacy lists cannot contain a goal");
+	}
 	if (!Array.isArray(state.items)) fail("List items must be an array");
 }
 
@@ -160,18 +180,23 @@ function sealItem(item: ListItem): ListItem {
 function sealState(parts: {
 	id: string;
 	title: string;
+	goal?: string;
 	revision: number;
 	items: readonly ListItem[];
 }): ListState {
 	const items: ListItem[] = parts.items.map(sealItem);
 	Object.freeze(items);
-	const sealed: ListState = {
-		schemaVersion: 1,
+	const fields: ListStateFields = {
 		id: parts.id,
 		title: parts.title,
 		revision: parts.revision,
 		items,
 	};
+	// Legacy mutations retain their missing-goal status instead of inventing
+	// a goal or promoting the record to the modern, goal-required format.
+	const sealed: ListState = parts.goal === undefined
+		? { ...fields, schemaVersion: 1 }
+		: { ...fields, schemaVersion: 2, goal: parts.goal };
 	Object.freeze(sealed);
 	return sealed;
 }
@@ -291,9 +316,15 @@ function findIndex(state: ListState, itemId: string): number {
 	return index;
 }
 
-export function createList(id: string, title: string, items: ListItemInput[]): ListState {
+export function createList(
+	id: string,
+	title: string,
+	goal: string,
+	items: ListItemInput[],
+): ListState {
 	const listId = requireText(id, "List id", false, false);
 	const listTitle = requireText(title, "List title", false, false);
+	const listGoal = requireText(goal, "List goal", false, true);
 	if (!Array.isArray(items)) fail("List items must be an array");
 	if (items.length === 0) fail("List must contain at least one item");
 	const materialized = items.map(readInput);
@@ -301,6 +332,7 @@ export function createList(id: string, title: string, items: ListItemInput[]): L
 	return sealState({
 		id: listId,
 		title: listTitle,
+		goal: listGoal,
 		revision: 1,
 		items: materialized,
 	});
@@ -316,6 +348,7 @@ export function appendItems(state: ListState, items: ListItemInput[]): ListState
 	return sealState({
 		id: state.id,
 		title: state.title,
+		goal: state.goal,
 		revision: nextRevision(state.revision),
 		items: nextItems,
 	});
@@ -365,6 +398,7 @@ export function updateItem(
 	return sealState({
 		id: state.id,
 		title: state.title,
+		goal: state.goal,
 		revision: nextRevision(state.revision),
 		items,
 	});
@@ -396,6 +430,7 @@ export function completeItem(state: ListState, itemId: string): ListState {
 	return sealState({
 		id: state.id,
 		title: state.title,
+		goal: state.goal,
 		revision: nextRevision(state.revision),
 		items,
 	});
@@ -403,16 +438,27 @@ export function completeItem(state: ListState, itemId: string): ListState {
 
 export function parseListState(value: unknown): ListState {
 	if (!isRecord(value)) fail("List state must be an object");
-	assertFields(value, LIST_FIELDS, "list");
-	if (value.schemaVersion !== 1) fail("List schemaVersion must be 1");
+	assertFields(value, value.schemaVersion === 1 ? LEGACY_LIST_FIELDS : LIST_FIELDS, "list");
+	if (value.schemaVersion !== 1 && value.schemaVersion !== 2) {
+		fail("List schemaVersion must be 1 or 2");
+	}
 	const id = requireText(value.id, "List id", false, false);
 	const title = requireText(value.title, "List title", false, false);
+	const goal = value.schemaVersion === 2
+		? requireText(value.goal, "List goal", false, true)
+		: undefined;
 	const revision = readRevision(value.revision);
 	if (!Array.isArray(value.items)) fail("List items must be an array");
 	if (value.items.length === 0) fail("List must contain at least one item");
 	const items = value.items.map(readStoredItem);
 	validateGraph(items);
-	return sealState({ id, title, revision, items });
+	return sealState({
+		id,
+		title,
+		goal,
+		revision,
+		items,
+	});
 }
 
 // Direct incomplete dependencies, in dependsOn order. A missing id counts as

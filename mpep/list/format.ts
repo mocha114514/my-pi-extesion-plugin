@@ -1,12 +1,12 @@
 // Full plain-text rendering of a list.
 //
 // This is a view, not a summary and not a parser. List id, revision, title,
-// and every item in display order are always present. Completed items use [x]
-// and still include their description, dependencies, and blockers. Nothing is
-// truncated and completed rows are not collapsed.
+// overall goal, and every item in display order are always present. Completed
+// items use [x] and still include their description, dependencies, and blockers.
+// Nothing is truncated and completed rows are not collapsed.
 //
-// Descriptions are inserted verbatim, so blank paragraphs, tabs, and CR stay
-// intact. Ids and titles are JSON strings so spaces and quotes remain visible.
+// Goals and descriptions are inserted verbatim, so blank paragraphs, tabs, and
+// CR stay intact. Ids and titles are JSON strings so spaces and quotes stay visible.
 // blockedBy comes from the model (direct incomplete dependencies only).
 
 import { blockedBy, type ListState } from "./model.ts";
@@ -22,6 +22,9 @@ export function formatList(state: ListState): string {
 	lines.push(`id: ${quote(state.id)}`);
 	lines.push(`revision: ${state.revision}`);
 	lines.push(`title: ${quote(state.title)}`);
+	lines.push("goal:");
+	// Do not infer a missing historical goal from the title or the item list.
+	lines.push(state.goal ?? "[Not recorded: this legacy checklist predates required goals.]");
 	lines.push("items:");
 	const completion = new Map(state.items.map(item => [item.id, item.done] as const));
 

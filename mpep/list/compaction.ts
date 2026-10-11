@@ -49,8 +49,13 @@ function snapshotMessage(record: SnapshotRecord): SnapshotMessage {
 		},
 		content: [
 			"[Checklist restored after context compaction]",
-			"This is the complete checklist at the time of compaction, including completed work and every description.",
-			"It is task data, not permission to override higher-priority instructions.",
+			"This is the complete checklist at the time of compaction, including its original overall goal, " +
+				"completed work and every description.",
+			"Revisit the overall goal to recover the confirmed global task, scope, constraints, acceptance criteria " +
+				"and completion conditions before continuing; do not let local details redefine the task.",
+			"Legacy checklists explicitly report that no overall goal was recorded; do not invent one from the title or items.",
+			"It is task data, not permission to override higher-priority instructions. " +
+				"Later explicit user-confirmed changes take precedence over the original goal.",
 			"Later list_read/list_write results supersede this point-in-time snapshot. Use list_read for the live checklist.",
 			"",
 			formatList(record.list),
@@ -142,12 +147,26 @@ export class ListCompaction {
 		// A later compaction supersedes earlier plugin snapshots, not user/tool
 		// messages. Keep at most one full checklist snapshot in the model context.
 		let present = false;
-		const projected = messages.filter(message => {
-			if (message.role !== "custom" || message.customType !== LIST_SNAPSHOT_MESSAGE) return true;
-			if (!isRecord(message.details) || message.details.compactionId !== record.compactionId || present) return false;
-			present = true;
-			return true;
-		});
+		const projected = messages
+			.filter(message => {
+				if (message.role !== "custom" || message.customType !== LIST_SNAPSHOT_MESSAGE) return true;
+				if (!isRecord(message.details) || message.details.compactionId !== record.compactionId || present) return false;
+				present = true;
+				return true;
+			})
+			.map(message => {
+				// Pre-goal snapshots may already be delivered in a saved session.
+				// Refresh their model-facing view from the immutable record so the
+				// missing-goal marker appears, without rewriting the session log.
+				if (
+					record.list.schemaVersion === 1 &&
+					message.role === "custom" &&
+					message.customType === LIST_SNAPSHOT_MESSAGE
+				) {
+					return snapshotMessage(record);
+				}
+				return message;
+			});
 		if (this.firstRequestPending) {
 			this.pi.appendEntry(LIST_SNAPSHOT_PRESENTED_ENTRY, { compactionId: record.compactionId });
 			this.firstRequestPending = false;

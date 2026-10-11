@@ -32,6 +32,24 @@ const writeSchema = Type.Object({
 		Type.Literal("complete"),
 	]),
 	title: Type.Optional(Type.String({ description: "List title for create, or replacement item title for update." })),
+	goal: Type.Optional(Type.String({
+		minLength: 1,
+		description: [
+			"Required for create; the overall goal is fixed for the lifetime of this checklist. Paragraphs are allowed.",
+			"Before creating the checklist and starting execution, record the overall task, core requirements, expected outcomes,",
+			"scope and boundaries, constraints, acceptance criteria, and completion or convergence conditions",
+			"already discussed and confirmed with the user.",
+			"Write a thorough, precise, self-contained account of the global goal, standards, and execution guidance,",
+			"not detailed subtasks, procedural steps, or progress notes; put those in items.",
+			"Do not merely repeat the title, enumerate the items, refer to earlier discussion without restating its requirements,",
+			"or present unconfirmed assumptions as agreed requirements.",
+			"This field preserves the original confirmed objective across repeated context compactions,",
+			"preventing ambiguity, omissions, distortion, and drift into local problems or intermediate results.",
+			"Revisit it when recovering context, advancing work, and deciding whether the whole task is finished,",
+			"rather than relying only on the current item or recent conversation.",
+			"Later explicit user-confirmed changes take precedence over this original record; never infer or silently redefine the overall goal.",
+		].join(" "),
+	})),
 	items: Type.Optional(Type.Array(itemSchema, {
 		minItems: 1,
 		description: "Ordered new items, required for create and append. Creation always starts with unfinished items.",
@@ -65,7 +83,7 @@ function renderResult(
 
 function validateWriteArguments(params: Static<typeof writeSchema>): void {
 	const fields: Record<typeof params.action, readonly string[]> = {
-		create: ["action", "title", "items"],
+		create: ["action", "title", "goal", "items"],
 		append: ["action", "items"],
 		update: ["action", "itemId", "title", "description", "dependsOn"],
 		complete: ["action", "itemId"],
@@ -93,7 +111,7 @@ function summary(state: ListState): string {
 	return [
 		`Checklist ${state.id}, revision ${state.revision}: ${done}/${state.items.length} completed.`,
 		ready.length > 0 ? `Ready items: ${ready.map(item => item.id).join(", ")}.` : "No unblocked unfinished items.",
-		"Completed items and descriptions are retained. Use list_read to inspect the complete checklist.",
+		"The overall goal, completed items and descriptions are retained. Use list_read to inspect the complete checklist.",
 	].join("\n");
 }
 
@@ -107,14 +125,22 @@ export function registerListTools(
 		label: "List Write",
 		description: [
 			"Maintain a persistent, ordered checklist with explanatory descriptions and explicit prerequisite IDs.",
-			"create requires title and items; append requires items; update requires itemId and changed title/description/dependsOn; complete requires itemId.",
+			"create requires title, goal and items; append requires items;",
+			"update requires itemId and changed title/description/dependsOn; complete requires itemId.",
+			"Every new checklist needs a self-contained, user-confirmed overall goal; it remains fixed until the checklist is replaced.",
 			"Only mark an item complete after its actual work and all prerequisites are finished.",
 			"All updates are atomic. Invalid/missing/cyclic dependencies are rejected. An unfinished checklist cannot be replaced.",
-			"Descriptions and completed items remain available until a completed checklist is replaced with a new one.",
+			"The overall goal, descriptions and completed items remain available until a completed checklist is replaced with a new one.",
 		].join(" "),
-		promptSnippet: "Create and update a persistent checklist with descriptions and enforced dependencies.",
+		promptSnippet: "Create and update a persistent checklist anchored to a confirmed overall goal, with descriptions and enforced dependencies.",
 		promptGuidelines: [
-			"For multi-step work, create an ordered checklist, explicitly specify dependencies, and mark finished items complete as you work.",
+			"For multi-step work, clarify and confirm the overall task with the user, then create an ordered checklist " +
+				"with a self-contained goal before starting execution. Put detailed tasks in items and specify dependencies explicitly.",
+			"After context compaction, revisit the overall goal and use list_read for the live checklist; " +
+				"do not let a local problem or an old snapshot redefine the task.",
+			"Mark items complete only after their actual work is done. Before completing the final item, " +
+				"verify the overall outcome against the goal's acceptance criteria and completion conditions, " +
+				"accounting for later explicit user-confirmed changes.",
 			"Numeric dotted IDs are displayed in hierarchical order; other IDs keep their positions.",
 			"Numbering and display order do not imply dependencies. Fill dependsOn explicitly.",
 		],
@@ -131,10 +157,14 @@ export function registerListTools(
 					if (previous && !isComplete(previous)) {
 						throw new Error("Finish the existing checklist before creating another one.");
 					}
-					if (params.title === undefined || params.items === undefined) {
-						throw new Error("create requires title and items.");
+					if (
+						params.title === undefined ||
+						params.goal === undefined ||
+						params.items === undefined
+					) {
+						throw new Error("create requires title, goal and items.");
 					}
-					next = createList(randomUUID(), params.title, params.items);
+					next = createList(randomUUID(), params.title, params.goal, params.items);
 					break;
 				}
 				case "append":
@@ -167,8 +197,14 @@ export function registerListTools(
 	pi.registerTool<typeof readSchema, ListToolDetails>({
 		name: "list_read",
 		label: "List Read",
-		description: "Read the FULL current checklist, including every completed item, all description paragraphs, explicit dependencies and blocking IDs. State survives context compaction. Never infer the live state solely from an older compaction snapshot.",
-		promptSnippet: "Inspect the full checklist, including completed work and dependencies, even after compaction.",
+		description: [
+			"Read the FULL current checklist, including its complete overall goal, every completed item,",
+			"all description paragraphs, explicit dependencies and blocking IDs. State survives context compaction.",
+			"Legacy checklists explicitly report that no overall goal was recorded.",
+			"Revisit the goal to recover the global task and standards;",
+			"never infer the live state solely from an older compaction snapshot.",
+		].join(" "),
+		promptSnippet: "Inspect the full checklist and its overall goal, including completed work and dependencies, even after compaction.",
 		parameters: readSchema,
 		executionMode: "sequential",
 		async execute(_id, _params, signal, _update, ctx) {

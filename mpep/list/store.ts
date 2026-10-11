@@ -1,6 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isComplete, parseListState, type ListState } from "./model.ts";
 
+// Keep the session entry tag stable so historical and modern payloads share
+// one authoritative stream. ListState.schemaVersion distinguishes their shape.
 export const LIST_STATE_ENTRY = "mpep.list.state.v1";
 type SessionReader = Pick<ExtensionContext["sessionManager"], "getEntries">;
 
@@ -44,6 +46,9 @@ export class ListStore {
 		if (next === previous) return;
 		if (previous && next.id !== previous.id && !isComplete(previous)) {
 			throw new Error("Cannot replace the checklist while it still contains unfinished items.");
+		}
+		if (previous && next.id === previous.id && next.goal !== previous.goal) {
+			throw new Error("The checklist goal is fixed at creation and cannot be changed.");
 		}
 		// Do not acknowledge success or repaint a mutation whose persistence failed.
 		this.persist(next);

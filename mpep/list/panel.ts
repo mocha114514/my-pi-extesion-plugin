@@ -169,22 +169,28 @@ export class ListPanel implements Component {
 	}
 
 	private bodyLines(state: ListState | undefined, inner: number): string[] {
-		if (!state || state.items.length === 0) {
-			const lines: string[] = [];
-			if (state && state.title.trim().length > 0) {
-				lines.push(...this.wrapped(state.title, inner, "text"));
-				lines.push("");
-			}
-			lines.push(...this.wrapped(t("list.empty"), inner, "dim"));
-			return lines;
-		}
+		if (!state) return this.wrapped(t("list.empty"), inner, "dim");
 
 		const lines: string[] = [];
-		const completion = new Map(state.items.map(item => [item.id, item.done] as const));
 		if (state.title.trim().length > 0) {
 			lines.push(...this.wrapped(state.title, inner, "text"));
 			lines.push("");
 		}
+		// The global goal is separate from item descriptions and uses the same
+		// full-text wrapping and scrolling; it is never replaced by a summary.
+		lines.push(...this.wrapped(t("list.goal"), inner, "accent"));
+		lines.push(...this.wrapped(
+			state.goal ?? t("list.goalMissing"),
+			inner,
+			state.goal === undefined ? "warning" : "muted",
+		));
+		lines.push("");
+		if (state.items.length === 0) {
+			lines.push(...this.wrapped(t("list.empty"), inner, "dim"));
+			return lines;
+		}
+
+		const completion = new Map(state.items.map(item => [item.id, item.done] as const));
 		let index = 0;
 		for (const item of itemsInDisplayOrder(state.items)) {
 			if (index > 0) lines.push("");
