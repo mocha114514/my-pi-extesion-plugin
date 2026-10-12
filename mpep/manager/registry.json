@@ -133,6 +133,13 @@
     "enabled": true
   },
   {
+    "id": "retry-error-normalizer",
+    "name": "重试错误识别适配",
+    "path": "./retry-error-normalizer/index.ts",
+    "desc": "仅适配已确认的 Responses WS 中断报错，保留原文并交给 Pi 原有请求重试；不处理输出长度停止",
+    "enabled": true
+  },
+  {
     "id": "responses-OpenAI-offical-search",
     "name": "Responses 官方网页搜索",
     "path": "./responses-OpenAI-offical-search/index.ts",

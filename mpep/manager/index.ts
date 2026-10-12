@@ -24,6 +24,7 @@ const builtinIds = [
 	"stderr-guard",
 	"user-bubble",
 	"responses-ws",
+	"retry-error-normalizer",
 	"responses-OpenAI-offical-search",
 ] as const;
 

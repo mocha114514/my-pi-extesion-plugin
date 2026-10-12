@@ -39,6 +39,8 @@ export const en = {
   "responsesSearch.sources": "Sources",
   "plugin.responses-ws.name": "Responses WebSocket transport",
   "plugin.responses-ws.desc": "Uses WS only for openai-responses models with ws: true; preserves Pi's request building and response parsing",
+  "plugin.retry-error-normalizer.name": "Retry error classification",
+  "plugin.retry-error-normalizer.desc": "Normalizes the known Responses WS interruption for Pi's existing request retry, preserving the original error; leaves output-length stops unchanged",
   "responsesWs.configFailed": "Responses WS configuration could not be loaded: {error}",
   "responsesWs.conflict": "Responses WS was not enabled for {provider}: another extension already owns this provider. Its registration was left unchanged.",
   "responsesWs.noModel": "Responses WS was not enabled for {provider}: no configured ws: true model uses openai-responses.",

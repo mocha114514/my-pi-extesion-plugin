@@ -40,6 +40,8 @@ export const zhCN = {
   "responsesSearch.sources": "来源",
   "plugin.responses-ws.name": "Responses WebSocket 传输",
   "plugin.responses-ws.desc": "仅对 openai-responses 且 ws: true 的模型启用 WS，沿用 Pi 的请求构造与响应解析",
+  "plugin.retry-error-normalizer.name": "重试错误识别适配",
+  "plugin.retry-error-normalizer.desc": "仅适配已确认的 Responses WS 中断报错，保留原文并交给 Pi 原有请求重试；不处理输出长度停止",
   "responsesWs.configFailed": "Responses WS 配置读取失败：{error}",
   "responsesWs.conflict": "未为 {provider} 启用 Responses WS：其他扩展已接管此 provider，已保留其注册不变。",
   "responsesWs.noModel": "未为 {provider} 启用 Responses WS：没有配置 ws: true 且使用 openai-responses 的模型。",
