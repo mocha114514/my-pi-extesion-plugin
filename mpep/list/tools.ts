@@ -152,6 +152,11 @@ export function registerListTools(
 				"accounting for later explicit user-confirmed changes.",
 			"Numeric dotted IDs are displayed in hierarchical order; other IDs keep their positions.",
 			"Numbering and display order do not imply dependencies. Fill dependsOn explicitly.",
+			"Keep each checklist focused on its confirmed overall goal and within a reasonable, manageable size; " +
+				"do not append items endlessly to a single checklist. When every item of the current checklist is " +
+				"complete and the user raises a new request whose task is clearly distinct from that finished " +
+				"checklist's goal, leave the completed checklist behind and create a fresh checklist with its own " +
+				"confirmed goal instead of extending the old one.",
 		],
 		parameters: writeSchema,
 		executionMode: "sequential",
