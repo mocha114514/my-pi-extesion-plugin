@@ -198,7 +198,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		for (const m of crossed) firedMilestones.add(m);
 		const percent = Math.round(crossed[crossed.length - 1] * 100);
 		injectReminder(
-			`Context usage has crossed ${percent}% of the effective compaction window ` +
+			`Context usage has reached about ${percent}% of the configured context window ` +
 			`(${usage.tokens.toLocaleString("en-US")} / ${effectiveWindow.toLocaleString("en-US")} tokens)`,
 		);
 	};
@@ -299,7 +299,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		// re-inject the current tips immediately and let milestones fire again
 		// as the context grows back.
 		firedMilestones.clear();
-		injectReminder("A context compaction just completed; these are your current session reminders");
+		injectReminder("This is the post-compaction reminder: the context was just compacted");
 	});
 
 	const dispose = () => {
