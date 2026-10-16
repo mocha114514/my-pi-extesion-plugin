@@ -20,7 +20,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { t } from "../shared/i18n/index.ts";
+import { getLocale, t } from "../shared/i18n/index.ts";
 import { blockedBy, type ListItem, type ListState } from "./model.ts";
 import { itemsInDisplayOrder } from "./order.ts";
 
@@ -66,6 +66,14 @@ export class ListPanel implements Component {
 	private width = PANEL_WIDTH;
 	private scrollOffset = 0;
 	private listId: string | undefined;
+	// Building the body is the expensive part: every item is cleaned, wrapped,
+	// and painted, and wheel events, renders, and repositioning all need the
+	// result. store.read() returns the same object until a commit replaces it,
+	// so (state, width, theme, locale) is a sound key; scrolling then only
+	// moves the viewport over these cached lines instead of rebuilding them.
+	private bodyCache:
+		| { state: ListState | undefined; width: number; theme: Theme; locale: string; lines: string[] }
+		| undefined;
 
 	constructor(readState: () => ListState | undefined, theme: () => Theme) {
 		this.readState = readState;
@@ -81,8 +89,9 @@ export class ListPanel implements Component {
 	}
 
 	invalidate(): void {
-		// There is no line cache. Scroll belongs to the list the user is
+		// Drop the cached body lines. Scroll belongs to the list the user is
 		// reading, so a theme change must not send them back to the top.
+		this.bodyCache = undefined;
 	}
 
 	render(width: number): string[] {
@@ -139,7 +148,7 @@ export class ListPanel implements Component {
 
 	private measure(state: ListState | undefined): number {
 		if (this.width < 2) return 0;
-		return this.bodyLines(state, this.width - 2).length;
+		return this.body(state, this.width - 2).length;
 	}
 
 	private layout(width: number): string[] {
@@ -149,7 +158,7 @@ export class ListPanel implements Component {
 		if (width <= 0) return [];
 
 		const inner = width - 2;
-		const body = inner > 0 ? this.bodyLines(state, inner) : [];
+		const body = inner > 0 ? this.body(state, inner) : [];
 		const frame = this.frame(body.length);
 		this.clamp(body.length, frame.viewport);
 		if (frame.height <= 0) return [];
@@ -166,6 +175,24 @@ export class ListPanel implements Component {
 			const right = index === 0 ? "╮" : index === lines.length - 1 ? "╯" : "│";
 			return this.seal(line, width, right);
 		});
+	}
+
+	private body(state: ListState | undefined, width: number): string[] {
+		const theme = this.theme();
+		const locale = getLocale();
+		const cached = this.bodyCache;
+		if (
+			cached &&
+			cached.state === state &&
+			cached.width === width &&
+			cached.theme === theme &&
+			cached.locale === locale
+		) {
+			return cached.lines;
+		}
+		const lines = this.bodyLines(state, width);
+		this.bodyCache = { state, width, theme, locale, lines };
+		return lines;
 	}
 
 	private bodyLines(state: ListState | undefined, inner: number): string[] {
