@@ -88,6 +88,9 @@ interface WrapPieceCopy {
 	part: number;
 	partCount: number;
 	full: boolean;
+	/** Stream selection columns, so a partial first/last row can slice the payload. */
+	start: number;
+	end: number;
 	slice: string;
 }
 
@@ -412,6 +415,8 @@ function planBlocks(
 					part: wrap.part,
 					partCount: wrap.partCount,
 					full,
+					start,
+					end,
 					slice,
 				});
 				continue;
@@ -442,6 +447,8 @@ function planBlocks(
 			part: wrap.part,
 			partCount: wrap.partCount,
 			full: stream.start <= row.parsed.origin && stream.end >= wrapContentEnd(row.line),
+			start: stream.start,
+			end: stream.end,
 			slice: streamCopy(row.line, row.row, selection, columns),
 		});
 	}
@@ -492,6 +499,106 @@ function groupIsComplete(group: readonly FramePieceCopy[], source: string[] | un
 	return group.every(
 		(piece, index) => piece.full && piece.part === index && piece.src === first.src && piece.id === first.id,
 	);
+}
+
+/**
+ * Rejoin a partially covered wrap group into one logical line.
+ *
+ * The complete-group check above is all-or-nothing: a drag that starts or ends
+ * inside a soft-wrapped paragraph fails it, and every visual row would copy as
+ * a hard line. Here the covered rows are joined through the wrap payload
+ * instead: middle rows are whole by construction, and only the first/last
+ * covered rows are sliced, at the exact stream columns of the drag.
+ *
+ * Returns undefined when the payload cannot be matched safely; the caller then
+ * keeps the per-row slices. Frame-embedded prose keeps per-row slices too: its
+ * columns are clipped to the frame inner box, which the payload knows nothing
+ * about.
+ */
+function rejoinWrapGroup(
+	lines: readonly string[],
+	group: readonly WrapPieceCopy[],
+	text: string,
+): string | undefined {
+	if (group.length < 2) return undefined;
+	const first = group[0];
+	const last = group[group.length - 1];
+	if (!first || !last) return undefined;
+	// The group must be a contiguous run of wrap parts of one logical line.
+	for (let index = 0; index < group.length; index++) {
+		if (group[index]?.part !== first.part + index) return undefined;
+	}
+	// Middle rows must be fully covered; anything else is not a stream drag.
+	for (let index = 1; index < group.length - 1; index++) {
+		if (!group[index]?.full) return undefined;
+	}
+
+	// Visible text of each covered row after its marker prefix: this is the
+	// substring the row occupies inside the payload.
+	const partTexts: string[] = [];
+	const origins: number[] = [];
+	for (const piece of group) {
+		const line = lines[piece.row] ?? "";
+		const parsed = parseSelectionMarkers(line);
+		if (parsed.frame || parsed.wrap?.id !== first.id) return undefined;
+		const cleaned = stripTerminalSequences(stripSelectionMarkers(line));
+		const partText = sliceByColumn(cleaned, parsed.origin, visibleWidth(cleaned) - parsed.origin, true).trimEnd();
+		if (partText === "") return undefined;
+		partTexts.push(partText);
+		origins.push(parsed.origin);
+	}
+
+	// Locate every covered part inside the payload. The group may start in the
+	// middle of the logical line, so the first part is searched for; repeated
+	// phrases are disambiguated by picking the occurrence from which all
+	// remaining parts match sequentially. Wrap points consume the break
+	// whitespace, so later parts match after skipping spaces.
+	const matchFrom = (candidate: number): number[] | undefined => {
+		const starts: number[] = [candidate];
+		let pointer = candidate + (partTexts[0]?.length ?? 0);
+		for (const partText of partTexts.slice(1)) {
+			while (text[pointer] === " ") pointer += 1;
+			if (!text.startsWith(partText, pointer)) return undefined;
+			starts.push(pointer);
+			pointer += partText.length;
+		}
+		return starts;
+	};
+	let starts: number[] | undefined;
+	let candidate = text.indexOf(partTexts[0] ?? "");
+	while (candidate !== -1) {
+		starts = matchFrom(candidate);
+		if (starts) break;
+		candidate = text.indexOf(partTexts[0] ?? "", candidate + 1);
+	}
+	if (!starts) return undefined;
+
+	// Character offset covering `column` visible cells of a part (wide-char safe).
+	const charOffset = (partText: string, column: number): number => {
+		if (column <= 0) return 0;
+		return sliceByColumn(partText, 0, column, true).length;
+	};
+
+	const firstStart = starts[0] ?? 0;
+	const lastStart = starts[starts.length - 1] ?? 0;
+	const lastText = partTexts[partTexts.length - 1] ?? "";
+	const payloadStart = first.full
+		? firstStart
+		: firstStart + charOffset(partTexts[0] ?? "", first.start - (origins[0] ?? 0));
+	const payloadEnd = last.full
+		? lastStart + lastText.length
+		: lastStart + charOffset(lastText, last.end - (origins[origins.length - 1] ?? 0));
+	if (payloadEnd < payloadStart) return undefined;
+
+	let result = text.slice(payloadStart, payloadEnd);
+	if (payloadStart === 0) {
+		// Same prefix rule as the complete path: padding/bullets belong to the
+		// first visual line only, and a frame owns its own border.
+		const head = lines[first.row] ?? "";
+		const prefix = parseSelectionMarkers(head).frame ? "" : wrapPrefix(head);
+		result = prefix + result;
+	}
+	return expandCopiedText(result).replace(/\r$/, "");
 }
 
 function collapsePieces(lines: readonly string[], pieces: readonly CopyPiece[]): string[] {
@@ -560,6 +667,13 @@ function collapsePieces(lines: readonly string[], pieces: readonly CopyPiece[]):
 				const prefix = parseSelectionMarkers(head).frame ? "" : wrapPrefix(head);
 				collapsed.push(expandCopiedText(prefix + text).replace(/\r$/, ""));
 				continue;
+			}
+			if (text !== undefined) {
+				const rejoined = rejoinWrapGroup(lines, group, text);
+				if (rejoined !== undefined) {
+					collapsed.push(rejoined);
+					continue;
+				}
 			}
 			for (const part of group) collapsed.push(part.slice);
 			continue;
