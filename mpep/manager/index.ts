@@ -26,6 +26,7 @@ const builtinIds = [
 	"responses-ws",
 	"retry-error-normalizer",
 	"responses-OpenAI-offical-search",
+	"tips",
 ] as const;
 
 // Lifecycle hooks: some plugins own files outside mpep-cache and must clean up

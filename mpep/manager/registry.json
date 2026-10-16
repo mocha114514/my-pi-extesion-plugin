@@ -145,5 +145,12 @@
     "path": "./responses-OpenAI-offical-search/index.ts",
     "desc": "仅对 openai-responses 且 offical-search: true 的模型开启内置网页搜索，并补全可点击引用",
     "enabled": true
+  },
+  {
+    "id": "tips",
+    "name": "会话级提醒本 (Tips) (/m-tips)",
+    "path": "./tips/index.ts",
+    "desc": "AI 可写入的会话级提醒本：在有效压缩窗口 25%/50%/75% 及压缩成功后自动伴随注入，不触发新回合",
+    "enabled": true
   }
 ]

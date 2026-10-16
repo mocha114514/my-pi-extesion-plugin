@@ -38,7 +38,8 @@
       "./user-bubble/index.ts",
       "./responses-ws/index.ts",
       "./retry-error-normalizer/index.ts",
-      "./responses-OpenAI-offical-search/index.ts"
+      "./responses-OpenAI-offical-search/index.ts",
+      "./tips/index.ts"
     ]
   }
 }

@@ -218,4 +218,9 @@ export const zhCN = {
   "stderr.empty": "当前没有任何被拦截的 stderr 输出，系统运行良好。",
   "subagent.indicator": "{count} 个子代理",
   "subagent.overlayTitle": "子代理",
+  "plugin.tips.name": "会话级提醒本 (Tips) (/m-tips)",
+  "plugin.tips.desc": "AI 可写入的会话级提醒本：在有效压缩窗口 25%/50%/75% 及压缩成功后自动伴随注入，不触发新回合",
+  "tips.command": "查看当前会话记录的会话级提醒 (tips)",
+  "tips.empty": "当前会话还没有记录任何 tips。",
+  "tips.list": "当前会话 tips：\n{tips}",
 } as const satisfies Record<keyof typeof en, string>;

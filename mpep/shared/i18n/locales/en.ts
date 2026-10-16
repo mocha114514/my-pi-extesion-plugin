@@ -217,4 +217,9 @@ export const en = {
   "stderr.empty": "No stderr output has been captured. System is clean.",
   "subagent.indicator": "{count} subagents",
   "subagent.overlayTitle": "Subagents",
+  "plugin.tips.name": "Session-level Reminder Notebook (/m-tips)",
+  "plugin.tips.desc": "AI-writable session reminder notebook: auto-injected as passive context at 25%/50%/75% of the effective compaction window and after each successful compaction, never triggering a turn",
+  "tips.command": "Show the session-level reminders (tips) recorded for this session",
+  "tips.empty": "No tips recorded for this session yet.",
+  "tips.list": "Session tips:\n{tips}",
 } as const;
