@@ -534,6 +534,32 @@ export class StylizedDesignEditor extends CustomEditor {
 			return;
 		}
 
+		// 10. Left/Right with an internal selection: collapse the selection to its edge (Left ->
+		// selection start, Right -> selection end) instead of letting the base editor move one
+		// grapheme from the current cursor position, mirroring desktop editors. Keybinding-aware
+		// matching keeps user-remapped cursor keys consistent.
+		if (this.internalSelection) {
+			const range = this.getInternalSelectionRange();
+			const isLeft =
+				this.editorKeybindings.matches(data, "tui.editor.cursorLeft") || matchesKey(data, "left");
+			const isRight =
+				this.editorKeybindings.matches(data, "tui.editor.cursorRight") || matchesKey(data, "right");
+			if (range && (isLeft || isRight)) {
+				const target = isLeft
+					? { line: range.startLine, col: range.startCol }
+					: { line: range.endLine, col: range.endCol };
+				this.internalSelection = null;
+				(this as any).state.cursorLine = target.line;
+				if (typeof (this as any).setCursorCol === "function") {
+					(this as any).setCursorCol(target.col);
+				} else {
+					(this as any).state.cursorCol = target.col;
+				}
+				tui?.requestRender?.();
+				return;
+			}
+		}
+
 		// Any key that reaches the base editor (cursor moves, history navigation, etc.) collapses
 		// the internal selection first, mirroring desktop editors. (The copy/cut/delete paths above
 		// already cleared it through clearActiveSelection / deleteSelectionRange.)
