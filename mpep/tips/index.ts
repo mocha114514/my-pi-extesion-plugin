@@ -13,9 +13,10 @@ import { t } from "../shared/i18n/index.ts";
 /**
  * Tips (/m-tips)
  *
- * A session-scoped "reminder notebook" for the AI. The AI records durable,
- * whole-session reminders via the `tips` tool (add / list / update / remove);
- * the user inspects them with /m-tips. Tips never change on their own.
+ * A session-scoped "reminder notebook" for the AI. At the user's request,
+ * the AI records durable, whole-session reminders via the `tips` tool
+ * (add / list / update / remove); the user inspects them with /m-tips. Tips
+ * never change on their own.
  *
  * Delivery: at 25% / 50% / 75% of the EFFECTIVE compaction window
  * (contextWindow - compaction.reserveTokens, i.e. the point where Pi actually
@@ -110,7 +111,7 @@ function buildReminder(state: TipsState, reason: string, issuedAt: string): stri
 		"Session reminders (tips):",
 		...lines,
 		"",
-		"You can manage these reminders at any time with the `tips` tool (add / list / update / remove).",
+		"These reminders were recorded at the user's request; manage them with the `tips` tool (add / list / update / remove) only when the user asks.",
 		"</system-reminder>",
 	].join("\n");
 }
@@ -208,7 +209,10 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		label: "Tips",
 		description:
 			"Manage session-level reminders that stay in effect for the whole session. " +
-			"Use this to record durable notes to your future self (e.g. \"do not over-test\", " +
+			"IMPORTANT: only call this tool when the user explicitly asks you to record " +
+			"certain points or items into tips; by default you must NOT call it on your " +
+			"own initiative. " +
+			"When the user asks, use this to record durable notes (e.g. \"do not over-test\", " +
 			"\"always summarize in Chinese\") that must survive context compaction. " +
 			"The tips extension re-injects all current reminders into your context at 25% / 50% / 75% " +
 			"of the compaction window and right after every successful compaction, so they are never forgotten.",
