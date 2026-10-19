@@ -9,6 +9,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { t } from "../shared/i18n/index.ts";
+import { getCacheDir } from "../shared/paths.ts";
 
 /**
  * Tips (/m-tips)
@@ -30,6 +31,12 @@ import { t } from "../shared/i18n/index.ts";
  * Persistence: every mutation snapshots the full state into a custom session
  * entry (never sent to the LLM), so tips survive /reload, session resume and
  * context compaction; session_start rebuilds the state from the latest entry.
+ *
+ * Seed tips: the user may hand-write default tips as unordered-list items
+ * ("- ..." or "* ...") in mpep-cache/tips/Tips.md. Every FRESH session (one
+ * without a prior tips snapshot) loads them as its initial tips and injects
+ * them immediately. The file is read-only: AI-side add / update / remove
+ * never writes back to it.
  */
 
 const COMMAND = "m-tips";
@@ -134,6 +141,25 @@ const TipsParams = Type.Object({
 });
 type TipsArgs = Static<typeof TipsParams>;
 
+/**
+ * Reads user-authored seed tips from mpep-cache/tips/Tips.md: every
+ * unordered-list item ("- ..." or "* ...") becomes one tip; all other lines
+ * are ignored. Returns [] when the file is missing or unreadable, so a
+ * session without a seed file behaves exactly as before.
+ */
+function loadSeedTips(): string[] {
+	let markdown: string;
+	try {
+		markdown = readFileSync(join(getCacheDir(), "tips", "Tips.md"), "utf8");
+	} catch {
+		return [];
+	}
+	return markdown
+		.split(/\r?\n/)
+		.map(line => /^\s*[-*]\s+(.*)$/.exec(line)?.[1]?.trim() ?? "")
+		.filter(Boolean);
+}
+
 export default function tipsExtension(pi: ExtensionAPI): void {
 	installations[SLOT]?.();
 	if (!isPluginEnabled("tips")) return;
@@ -145,7 +171,8 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 
 	const persist = () => pi.appendEntry(ENTRY_TYPE, state);
 
-	const bind = (ctx: ExtensionContext) => {
+	/** Rebuilds state for ctx's session; returns true when seed tips were loaded. */
+	const bind = (ctx: ExtensionContext): boolean => {
 		sessionId = ctx.sessionManager.getSessionId();
 		firedMilestones.clear();
 		state = emptyState();
@@ -161,7 +188,25 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 				// A corrupt snapshot must not break the session; start fresh instead.
 				state = emptyState();
 			}
+			return false;
 		}
+		// Fresh session (no snapshot): seed the notebook from
+		// mpep-cache/tips/Tips.md so the user's default tips are present from
+		// the very first turn.
+		const seeds = loadSeedTips();
+		if (seeds.length === 0) return false;
+		const now = new Date().toISOString();
+		state = {
+			tips: seeds.map((content, index) => ({
+				id: index + 1,
+				content,
+				createdAt: now,
+				updatedAt: now,
+			})),
+			nextId: seeds.length + 1,
+		};
+		persist();
+		return true;
 	};
 
 	const ensureBound = (ctx: ExtensionContext) => {
@@ -282,7 +327,13 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
-		if (active) bind(ctx);
+		if (!active) return;
+		// Seed tips only exist on a fresh session; inject them right away so the
+		// model sees them from the first request instead of waiting for the
+		// 25% context milestone.
+		if (bind(ctx)) {
+			injectReminder("This is the session-start reminder: default tips were loaded from the user's mpep-cache/tips/Tips.md seed file");
+		}
 	});
 	pi.on("session_shutdown", () => {
 		// A session switch can reuse this extension instance; drop the old binding
