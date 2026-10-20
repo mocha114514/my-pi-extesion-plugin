@@ -64,6 +64,7 @@ export function installListWidget(ctx: ExtensionContext, readState: () => ListSt
 			close();
 			return;
 		}
+		panel.resetView();
 		options = { margin: 0, minWidth: 1, nonCapturing: true };
 		if (!position()) {
 			options = undefined;

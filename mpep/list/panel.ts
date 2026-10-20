@@ -8,7 +8,8 @@
 //
 // Scroll is counted in rendered lines, not items, and it is remembered for
 // the current list id. Completing an item keeps the position (clamped if the
-// text got shorter). A different list id starts at the top again.
+// text got shorter). Opening the popup or switching list ids resets the
+// viewport and folds the overall goal and every item.
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
@@ -34,6 +35,10 @@ const STRIKE_ON = "\x1b[9m";
 const STRIKE_OFF = "\x1b[29m";
 
 type Ink = Parameters<Theme["fg"]>[0];
+
+type FoldTarget =
+	| { kind: "goal" }
+	| { kind: "item"; id: string };
 
 function columns(value: number): number {
 	if (!Number.isFinite(value)) return 0;
@@ -66,11 +71,17 @@ export class ListPanel implements Component {
 	private width = PANEL_WIDTH;
 	private scrollOffset = 0;
 	private listId: string | undefined;
+	private goalExpanded = false;
+	private readonly expandedItems = new Set<string>();
+	// Body-relative title rows share the wrapped-line cache. Mouse coordinates
+	// are translated through scrollOffset, so wrapped and scrolled titles work.
+	private readonly titleRows = new Map<number, FoldTarget>();
 	// Building the body is the expensive part: every item is cleaned, wrapped,
 	// and painted, and wheel events, renders, and repositioning all need the
 	// result. store.read() returns the same object until a commit replaces it,
-	// so (state, width, theme, locale) is a sound key; scrolling then only
-	// moves the viewport over these cached lines instead of rebuilding them.
+	// so (state, width, theme, locale) is a sound key while fold state is
+	// unchanged. Toggling a section invalidates the cache; scrolling only moves
+	// the viewport over these cached lines instead of rebuilding them.
 	private bodyCache:
 		| { state: ListState | undefined; width: number; theme: Theme; locale: string; lines: string[] }
 		| undefined;
@@ -94,6 +105,14 @@ export class ListPanel implements Component {
 		this.bodyCache = undefined;
 	}
 
+	/** Fold all sections on each popup visit without touching checklist data. */
+	resetView(): void {
+		this.goalExpanded = false;
+		this.expandedItems.clear();
+		this.scrollOffset = 0;
+		this.invalidate();
+	}
+
 	render(width: number): string[] {
 		const given = columns(width);
 		const used = this.configured ? Math.min(this.allocatedWidth, given) : given;
@@ -112,7 +131,31 @@ export class ListPanel implements Component {
 			return { handled: true, focus: false, render: true };
 		}
 		if (event.type === "click") {
-			// A click on the body must not dismiss the panel or focus it.
+			if (
+				event.button === "left" && !event.shift && !event.alt && !event.ctrl &&
+				(event.clickCount ?? 1) === 1
+			) {
+				const state = this.readState();
+				this.sync(state);
+				const body = this.measure(state);
+				const { viewport } = this.frame(body);
+				this.clamp(body, viewport);
+				const inside = event.x > 0 && event.x < this.width - 1 &&
+					event.y > 0 && event.y <= viewport;
+				const target = inside ? this.titleRows.get(this.scrollOffset + event.y - 1) : undefined;
+				if (target) {
+					if (target.kind === "goal") {
+						this.goalExpanded = !this.goalExpanded;
+					} else if (this.expandedItems.has(target.id)) {
+						this.expandedItems.delete(target.id);
+					} else {
+						this.expandedItems.add(target.id);
+					}
+					this.invalidate();
+					return { handled: true, focus: false, render: true };
+				}
+			}
+			// Borders, details, and modified clicks neither dismiss nor focus it.
 			return { handled: true, focus: false, render: false };
 		}
 		// press / drag / release / move stay with the renderer so a drag can
@@ -128,7 +171,7 @@ export class ListPanel implements Component {
 		const id = state?.id;
 		if (id === this.listId) return;
 		this.listId = id;
-		this.scrollOffset = 0;
+		this.resetView();
 	}
 
 	private frame(bodyLength: number): { height: number; viewport: number } {
@@ -196,6 +239,7 @@ export class ListPanel implements Component {
 	}
 
 	private bodyLines(state: ListState | undefined, inner: number): string[] {
+		this.titleRows.clear();
 		if (!state) return this.wrapped(t("list.empty"), inner, "dim");
 
 		const lines: string[] = [];
@@ -203,14 +247,23 @@ export class ListPanel implements Component {
 			lines.push(...this.wrapped(state.title, inner, "text"));
 			lines.push("");
 		}
-		// The global goal is separate from item descriptions and uses the same
-		// full-text wrapping and scrolling; it is never replaced by a summary.
-		lines.push(...this.wrapped(t("list.goal"), inner, "accent"));
-		lines.push(...this.wrapped(
-			state.goal ?? t("list.goalMissing"),
+		const goalTitle = this.wrapped(
+			`${this.goalExpanded ? "▾" : "▸"} ${t("list.goal")}`,
 			inner,
-			state.goal === undefined ? "warning" : "muted",
-		));
+			"accent",
+		);
+		for (let row = 0; row < goalTitle.length; row += 1) {
+			this.titleRows.set(lines.length + row, { kind: "goal" });
+		}
+		lines.push(...goalTitle);
+		// Folding is presentation-only: expanding still wraps the complete goal.
+		if (this.goalExpanded) {
+			lines.push(...this.wrapped(
+				state.goal ?? t("list.goalMissing"),
+				inner,
+				state.goal === undefined ? "warning" : "muted",
+			));
+		}
 		lines.push("");
 		if (state.items.length === 0) {
 			lines.push(...this.wrapped(t("list.empty"), inner, "dim"));
@@ -221,7 +274,7 @@ export class ListPanel implements Component {
 		let index = 0;
 		for (const item of itemsInDisplayOrder(state.items)) {
 			if (index > 0) lines.push("");
-			lines.push(...this.itemLines(state, item, inner, completion));
+			lines.push(...this.itemLines(state, item, inner, completion, lines.length));
 			index += 1;
 		}
 		return lines;
@@ -236,9 +289,12 @@ export class ListPanel implements Component {
 		item: ListItem,
 		inner: number,
 		completion: ReadonlyMap<string, boolean>,
+		firstRow: number,
 	): string[] {
+		const expanded = this.expandedItems.has(item.id);
+		const disclosure = this.paint("dim", expanded ? "▾" : "▸");
 		const mark = item.done ? "[x]" : "[ ]";
-		const prefix = `${this.paint(item.done ? "dim" : "success", mark)} `;
+		const prefix = `${disclosure} ${this.paint(item.done ? "dim" : "success", mark)} `;
 		const gutter = visibleWidth(prefix);
 		// The stable id stays visible, including on a struck completed row.
 		// Numbering is not implied by order, so the id is not optional chrome.
@@ -247,6 +303,11 @@ export class ListPanel implements Component {
 				? `${STRIKE_ON}${this.paint("dim", line)}${STRIKE_OFF}`
 				: this.paint("text", line),
 		);
+
+		for (let row = 0; row < lines.length; row += 1) {
+			this.titleRows.set(firstRow + row, { kind: "item", id: item.id });
+		}
+		if (!expanded) return lines;
 
 		// Completed descriptions stay in full. They are dimmed, not struck
 		// through, and blank paragraphs are real rows.
