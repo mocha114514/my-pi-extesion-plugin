@@ -6,20 +6,41 @@ export interface TurnAnchor {
 
 /** Columns occupied by the right-side turn rail. Matches the single-cell ─ / ═ markers. */
 export const NAVIGATOR_COLUMNS = 1;
+const TURN_GROUP_SIZE = 5;
+
+// Numbers are zero-based turn indices; strings are non-interactive separator digits.
+export type NavigationMarker = number | string;
+
+export function navigationMarkers(count: number): NavigationMarker[] {
+	const markers: NavigationMarker[] = [];
+	for (let index = 0; index < count; index++) {
+		markers.push(index);
+		const turn = index + 1;
+		if (turn < count && turn % TURN_GROUP_SIZE === 0) {
+			markers.push(...String(turn));
+		}
+	}
+	return markers;
+}
 
 /**
- * Rows a complete marker list needs: one line per turn plus the top/bottom arrows.
+ * Rows a complete marker list needs: one per turn and separator digit, plus both arrows.
  * Zero markers means "no lower bound" so an empty index keeps the default band.
  */
 function bandRows(count: number): number {
-	return count > 0 ? count + 2 : 0;
+	if (count <= 0) return 0;
+	let rows = count + 2;
+	for (let turn = TURN_GROUP_SIZE; turn < count; turn += TURN_GROUP_SIZE) {
+		rows += String(turn).length;
+	}
+	return rows;
 }
 
 /**
  * Vertical slice of the transcript viewport occupied by the rail.
  *
  * Few turns: the middle-lower half of the viewport, unchanged. From the point where
- * every marker already has its own line, the band grows one row per extra turn so the
+ * every marker already has its own line, the band grows with turns and label digits so the
  * markers stay individually clickable, up to the whole viewport height; only past that
  * limit does markerRows() window the list and the wheel take over.
  */
@@ -55,14 +76,25 @@ export function activeTurn(anchors: readonly TurnAnchor[], scrollTop: number, vi
 	return Math.max(0, low - 1);
 }
 
-export function markerRows(count: number, height: number, start = 0): Map<number, number> {
+export function markerRows(
+	markers: readonly NavigationMarker[],
+	height: number,
+	start = 0,
+): Map<number, NavigationMarker> {
 	const slots = Math.max(0, height - 2);
-	const visible = Math.min(count, slots);
-	const first = Math.max(0, Math.min(start, count - visible));
-	const result = new Map<number, number>();
-	for (let index = 0; index < visible; index++) {
-		const row = visible === 1 ? 1 + Math.floor((slots - 1) / 2) : 1 + Math.round((index * (slots - 1)) / (visible - 1));
-		result.set(row, first + index);
+	const visible = Math.min(markers.length, slots);
+	const first = Math.max(0, Math.min(start, markers.length - visible));
+	const window = markers.slice(first, first + visible);
+	const result = new Map<number, NavigationMarker>();
+	const groups = window.filter((marker, index) => index === 0 || typeof marker === "number").length;
+	const spare = slots - visible;
+	let group = 0;
+	for (let index = 0; index < window.length; index++) {
+		const marker = window[index];
+		if (index > 0 && typeof marker === "number") group++;
+		// Add spacing only before turns, keeping each separator's digits on adjacent rows.
+		const padding = groups === 1 ? Math.floor(spare / 2) : Math.round((group * spare) / (groups - 1));
+		result.set(1 + index + padding, marker);
 	}
 	return result;
 }

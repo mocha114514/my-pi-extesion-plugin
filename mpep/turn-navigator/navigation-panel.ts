@@ -8,7 +8,14 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { markerRows, navigationBand, sameAnchors, type TurnAnchor } from "./turn-index.ts";
+import {
+	markerRows,
+	navigationBand,
+	navigationMarkers,
+	type NavigationMarker,
+	sameAnchors,
+	type TurnAnchor,
+} from "./turn-index.ts";
 
 export type NavigatorTheme = Pick<Theme, "fg" | "bg" | "bold">;
 
@@ -27,7 +34,8 @@ export class NavigationPanel implements Component {
 	private active = -1;
 	private start = 0;
 	private hovered: number | undefined;
-	private markers = new Map<number, number>();
+	private entries: readonly NavigationMarker[] = [];
+	private markers = new Map<number, NavigationMarker>();
 
 	constructor(actions: PanelActions) {
 		this.actions = actions;
@@ -36,13 +44,17 @@ export class NavigationPanel implements Component {
 	update(anchors: readonly TurnAnchor[], active: number, height: number): boolean {
 		if (height === this.height && active === this.active && sameAnchors(this.anchors, anchors)) return false;
 		const recenter = active !== this.active || height !== this.height || !sameAnchors(this.anchors, anchors);
+		if (anchors.length !== this.anchors.length) this.entries = navigationMarkers(anchors.length);
 		this.anchors = anchors;
 		this.active = active;
 		this.height = Math.max(0, height);
 		this.band = navigationBand(this.height, anchors.length);
 		const capacity = Math.max(0, this.band.height - 2);
-		if (recenter) this.start = Math.max(0, Math.min(active - Math.floor(capacity / 2), anchors.length - capacity));
-		this.markers = markerRows(anchors.length, this.band.height, this.start);
+		if (recenter) {
+			const activeRow = this.entries.indexOf(active);
+			this.start = Math.max(0, Math.min(activeRow - Math.floor(capacity / 2), this.entries.length - capacity));
+		}
+		this.markers = markerRows(this.entries, this.band.height, this.start);
 		this.leave();
 		return true;
 	}
@@ -61,7 +73,8 @@ export class NavigationPanel implements Component {
 		return Array.from({ length: this.height }, (_, screenRow) => {
 			const row = screenRow - this.band.top;
 			if (row < 0 || row >= this.band.height) return " ".repeat(width);
-			const index = this.markers.get(row);
+			const marker = this.markers.get(row);
+			const index = typeof marker === "number" ? marker : undefined;
 			let glyph = "";
 			let enabled = false;
 			if (this.band.height >= 3 && row === 0) {
@@ -70,6 +83,8 @@ export class NavigationPanel implements Component {
 			} else if (this.band.height >= 3 && row === this.band.height - 1) {
 				glyph = "\u25bc";
 				enabled = this.active >= 0 && this.active < this.anchors.length - 1;
+			} else if (typeof marker === "string") {
+				glyph = marker;
 			} else if (index !== undefined) {
 				glyph = index === this.active ? "\u2550" : "\u2500";
 				enabled = true;
@@ -91,22 +106,24 @@ export class NavigationPanel implements Component {
 			this.leave();
 			return undefined;
 		}
+		const marker = this.markers.get(row);
+		const turnIndex = typeof marker === "number" ? marker : undefined;
 		if (event.type === "move") {
 			if (this.hovered !== row) {
 				this.hovered = row;
-				this.actions.preview(this.markers.get(row), row);
+				this.actions.preview(turnIndex, row);
 				return { handled: true, render: true };
 			}
 		} else if (event.type === "wheel") {
 			const capacity = Math.max(0, this.band.height - 2);
 			const delta = Math.sign(event.wheelDelta ?? 0) * 3;
-			this.start = Math.max(0, Math.min(this.start + delta, this.anchors.length - capacity));
-			this.markers = markerRows(this.anchors.length, this.band.height, this.start);
+			this.start = Math.max(0, Math.min(this.start + delta, this.entries.length - capacity));
+			this.markers = markerRows(this.entries, this.band.height, this.start);
 			this.leave();
 			return { handled: true, render: true };
 		} else if (event.type === "click" && event.button === "left") {
 			const index =
-				row === 0 ? this.active - 1 : row === this.band.height - 1 ? this.active + 1 : this.markers.get(row);
+				row === 0 ? this.active - 1 : row === this.band.height - 1 ? this.active + 1 : turnIndex;
 			if (index !== undefined && index >= 0 && index < this.anchors.length) this.actions.jump(index);
 		}
 		return { handled: true };
