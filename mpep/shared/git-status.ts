@@ -96,7 +96,7 @@ function applyHeader(snapshot: GitStatusSnapshot, body: string): void {
 }
 
 /**
- * Parse `git status --porcelain=v2 --branch --untracked-files=normal`.
+ * Parse `git status --porcelain=v2 --branch --untracked-files=all`.
  *
  * Only the record type and the `XY` pair are inspected, never a path, so quoted or
  * unusual file names cannot break the counts; unknown record types are skipped and a
@@ -165,7 +165,8 @@ export function formatGitStatus(snapshot: GitStatusSnapshot, detachedLabel: stri
  * so a refresh costs a single git process instead of one per question.
  * `--no-optional-locks` keeps us from rewriting the index behind a concurrent git.
  */
-const STATUS_ARGS = ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=normal"];
+// Expand untracked directories so the footer and preview count the same actual files.
+const STATUS_ARGS = ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=all"];
 /** A busy repository prints one line per changed path, so allow a generous pipe. */
 const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 

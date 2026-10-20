@@ -7,6 +7,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { t } from "./shared/i18n/index.ts";
 import { isPluginEnabled } from "./manager/preferences.ts";
+import { showGitPreview } from "./statusline/git-preview.ts";
 import {
 	formatGitStatus,
 	GitStatusTracker,
@@ -29,7 +30,7 @@ const RESET = "\x1b[0m";
 const MODEL_WIDGET_KEY = "model-info";
 /** Repaint cadence for the token/context counters; independent of the git probe. */
 const REFRESH_INTERVAL_MS = 1000;
-/** How often the git area re-probes on its own. A round ending or a double click skips the wait. */
+/** How often the git area re-probes on its own. A round ending or a single click skips the wait. */
 const GIT_REFRESH_INTERVAL_MS = 10_000;
 /** How long the "refreshed" marker stays visible after an on-demand refresh. */
 const GIT_REFRESH_MARKER_MS = 1500;
@@ -103,8 +104,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		const ui = ctx.ui;
 		ui.setFooter((tui, _theme, footerData) => {
-			// Geometry of the git area in the last render, used to hit-test double clicks.
+			// Geometry of the git area in the last render, shared by refresh and preview clicks.
 			let gitRegion: { start: number; end: number } | null = null;
+			let closePreview: (() => void) | undefined;
 
 			const tracker = new GitStatusTracker({
 				intervalMs: GIT_REFRESH_INTERVAL_MS,
@@ -152,6 +154,7 @@ export default function (pi: ExtensionAPI) {
 
 			return {
 				dispose() {
+					closePreview?.();
 					tracker.stop();
 					if (activeTracker === tracker) activeTracker = null;
 					unsubBranch();
@@ -273,16 +276,24 @@ export default function (pi: ExtensionAPI) {
 
 					return lines;
 				},
-				/**
-				 * Double clicking the git area forces an immediate refresh. Answering the press is what
-				 * makes the renderer report the matching click back to us; the trade-off is that text
-				 * selection is unavailable inside that area only.
+				/** Claim presses so the renderer reports clicks back to this footer.
+				 * A first click refreshes; the second opens an on-demand file browser.
 				 */
 				handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 					if (event.y !== 0 || event.button !== "left") return undefined;
 					if (event.type !== "press" && event.type !== "click") return undefined;
 					if (gitRegion === null || event.x < gitRegion.start || event.x >= gitRegion.end) return undefined;
-					if (event.type === "click" && event.clickCount === 2) tracker.refresh({ manual: true });
+					if (event.type === "click") {
+						if ((event.clickCount ?? 1) === 1) tracker.refresh({ manual: true });
+						else if (event.clickCount === 2 && !closePreview) {
+							closePreview = showGitPreview({
+								tui,
+								theme: () => ui.theme,
+								root: tracker.getProjectRoot(ctx.cwd),
+								onClose: () => { closePreview = undefined; },
+							});
+						}
+					}
 					return { handled: true };
 				},
 			};

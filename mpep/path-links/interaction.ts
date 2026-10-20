@@ -11,7 +11,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { spawn } from "node:child_process";
+import { openLocalPath } from "../shared/open-local-path.ts";
 import { decodePathHref, isCompletePath, isWebHref, resolveOpenTarget } from "./paths.ts";
 
 type PathTheme = Pick<Theme, "fg">;
@@ -59,18 +59,6 @@ class PathPreview implements Component {
 			theme.fg("border", `\u2514${"\u2500".repeat(width - 2)}\u2518`),
 		];
 	}
-}
-
-function openPath(target: string): void {
-	const [cmd, args]: [string, string[]] =
-		process.platform === "darwin"
-			? ["open", [target]]
-			: process.platform === "win32"
-				? ["rundll32", ["url.dll,FileProtocolHandler", target]]
-				: ["xdg-open", [target]];
-	spawn(cmd, args, { stdio: "ignore", detached: true })
-		.on("error", () => {})
-		.unref();
 }
 
 interface PointerState {
@@ -170,7 +158,7 @@ export function installPathLinkInteraction(options: { theme(): PathTheme }): { a
 				return;
 			}
 			if (pointer.dragged || !isCompletePath(path)) return;
-			openPath(resolveOpenTarget(path));
+			void openLocalPath(resolveOpenTarget(path)).catch(() => {});
 		}
 		internals.openUrl = wrappedOpenUrl;
 
