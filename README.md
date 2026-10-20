@@ -4,196 +4,24 @@ English | [简体中文](README.zh-CN.md)
 
 A lightweight extension suite that polishes Pi's shell interface.
 
-Built entirely on Pi's own extension mechanism — zero source modification, easy to attach and remove.
+Built entirely on Pi's own extension mechanism — zero source modifications, easy to install and remove.
 
-> **Fullscreen mode strongly recommended** (set TUI mode to full screen in `/settings`) for the best experience.
+> **Use these extensions in Pi's fullscreen mode (set TUI mode to full screen in `/settings`) for the best experience.**
 >
-> Use this as a reference for the recommended settings.
+> Use the settings below as a reference.
 >
-> <img src="assets/fullscreen-settings.png" alt="Fullscreen settings"  />
+> ![Fullscreen settings](assets/fullscreen-settings.png)
 
-### Interface Optimization
+### Features
 
-Compact tool output, expandable details, Markdown rendering enhancements, and more.
-
-While a response is executing:
-
-![Executing view](assets/executing-view.png)
-
-When a round ends — finished, aborted, or interrupted — the process collapses automatically:
-
-![Auto collapse](assets/auto-collapse.png)
-
-Double-click to expand:
-
-![Double click expand](assets/double-click-expand.png)
-
-### User Message Bubble Border
-
-Replaces the full-width solid background block of user messages with a clean, modern colored rounded border, eliminating visual harshness and keeping the background transparent. Can be toggled independently via `/m-mng`.
-
-### AI Dependency Checklist
-
-Provides `list_write` and `list_read` tools. Creating a checklist requires `title`, a non-empty **`goal`**, and `items`. Before starting execution, the AI must record the overall task, core requirements, expected outcomes, scope, constraints, acceptance criteria, and completion or convergence conditions already discussed and confirmed with the user. The goal must be precise and self-contained rather than a title, task breakdown, progress note, or reference to earlier conversation; detailed tasks belong in `items`.
-
-The goal stays fixed for that checklist and is preserved verbatim, including multiple paragraphs. It anchors the original objective across repeated context compactions so local issues do not redefine the task. Later explicit user-confirmed changes still take precedence over the original record. Before completing the final item, the AI should check the overall outcome against the goal, not just the item statuses.
-
-Items retain their creation order, stable IDs, full descriptions, and prerequisites explicitly specified by the AI through `dependsOn`. An item can only be completed after all prerequisites are done. Duplicate IDs, missing prerequisites, and dependency cycles are rejected.
-
-In Pi **full screen mode**, click **list** on the right side of the editor's top border to open or close the popup, or use `/m-list`. Pi 0.85.1's regular mode has no component-level mouse dispatch, so the button is hidden there while AI checklist tools remain available. The panel prefers 64 character columns and grows upward until it reaches the terminal top, then scrolls internally without moving the transcript or taking input focus. Each time the panel opens, the overall goal and all item details start collapsed: only the goal heading and each item's completion status, ID, and title are shown. Click a heading to expand its full text, or click it again to collapse it. Items expand independently, and expanded descriptions, dependencies, and the overall goal keep the same wrapping and internal scrolling. Completed titles use strikethrough; their details can still be expanded. Folding only affects the UI, not the full checklist available to the AI.
-
-State lives in Pi's session log, not a chat summary or project file. Browsing earlier transcript positions within the same session does not roll back task progress. A completed checklist, including its goal, remains until the next one is created; unfinished checklists cannot be overwritten. Legacy checklists remain readable and explicitly report that no overall goal was recorded, rather than inventing one from their title or items.
-
-After every successful context compaction, the extension appends one **full checklist snapshot** to the new context, including the complete overall goal, completed items, descriptions, and dependencies. The message reminds the model to revisit the global task and standards, is visible to the model but hidden in the chat UI and never starts an extra reply. Later tool results supersede the point-in-time snapshot. Full text consumes context tokens and is never silently summarized or truncated.
-
-`list_write` supports `create`, `append`, `update`, and `complete`; only `create` accepts `goal`. `list_read` always returns the entire checklist, including the full goal and completed work. The extension enforces a valid non-empty goal and dependency rules; the AI remains responsible for accurately recording the user's confirmed objective and verifying that the actual work and overall acceptance criteria are satisfied. Toggle the plugin independently through `/m-mng`.
-
-### Context Compaction
-
-`compact-forewarn` provides an early warning and the `request_compaction` tool so the AI can compact at a safe milestone. Successful native automatic compaction also receives the same English continuation guide when the final response was truncated or native compaction preempted a queued tool request, and Pi has not already resumed or arranged a retry. The guide is delivered once at settlement, not during the active run. Manual compaction, normal completed answers, and cancelled runs do not start an extra response.
-
-### Thinking-only Response Cleanup
-
-`drop-useless-reasoning-item-before-compact` is enabled by default and has its own `/m-mng` switch. After each completed model/tool turn, it scans the **full effective context**, including older retained history, and omits whole assistant responses containing only thinking and empty/whitespace text. Stop reasons do not matter. Nonempty body text, tool calls, any other output, and all non-assistant messages are preserved.
-
-Omissions are persisted as native context edits: original session records stay inspectable, while subsequent model requests and compaction retention use the edited context. Cleanup never retries the model or forces compaction. If cleanup makes compaction unnecessary, no compaction-completion guide is sent. The two plugins are independent.
-
-Requires Pi's editable boundary/context-edit support (verified with **Pi 1.1.0**); unsupported runtimes warn once per session and leave history unchanged. After first enabling the plugin for an uncleaned old session, complete one ordinary reply, for example: **“Reply 收到 only; do not use tools or modify files.”** Cleanup runs when that turn ends, so the first request may still contain old data. A direct `/compact` or pre-prompt compaction before that first boundary is not pre-cleaned.
-
-### Turn Navigator
-
-Adds a navigator on the right side to quickly review each round's user prompt and jump to it with a click.
-
-![Turn navigator](assets/turn-navigator.png)
-
-### Statusline
-
-An improved version of Pi's native statusline.
-
-Shows model, project, Git and token usage information, among other data.
-
-![Statusline](assets/statusline.png)
-
-### Usage
-
-Token usage, costs, daily totals and model price editing.
-
-![Usage and costs](assets/usage-costs.png)
-
-![Daily usage](assets/usage-daily.png)
-
-### Theme Distributor
-
-Ships the bundled `mpep-blue` theme. On first load it installs the theme into `~/.pi/agent/themes/` and selects it automatically. The installation is one-shot: if the theme file already exists, your manual theme choice is never overridden.
-
-Disabling the plugin through `/m-mng` uninstalls it: the theme file is removed and the previously selected theme is restored (falls back to Pi's default `dark`).
-
-### Responses WebSocket
-
-Optional transport for the Responses API. Pi still owns the model list, auth, request building, and response parsing. This extension does not modify Pi core and does not patch global `fetch`.
-
-It is enabled by default in `/m-mng`, but it does nothing until a model opts in. Set `"ws": true` in Pi's `models.json` (`~/.pi/agent/models.json`, or under `PI_CODING_AGENT_DIR` when that is set). Examples below use `//` comments; trailing commas are allowed.
-
-Custom model entry:
-
-```jsonc
-{
-  "providers": {
-    "example-provider": {
-      "baseUrl": "https://example.invalid/v1",
-      "apiKey": "YOUR_API_KEY",
-      "api": "openai-responses",
-      "models": [
-        {
-          "id": "example-model",
-          // Other model fields stay Pi's. Only ws is read here.
-          "api": "openai-responses",
-          "ws": true,
-        },
-      ],
-    },
-  },
-}
-```
-
-For a model already supplied by a built-in provider, use `modelOverrides` rather than duplicating it in `models[]`. Replace the placeholder provider and model ids below with the existing ones; the model must already resolve to `openai-responses`:
-
-```jsonc
-{
-  "providers": {
-    "example-provider": {
-      "modelOverrides": {
-        "builtin-model": {
-          "ws": true,
-        },
-      },
-    },
-  },
-}
-```
-
-- WebSocket is used only when the resolved model `api` is `openai-responses` and the effective `ws` value is `true`. `ws: false`, or no `ws` field, keeps Pi's original transport. Any other API is left untouched.
-- For the same model id, an explicit `modelOverrides` `ws` wins over `models[]`, including `ws: false`.
-- Edits to `models.json`, and `/m-mng enable responses-ws` or `/m-mng disable responses-ws`, apply only after a restart or `/reload`.
-- Newly started subagents also load this plugin by default, with their own connection pools and the same plugin-enable/model opt-in checks. Existing child processes must be restarted to pick up the loading change.
-- Each request still sends the full context Pi built. There is no automatic `previous_response_id` optimization.
-- WebSocket events are bridged to a local SSE stream for Pi's original parser. A network WebSocket error is never retried as a network HTTP/SSE request.
-- An idle socket is reused only when provider, session, WebSocket URL, final handshake headers, and proxy all match. Concurrent requests use separate sockets. `cacheRetention: "none"` keeps Pi's prompt-cache behavior but does not disable WebSocket reuse.
-- There is no default idle-time eviction. Connections retire after 55 minutes of age: an idle connection closes at that deadline, while an active response is allowed to finish before its connection retires. The next request opens a replacement only when needed. Shutdown and `/reload` close sockets this extension owns.
-- Establishing a new WebSocket has a 60-second default budget (`websocketConnectTimeoutMs` overrides it per request). While reading a response, each wait for the next SDK event has a 10-minute default budget (`timeoutMs` overrides it); this is not a total task-duration or parked-connection idle limit.
-- Protocol heartbeats send a Ping every 60 seconds and allow 60 seconds for its matching Pong. Three consecutive missed replies terminate the unhealthy socket. Ping/Pong never sends `response.create`, does not count as model-response progress, and cannot extend the server's connection lifetime.
-- Established connections recover from unexpected, SDK-recoverable failures with at most 5 reconnect attempts: an initial 1.875-second backoff, exponential doubling, a 30-second cap, and the SDK's native 75%–100% jitter. An interrupted response fails explicitly; no already-sent request is replayed or response resumed. A recovered connection can serve later requests. A socket still reconnecting is not leased; an overlapping request may open a separate socket.
-- Cancellation, disposal, shutdown/reload, and normal age retirement intentionally close connections and prevent further recovery attempts. The SDK's public API cannot cancel an already-running backoff timer: that timer may settle afterward, without opening another connection. Handshake redirects remain disabled.
-- If another extension already registered that provider, this one refuses it, leaves that registration unchanged, and notifies you.
-- `onResponse` receives synthetic local-SSE metadata (`200`, `X-MPEP-Transport: websocket`). That is not the HTTP create response and not the WebSocket upgrade response.
-
-Verified with local loopback synthetic tests against the Node.js installation of Pi 0.85.1, including native-provider integration, cancellation, timeouts, connection isolation, an HTTP CONNECT proxy, and production-only package copies loaded through Pi's actual extension loader (with no local Pi SDK and with an extension-local decoy helper). The extension resolves Pi's public proxy helper from the host installation; hosts without that helper report a compatibility error rather than bypassing proxy settings. Standalone executable distributions and real official/intermediary APIs have not been verified. The server must support Responses WebSocket.
-
-### Responses Official Web Search (`responses-OpenAI-offical-search`)
-
-Enables the Responses API's hosted `web_search` tool, not a Pi-executed function or a separate search endpoint. Its `search`, `open_page`, and `find_in_page` actions are managed by the model/server; no extra tool declarations are needed. `file_search` and `tool_search` are different capabilities and are not enabled here. See the [official web search guide](https://developers.openai.com/api/docs/guides/tools-web-search).
-
-The plugin is enabled by default in `/m-mng`, but individual models opt in with the intentionally spelled **`"offical-search": true`** in Pi's `models.json`. Provider and model IDs must match exactly. The resolved model API must already be `openai-responses`; provider names, domains, and model families are not checked or probed.
-
-For an existing model, merge this into its provider's `modelOverrides`:
-
-```jsonc
-{
-  "providers": {
-    "example-provider": {
-      "modelOverrides": {
-        "existing-responses-model": {
-          "offical-search": true,
-          // Optional: the same request can use the responses-ws plugin.
-          "ws": true,
-        },
-      },
-    },
-  },
-}
-```
-
-For a custom model already defined in `models[]`, add `"offical-search": true` to that entry; keep its other required Pi fields. An explicit `modelOverrides` value wins over the entry, including `false`. Missing means off. JSONC comments and trailing commas are accepted. Configuration errors disable this plugin's additions for that session, with a credential-blind diagnostic; the normal provider request remains Pi's responsibility.
-
-- Each request rechecks the selected model. Other APIs and unmarked models are unchanged.
-- Existing Pi/MCP tools, request parameters, and `tool_choice` are retained. An existing `web_search`/preview/versioned declaration is preserved with its controls, not duplicated or replaced. The plugin makes search available; it does not force the model to search.
-- `ws: true` uses the existing Responses WS transport; otherwise Pi's original transport is retained. This plugin registers neither a provider nor a client-executed tool, does not patch global `fetch`, and does not preflight endpoint capability. Unsupported tools fail through the provider normally.
-- URL citations require **Pi 0.99.0 or later** and a provider adapter that emits `provider_stream_event` (the built-in Responses adapter does). The plugin observes those events before normalization, then restores clickable Markdown links in the finalized message. Original source text and URL citation metadata are retained in the text block's `mpepWebSearch` field. Unsafe URLs are not made clickable; uncertain ranges use visible source links rather than rewriting arbitrary text.
-- Citation records are matched by output-message IDs and separated by provider/model/session, then cleared after the run. No synthetic Pi tool execution or search log is added. Other message content, signatures, usage, and stop reasons are preserved.
-- Changes to `models.json` or `/m-mng enable|disable responses-OpenAI-offical-search` require a restart or `/reload`. Newly started subagents also load this plugin and obey the same plugin/model rules; restart existing children to apply that change.
-- Search runs on the server and may incur tool charges. Pi's existing token-cost display is not a complete search-inclusive bill.
-
-Verified with 87 isolated synthetic search/citation tests, including Pi 1.1.0's native HTTP/WS stream hooks and actual SessionManager persistence, plus 98 existing WS regressions. Code/reference-link fallback behavior was checked with the host TUI's actual Markdown parser. No real user configuration or paid endpoint was used. Real official/intermediary APIs, standalone executable distributions, and third-party adapters without the raw event hook have not been verified.
-
-### Keyboard Shortcuts
-
-- Ctrl+C no longer clears the input box text.
-- With mouse-selected text, Ctrl+C copies it instead of quitting Pi; pressing Ctrl+C with nothing selected asks for confirmation first to prevent accidental exits.
-- With mouse-selected text, direct deletion (Backspace / Delete) and overwrite (Ctrl+V) are supported.
-- With mouse-selected text, line cutting (Ctrl+X) is supported.
-- Ctrl+- / Ctrl+_ for undo; Windows additionally supports Ctrl+Z.
-
-Note: the TPS plugin comes from the official [Pi](https://github.com/earendil-works/pi) repository implementation; parts of the subagent plugin design are referenced from [omp](https://github.com/can1357/oh-my-pi).
+- An improved statusline.
+- Compact, minimal tool-call output.
+- Basic cost tracking.
+- Enhanced Markdown rendering.
+- Improved mouse and keyboard interactions.
+- AI-initiated context compaction.
+- Lightweight subagents.
+- WebSocket support for the Responses API.
 
 ### Install and Update
 
@@ -208,20 +36,19 @@ pi update git:github.com/mocha114514/better-pi-appearance
 pi remove git:github.com/mocha114514/better-pi-appearance
 ```
 
-Then manually delete `~/.pi/agent/mpep-cache/` if you want a full cleanup.
+Then manually delete `~/.pi/agent/mpep-cache/` to remove all remaining data.
 
 ### Commands
 
-| Command              | Purpose                                                |
-| -------------------- | ------------------------------------------------------ |
-| `/m-mng`             | Enable or disable extensions, including Responses WS and web search |
-| `/m-mng list`        | List plugin states                                     |
-| `/m-lgg`             | Chinese/English selection                              |
-| `/m-usg` / `/-usg n` | View usage and cost statistics                         |
+- See `/m-*` for the available commands.
 
 ### Data Location
 
-- Configuration, plugin switches and usage data are stored in **`~/.pi/agent/mpep-cache/`**, separate from the installation directory. Follows `PI_CODING_AGENT_DIR` when set; project-level installations also use the same user data directory.
+- Configuration, plugin preferences, and usage data are stored in **`~/.pi/agent/mpep-cache/`**, separate from the installation directory. When `PI_CODING_AGENT_DIR` is set, this data directory follows it. Project-local installations use the same per-user data directory.
+
+## Credits
+
+The TPS extension is based on the implementation in the official [Pi](https://github.com/earendil-works/pi) repository. The default subagent prompt design draws on [omp](https://github.com/can1357/oh-my-pi).
 
 ## License
 
