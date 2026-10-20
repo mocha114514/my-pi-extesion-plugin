@@ -145,7 +145,14 @@ export class ManagerPanel implements Component {
 
 		const { theme, items } = this.options;
 		const border = (text: string) => theme.fg("border", text);
-		const divider = border(`├${"─".repeat(Math.max(0, width - 2))}┤`);
+		const enabled = items.filter(item => item.enabled).length;
+		const summary = t("manager.enabledCount", { enabled, total: items.length });
+		const dividerWidth = Math.max(0, width - 2);
+		// Reuse the divider row; narrow panels keep the numeric ratio instead of clipping its label.
+		const counter = visibleWidth(summary) + 2 <= dividerWidth
+			? ` ${summary} `
+			: truncateToWidth(`${enabled}/${items.length}`, dividerWidth, "");
+		const divider = border(`├${"─".repeat(dividerWidth - visibleWidth(counter))}${counter}┤`);
 		const frame = (text: string, right = border("│")) => {
 			const clipped = truncateToWidth(text, innerWidth, "…");
 			return framed
