@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { t } from "../shared/i18n/index.ts";
+import { ManagerPanel } from "./panel.ts";
 import { loadRegistry, writePluginStates, type RegistryItem } from "./preferences.ts";
 import { disablePathLinkHyperlinks, enablePathLinkHyperlinks } from "../path-links/hyperlinks.ts";
 import { installTheme, uninstallTheme } from "../theme-distributor.ts";
@@ -51,7 +52,7 @@ async function handleManagerCommand(args: string, ctx: ExtensionCommandContext):
 	const subArgs = trimmedArgs ? trimmedArgs.split(/\s+/) : [];
 	const subCommand = subArgs[0]?.toLowerCase();
 
-	let items = loadRegistry();
+	const items = loadRegistry();
 	if (items.length === 0) {
 		ctx.ui.notify(t("manager.missingRegistry"), "error");
 		return;
@@ -90,50 +91,40 @@ async function handleManagerCommand(args: string, ctx: ExtensionCommandContext):
 	}
 
 	let hasChanged = false;
-
-	while (true) {
-		items = loadRegistry();
-		if (items.length === 0) {
-			ctx.ui.notify(t("manager.invalidRegistry"), "error");
-			return;
-		}
-		const options: { label: string; action: "toggle" | "enableAll" | "disableAll" | "done"; id?: string }[] = [];
-
-		for (const item of items) {
-			const mark = item.enabled ? `[✓ ${t("manager.on")}]` : `[  ${t("manager.off")}]`;
-			const label = display(item);
-			options.push({ label: `${mark} ${label.name} ── ${label.desc}`, action: "toggle", id: item.id });
-		}
-
-		options.push({ label: t("manager.enableAll"), action: "enableAll" });
-		options.push({ label: t("manager.disableAll"), action: "disableAll" });
-		options.push({ label: t("manager.done"), action: "done" });
-
-		const selected = await ctx.ui.select(t("manager.title"), options.map(option => option.label));
-		const choice = options.find(option => option.label === selected);
-
-		if (!choice || choice.action === "done") {
-			break;
-		}
-
-		if (choice.action === "enableAll" || choice.action === "disableAll") {
-			for (const item of items) {
-				item.enabled = choice.action === "enableAll";
-			}
-			writePluginStates(Object.fromEntries(items.map(item => [item.id, item.enabled])));
-			hasChanged = true;
-			continue;
-		}
-
-		// A specific extension item was toggled
-		const target = items.find(item => item.id === choice.id);
-		if (target) {
-			target.enabled = !target.enabled;
-			writePluginStates({ [target.id]: target.enabled });
-			toggleHooks[target.id]?.(target.enabled);
-			hasChanged = true;
-		}
-	}
+	const panelItems = items.map(item => ({ ...item, ...display(item) }));
+	await ctx.ui.custom<void>(
+		(tui, theme, keys, done) => new ManagerPanel({
+			items: panelItems,
+			theme,
+			rows: () => tui.terminal.rows,
+			matches: (data, action) => keys.matches(data, action),
+			close: () => done(),
+			change: (changes, toggledId) => {
+				try {
+					writePluginStates(changes);
+					// Keep the open panel in sync with disk, even if a lifecycle hook fails.
+					for (const item of panelItems) {
+						if (Object.hasOwn(changes, item.id)) item.enabled = changes[item.id];
+					}
+					hasChanged = true;
+					if (toggledId) toggleHooks[toggledId]?.(changes[toggledId]);
+				} catch (error) {
+					ctx.ui.notify(t("manager.saveFailed", {
+						error: error instanceof Error ? error.message : String(error),
+					}), "error");
+				}
+			},
+		}),
+		{
+			overlay: true,
+			overlayOptions: {
+				anchor: "center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: { left: 1, right: 1 },
+			},
+		},
+	);
 
 	if (hasChanged) {
 		ctx.ui.notify(t("manager.updated"), "info");

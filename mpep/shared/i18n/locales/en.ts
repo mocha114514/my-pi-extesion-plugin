@@ -30,6 +30,8 @@ export const en = {
   "manager.disableAll": "Disable all",
   "manager.done": "Done",
   "manager.title": "MPEP extension manager",
+  "manager.navigationHint": "↑↓ select · Click / Enter / Space toggle · Esc close",
+  "manager.scrollHint": "Wheel scroll · Shift+wheel / PgUp/PgDn page · Home/End first/last",
   "manager.updated": "MPEP extensions updated. Run /reload to apply.",
   "manager.description": "Enable or disable MPEP extensions",
   "manager.saveFailed": "MPEP settings could not be saved: {error}",

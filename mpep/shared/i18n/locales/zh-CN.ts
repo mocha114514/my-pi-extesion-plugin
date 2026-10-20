@@ -31,6 +31,8 @@ export const zhCN = {
   "manager.disableAll": "一键全部关闭",
   "manager.done": "完成设置并退出",
   "manager.title": "MPEP 扩展套件管理器",
+  "manager.navigationHint": "↑↓ 选择 · 单击 / Enter / 空格切换 · Esc 退出",
+  "manager.scrollHint": "滚轮滚动 · Shift+滚轮 / PgUp/PgDn 翻页 · Home/End 首尾",
   "manager.updated": "MPEP 扩展套件已更新，运行 /reload 即可完成热加载",
   "manager.description": "管理 MPEP 个人扩展套件的启用与禁用状态",
   "manager.saveFailed": "MPEP 设置保存失败：{error}",
