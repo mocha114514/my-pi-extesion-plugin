@@ -11,8 +11,6 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { lstat } from "node:fs/promises";
-import { resolve } from "node:path";
 import {
 	GIT_CHANGE_CATEGORIES,
 	type GitChangeCategory,
@@ -20,7 +18,10 @@ import {
 	readGitChanges,
 } from "../shared/git-changes.ts";
 import { getLocale, t, type MessageKey } from "../shared/i18n/index.ts";
-import { openLocalPath } from "../shared/open-local-path.ts";
+import type { GitFileSource } from "../shared/git-file-diff.ts";
+import { type GitCommit, type GitHistoryPage, readCommitChanges, readGitHistory } from "../shared/git-history.ts";
+import { showGitCodePreview } from "./git-code-preview.ts";
+import { displayPath, wrapPath } from "./git-preview-format.ts";
 
 type PreviewTheme = Pick<Theme, "fg">;
 
@@ -35,10 +36,23 @@ const CATEGORY_LABELS = {
 	conflicted: "gitPreview.conflicted",
 } as const satisfies Record<GitChangeCategory, MessageKey>;
 
+interface PreviewSection {
+	id: string;
+	source: GitFileSource;
+	expanded: boolean;
+	categories: Set<GitChangeCategory>;
+	files?: GitChangeFile[];
+	loading?: boolean;
+	failed?: boolean;
+}
+
 interface PreviewRow {
+	key: string;
 	text: string;
+	section?: PreviewSection;
 	category?: GitChangeCategory;
 	file?: GitChangeFile;
+	history?: boolean;
 	/** Content-relative hit range: statistics are not part of the file link. */
 	pathStart?: number;
 	pathEnd?: number;
@@ -49,59 +63,35 @@ export interface GitPreviewPanelOptions {
 	maxHeight: () => number;
 	requestRender: () => void;
 	onClose: () => void;
-	onOpen: (file: GitChangeFile) => Promise<void>;
-}
-
-/** Escape control characters without losing any portion of an unusual Git filename. */
-function displayPath(path: string): string {
-	return path.replace(/[\u0000-\u001f\u007f-\u009f]/g, character => {
-		if (character === "\n") return "\\n";
-		if (character === "\r") return "\\r";
-		if (character === "\t") return "\\t";
-		return `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`;
-	});
-}
-
-const pathSegments = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-
-/** Unlike prose wrapping, path wrapping must not discard spaces at a line boundary. */
-function wrapPath(path: string, width: number): string[] {
-	const rows: string[] = [];
-	let line = "";
-	let used = 0;
-	const append = (part: string) => {
-		const cells = visibleWidth(part);
-		if (used + cells > width && line) {
-			rows.push(line);
-			line = "";
-			used = 0;
-		}
-		line += part;
-		used += cells;
-	};
-	for (const { segment } of pathSegments.segment(displayPath(path))) {
-		if (visibleWidth(segment) <= width) append(segment);
-		else {
-			// A two-cell glyph cannot fit a one-cell viewport. Keep its code
-			// points readable rather than overflowing or silently dropping it.
-			const escaped = Array.from(segment, character => `\\u{${character.codePointAt(0)!.toString(16)}}`).join("");
-			for (const character of escaped) append(character);
-		}
-	}
-	if (line || rows.length === 0) rows.push(line);
-	return rows;
+	onOpen: (file: GitChangeFile, source: GitFileSource) => Promise<void>;
+	loadHistory: (options: { anchor?: string; skip: number; limit: number }) => Promise<GitHistoryPage>;
+	loadCommit: (commit: GitCommit) => Promise<GitChangeFile[]>;
 }
 
 /** Rendering and hit-testing share the same wrapped rows, including after scrolling. */
 export class GitPreviewPanel implements Component {
 	private readonly options: GitPreviewPanelOptions;
-	private files: GitChangeFile[] | undefined;
-	private failed = false;
+	private readonly workspace: PreviewSection = {
+		id: "workspace",
+		source: { kind: "workspace" },
+		expanded: true,
+		categories: new Set(),
+	};
+	/** Oldest first on screen; Git's pagination remains newest first. */
+	private readonly commits: PreviewSection[] = [];
+	private historyLoading = false;
+	private historyFailed = false;
+	private hasMore = true;
+	private anchor: string | undefined;
+	private loaded = 0;
+	private disposed = false;
+	private initialPosition = true;
+	private scrollAnchor: { key: string; offset: number } | undefined;
 	private notice: string | undefined;
-	private readonly expanded = new Set<GitChangeCategory>();
 	private scrollOffset = 0;
 	private width = 0;
 	private viewport = 0;
+	private trailingPadding = 0;
 	private closeStart = Number.POSITIVE_INFINITY;
 	private bodyCache:
 		| { width: number; theme: PreviewTheme; locale: string; rows: PreviewRow[] }
@@ -111,14 +101,22 @@ export class GitPreviewPanel implements Component {
 		this.options = options;
 	}
 
+	start(): void {
+		void this.loadMore();
+	}
+
+	dispose(): void {
+		this.disposed = true;
+	}
+
 	setFiles(files: GitChangeFile[]): void {
-		this.files = files;
-		this.failed = false;
+		this.workspace.files = files;
+		this.workspace.failed = false;
 		this.invalidate();
 	}
 
 	setFailed(): void {
-		this.failed = true;
+		this.workspace.failed = true;
 		this.invalidate();
 	}
 
@@ -131,17 +129,30 @@ export class GitPreviewPanel implements Component {
 		if (this.width === 0) return [];
 		if (this.width < 4) {
 			this.viewport = 0;
-			return [truncateToWidth(t("gitPreview.title", { count: this.files?.length ?? 0 }), this.width, "")];
+			return [truncateToWidth(t("gitPreview.title"), this.width, "")];
 		}
 		const rows = this.body();
-		const height = Math.min(rows.length + 2, Math.max(1, Math.floor(this.options.maxHeight())));
+		// A fixed viewport prevents the centered modal from moving as pages arrive.
+		const height = Math.max(1, Math.floor(this.options.maxHeight()));
+		const previousViewport = this.viewport;
 		this.viewport = Math.max(0, height - 2);
+		if (this.viewport !== previousViewport) {
+			this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, rows.length - 1));
+			this.trailingPadding = Math.max(0, this.scrollOffset + this.viewport - rows.length);
+		}
+		this.applyScrollAnchor(rows);
+		if (this.initialPosition) {
+			const workspace = rows.findIndex(row => row.key === "workspace:header:0");
+			this.scrollOffset = Math.max(0, Math.min(workspace, rows.length - this.viewport));
+			this.trailingPadding = 0;
+			if (!this.historyLoading && (this.workspace.files || this.workspace.failed)) this.initialPosition = false;
+		}
 		this.clampScroll(rows.length);
 		const top = this.top();
 		if (height === 1) return [top];
-
-		const visible = rows.slice(this.scrollOffset, this.scrollOffset + this.viewport);
-		return [top, ...visible.map(row => this.frameRow(row.text)), this.bottom(rows.length)];
+		const visible = rows.slice(this.scrollOffset, this.scrollOffset + this.viewport).map(row => row.text);
+		while (visible.length < this.viewport) visible.push("");
+		return [top, ...visible.map(line => this.frameRow(line)), this.bottom(rows.length)];
 	}
 
 	handleInput(data: string): void {
@@ -149,74 +160,169 @@ export class GitPreviewPanel implements Component {
 			this.options.onClose();
 			return;
 		}
-		const rows = this.body();
 		const page = Math.max(1, this.viewport - 1);
-		if (matchesKey(data, "up")) this.scrollOffset--;
-		else if (matchesKey(data, "down")) this.scrollOffset++;
-		else if (matchesKey(data, "pageUp")) this.scrollOffset -= page;
-		else if (matchesKey(data, "pageDown")) this.scrollOffset += page;
-		else if (matchesKey(data, "home")) this.scrollOffset = 0;
-		else if (matchesKey(data, "end")) this.scrollOffset = rows.length;
+		let delta: number;
+		if (matchesKey(data, "up")) delta = -1;
+		else if (matchesKey(data, "down")) delta = 1;
+		else if (matchesKey(data, "pageUp")) delta = -page;
+		else if (matchesKey(data, "pageDown")) delta = page;
+		else if (matchesKey(data, "home")) delta = -this.body().length;
+		else if (matchesKey(data, "end")) delta = this.body().length;
 		else return;
-		this.clampScroll(rows.length);
+		this.scroll(delta);
 		this.options.requestRender();
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.type === "wheel") {
-			this.scrollOffset += Math.trunc(event.wheelDelta ?? 0);
-			this.clampScroll(this.body().length);
+			this.scroll(Math.trunc(event.wheelDelta ?? 0));
 			return { handled: true, render: true };
 		}
 		if (event.button !== "left") return undefined;
-		// Claim presses so the renderer reports clicks to this overlay rather
-		// than starting a transcript selection underneath the modal.
+		// Claim presses so clicks belong to the overlay, not the transcript.
 		if (event.type === "press") return { handled: true };
 		if (event.type !== "click") return undefined;
-		if (event.shift || event.alt || event.ctrl || (event.clickCount ?? 1) !== 1) {
-			return { handled: true, render: false };
-		}
+		if (event.shift || event.alt || event.ctrl) return { handled: true };
+		const clicks = event.clickCount ?? 1;
 		if (event.y === 0 && event.x >= this.closeStart && event.x < this.width - 1) {
-			this.options.onClose();
+			if (clicks === 1) this.options.onClose();
 			return { handled: true };
 		}
 		const inBody = event.y > 0 && event.y <= this.viewport && event.x > 0 && event.x < this.width - 1;
-		if (!inBody) return { handled: true, render: false };
+		if (!inBody) return { handled: true };
 		const row = this.body()[this.scrollOffset + event.y - 1];
-		if (row?.category) {
-			if (this.expanded.has(row.category)) this.expanded.delete(row.category);
-			else this.expanded.add(row.category);
+		if (row?.history) {
+			if (clicks === 1) void this.loadMore();
+			return { handled: true, render: true };
+		}
+		if (row?.section && !row.category && !row.file) {
+			if (clicks === 2) this.toggle(row.section);
+			return { handled: true, render: clicks === 2 };
+		}
+		if (row?.section && row.category && clicks === 1) {
+			const expanded = row.section.categories;
+			if (expanded.has(row.category)) expanded.delete(row.category);
+			else expanded.add(row.category);
 			this.notice = undefined;
 			this.invalidate();
 			return { handled: true, render: true };
 		}
 		const contentX = event.x - 2;
-		if (row?.file && contentX >= row.pathStart! && contentX < row.pathEnd!) {
-			void this.open(row.file);
+		if (clicks === 1 && row?.file && row.section && contentX >= row.pathStart! && contentX < row.pathEnd!) {
+			void this.open(row.file, row.section.source);
 		}
-		return { handled: true, render: false };
+		return { handled: true };
 	}
 
-	private async open(file: GitChangeFile): Promise<void> {
-		if (file.deleted) {
-			this.notice = t("gitPreview.fileDeleted");
-			this.options.requestRender();
-			return;
+	private applyScrollAnchor(rows: PreviewRow[]): void {
+		const anchor = this.scrollAnchor;
+		if (!anchor) return;
+		const position = rows.findIndex(row => row.key === anchor.key);
+		if (position >= 0) {
+			this.scrollOffset = Math.max(0, position - anchor.offset);
+			this.trailingPadding = Math.max(0, this.scrollOffset + this.viewport - rows.length);
 		}
+		this.scrollAnchor = undefined;
+	}
+
+	private scroll(delta: number): void {
+		this.applyScrollAnchor(this.body());
+		this.initialPosition = false;
+		this.scrollAnchor = undefined;
+		this.scrollOffset += delta;
+		this.clampScroll(this.body().length);
+		if (delta < 0 && this.scrollOffset === 0) void this.loadMore();
+	}
+
+	private async loadMore(): Promise<void> {
+		if (this.disposed || this.historyLoading || !this.hasMore) return;
+		this.historyLoading = true;
+		this.historyFailed = false;
+		this.invalidate();
+		this.options.requestRender();
+		try {
+			const page = await this.options.loadHistory({ anchor: this.anchor, skip: this.loaded, limit: 10 });
+			if (this.disposed) return;
+			// Capture at completion, not request time: the user may scroll while
+			// Git runs. Stable row keys keep that exact viewport after prepending.
+			this.rememberPosition();
+			this.anchor = page.anchor;
+			this.loaded += page.commits.length;
+			this.hasMore = page.hasMore;
+			this.commits.unshift(...page.commits.toReversed().map((commit): PreviewSection => ({
+				id: commit.hash,
+				source: { kind: "commit", commit },
+				expanded: false,
+				categories: new Set(),
+			})));
+		} catch {
+			if (this.disposed) return;
+			this.historyFailed = true;
+		} finally {
+			if (!this.disposed) {
+				this.historyLoading = false;
+				this.invalidate();
+				this.options.requestRender();
+			}
+		}
+	}
+
+	private rememberPosition(): void {
+		if (this.initialPosition || this.scrollAnchor) return;
+		const rows = this.body();
+		let index = this.scrollOffset;
+		// The history status stays at the absolute top. Anchor the first
+		// real row below it so newly inserted commits do not replace the view.
+		while (rows[index]?.history) index++;
+		const row = rows[index];
+		if (row) this.scrollAnchor = { key: row.key, offset: index - this.scrollOffset };
+	}
+
+	private toggle(section: PreviewSection): void {
+		this.initialPosition = false;
+		section.expanded = !section.expanded;
+		this.notice = undefined;
+		this.invalidate();
+		if (section.expanded && section.source.kind === "commit" && !section.files && !section.loading) {
+			void this.loadSection(section);
+		}
+	}
+
+	private async loadSection(section: PreviewSection): Promise<void> {
+		if (section.source.kind !== "commit") return;
+		section.loading = true;
+		section.failed = false;
+		this.invalidate();
+		this.options.requestRender();
+		try {
+			const files = await this.options.loadCommit(section.source.commit);
+			if (this.disposed) return;
+			this.rememberPosition();
+			section.files = files;
+		} catch {
+			if (this.disposed) return;
+			section.failed = true;
+		} finally {
+			if (!this.disposed) {
+				section.loading = false;
+				this.invalidate();
+				this.options.requestRender();
+			}
+		}
+	}
+
+	private async open(file: GitChangeFile, source: GitFileSource): Promise<void> {
 		this.notice = undefined;
 		try {
-			await this.options.onOpen(file);
-		} catch (error) {
-			const missing = error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT";
-			this.notice = missing
-				? t("gitPreview.fileDeleted")
-				: t("gitPreview.openFailed");
+			await this.options.onOpen(file, source);
+		} catch {
+			if (!this.disposed) this.notice = t("gitPreview.openFailed");
 		}
-		this.options.requestRender();
+		if (!this.disposed) this.options.requestRender();
 	}
 
 	private clampScroll(total: number): void {
-		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, total - this.viewport)));
+		this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, Math.max(0, total + this.trailingPadding - this.viewport)));
 	}
 
 	private body(): PreviewRow[] {
@@ -226,41 +332,78 @@ export class GitPreviewPanel implements Component {
 		if (this.bodyCache?.width === width && this.bodyCache.theme === theme && this.bodyCache.locale === locale) {
 			return this.bodyCache.rows;
 		}
-		const rows: PreviewRow[] = [];
-		const message = this.failed
-			? t("gitPreview.failed")
-			: this.files === undefined
-				? t("gitPreview.loading")
-				: this.files.length === 0 ? t("gitPreview.empty") : undefined;
-		if (message) {
-			for (const line of wrapTextWithAnsi(message, width)) {
-				rows.push({ text: theme.fg(this.failed ? "error" : "muted", line) });
-			}
-		} else {
-			const files = this.files!;
-			let addWidth = 2;
-			let deleteWidth = 2;
-			for (const file of files) {
-				addWidth = Math.max(addWidth, String(file.additions ?? 0).length + 1);
-				deleteWidth = Math.max(deleteWidth, String(file.deletions ?? 0).length + 1);
-			}
-			for (const category of GIT_CHANGE_CATEGORIES) {
-				const entries = files.filter(file => file.categories.includes(category));
-				if (entries.length === 0) continue;
-				const expanded = this.expanded.has(category);
-				const label = `${expanded ? "▼" : "▶"} ${t(CATEGORY_LABELS[category])} (${entries.length})`;
-				for (const line of wrapTextWithAnsi(label, width)) {
-					rows.push({ text: theme.fg(category === "conflicted" ? "error" : "accent", line), category });
-				}
-				if (!expanded) continue;
-				for (const file of entries) rows.push(...this.fileRows(file, width, addWidth, deleteWidth));
-			}
-		}
+		const key = this.historyLoading
+			? "gitPreview.historyLoading"
+			: this.historyFailed ? "gitPreview.historyFailed"
+				: this.hasMore ? "gitPreview.historyMore" : "gitPreview.historyEnd";
+		const rows = wrapTextWithAnsi(t(key), width).map((line, index): PreviewRow => ({
+			key: `history:${index}`,
+			text: theme.fg(this.historyFailed ? "warning" : "muted", line),
+			history: true,
+		}));
+		for (const section of [...this.commits, this.workspace]) this.sectionRows(section, width, rows);
 		this.bodyCache = { width, theme, locale, rows };
 		return rows;
 	}
 
-	private fileRows(file: GitChangeFile, width: number, addWidth: number, deleteWidth: number): PreviewRow[] {
+	private sectionRows(section: PreviewSection, width: number, rows: PreviewRow[]): void {
+		const theme = this.options.theme();
+		const label = section.source.kind === "workspace"
+			? t("gitPreview.workspace")
+			: `${section.source.commit.hash.slice(0, 8)} · ${section.source.commit.date} · ${displayPath(section.source.commit.subject)}`;
+		const count = section.files ? ` (${section.files.length})` : "";
+		const header = `${section.expanded ? "▼" : "▶"} ${label}${count}`;
+		wrapTextWithAnsi(header, width).forEach((line, index) => {
+			rows.push({ key: `${section.id}:header:${index}`, text: theme.fg("accent", line), section });
+		});
+		if (!section.expanded) return;
+		const message = section.failed
+			? t("gitPreview.failed")
+			: !section.files ? t("gitPreview.loading")
+				: section.files.length === 0 ? t("gitPreview.empty") : undefined;
+		if (message) {
+			wrapTextWithAnsi(message, Math.max(1, width - 2)).forEach((line, index) => {
+				rows.push({
+					key: `${section.id}:message:${index}`,
+					text: " ".repeat(Math.min(2, width - 1)) + theme.fg(section.failed ? "error" : "muted", line),
+				});
+			});
+			return;
+		}
+		const files = section.files!;
+		let addWidth = 2;
+		let deleteWidth = 2;
+		for (const file of files) {
+			addWidth = Math.max(addWidth, String(file.additions ?? 0).length + 1);
+			deleteWidth = Math.max(deleteWidth, String(file.deletions ?? 0).length + 1);
+		}
+		for (const category of GIT_CHANGE_CATEGORIES) {
+			const entries = files.filter(file => file.categories.includes(category));
+			if (entries.length === 0) continue;
+			const expanded = section.categories.has(category);
+			const categoryLabel = `${expanded ? "▼" : "▶"} ${t(CATEGORY_LABELS[category])} (${entries.length})`;
+			const indent = Math.min(2, Math.max(0, width - 1));
+			wrapTextWithAnsi(categoryLabel, Math.max(1, width - indent)).forEach((line, index) => {
+				rows.push({
+					key: `${section.id}:${category}:header:${index}`,
+					text: " ".repeat(indent) + theme.fg(category === "conflicted" ? "error" : "accent", line),
+					section,
+					category,
+				});
+			});
+			if (!expanded) continue;
+			for (const file of entries) rows.push(...this.fileRows(section, category, file, width, addWidth, deleteWidth));
+		}
+	}
+
+	private fileRows(
+		section: PreviewSection,
+		category: GitChangeCategory,
+		file: GitChangeFile,
+		width: number,
+		addWidth: number,
+		deleteWidth: number,
+	): PreviewRow[] {
 		const theme = this.options.theme();
 		let stats: string;
 		if (file.kind === "text" && file.additions !== null && file.deletions !== null) {
@@ -273,27 +416,30 @@ export class GitPreviewPanel implements Component {
 			stats = theme.fg(file.kind === "conflict" ? "error" : "muted", t(key));
 		}
 		const statsWidth = visibleWidth(stats);
-		const inline = width - statsWidth - 3 >= 12;
-		const indent = Math.min(2, Math.max(0, width - 1));
+		const indent = Math.min(4, Math.max(0, width - 1));
+		const inline = width - indent - statsWidth - 1 >= 12;
 		const pathWidth = Math.max(1, width - indent - (inline ? statsWidth + 1 : 0));
-		// Wrap, never truncate: even long paths remain fully visible and every
-		// wrapped path segment opens the original, unescaped filesystem path.
-		const paths = wrapPath(file.path, pathWidth);
-		const rows = paths.map((path, index): PreviewRow => {
+		const prefix = `${section.id}:${category}:${file.path}`;
+		const rows = wrapPath(file.path, pathWidth).map((path, index): PreviewRow => {
 			const suffix = inline && index === 0
 				? " ".repeat(Math.max(1, width - indent - visibleWidth(path) - statsWidth)) + stats
 				: "";
 			return {
+				key: `${prefix}:path:${index}`,
 				text: " ".repeat(indent) + theme.fg("mdLink", path) + suffix,
+				section,
 				file,
 				pathStart: indent,
 				pathEnd: indent + visibleWidth(path),
 			};
 		});
 		if (!inline) {
-			for (const line of wrapTextWithAnsi(stats, width)) {
-				rows.push({ text: " ".repeat(Math.max(0, width - visibleWidth(line))) + line });
-			}
+			wrapTextWithAnsi(stats, width).forEach((line, index) => {
+				rows.push({
+					key: `${prefix}:stats:${index}`,
+					text: " ".repeat(Math.max(0, width - visibleWidth(line))) + line,
+				});
+			});
 		}
 		return rows;
 	}
@@ -309,11 +455,10 @@ export class GitPreviewPanel implements Component {
 
 	private top(): string {
 		const theme = this.options.theme();
-		if (this.width === 1) return theme.fg("border", "╭");
-		const inner = this.width - 2;
+		const inner = Math.max(0, this.width - 2);
 		const close = this.width >= 10 ? " × " : "";
 		this.closeStart = close ? this.width - close.length - 1 : Number.POSITIVE_INFINITY;
-		const title = truncateToWidth(` ${t("gitPreview.title", { count: this.files?.length ?? 0 })} `, inner - close.length, "");
+		const title = truncateToWidth(` ${t("gitPreview.title")} `, Math.max(0, inner - close.length), "");
 		return theme.fg("border", "╭") + theme.fg("accent", title) +
 			theme.fg("border", "─".repeat(Math.max(0, inner - visibleWidth(title) - close.length))) +
 			theme.fg("muted", close) + theme.fg("border", "╮");
@@ -321,7 +466,7 @@ export class GitPreviewPanel implements Component {
 
 	private bottom(total: number): string {
 		const theme = this.options.theme();
-		const position = total > this.viewport
+		const position = total > this.viewport || this.scrollOffset > 0
 			? ` ${this.scrollOffset + 1}–${Math.min(total, this.scrollOffset + this.viewport)}/${total}`
 			: "";
 		const hint = ` ${this.notice ?? t("gitPreview.hint")}${position} `;
@@ -334,16 +479,19 @@ export class GitPreviewPanel implements Component {
 
 export function showGitPreview(options: {
 	tui: TUI;
-	theme: () => PreviewTheme;
+	theme: () => Pick<Theme, "fg" | "bg" | "getBgAnsi">;
 	root: string;
 	onClose: () => void;
 }): () => void {
 	const { tui, root } = options;
 	let closed = false;
 	let handle: OverlayHandle | undefined;
+	let closeFile: (() => void) | undefined;
 	const close = () => {
 		if (closed) return;
 		closed = true;
+		panel.dispose();
+		closeFile?.();
 		handle?.hide();
 		options.onClose();
 	};
@@ -352,13 +500,23 @@ export function showGitPreview(options: {
 		maxHeight: () => Math.max(1, Math.min(tui.terminal.rows - 2, Math.floor(tui.terminal.rows * 0.8))),
 		requestRender: () => { if (!closed) tui.requestRender(); },
 		onClose: close,
-		onOpen: async file => {
-			const path = resolve(root, file.path);
-			await lstat(path);
-			await openLocalPath(path);
+		loadHistory: page => readGitHistory(root, page),
+		loadCommit: commit => readCommitChanges(root, commit),
+		onOpen: async (file, source) => {
+			if (closed) return;
+			closeFile?.();
+			closeFile = showGitCodePreview({
+				tui,
+				theme: options.theme,
+				root,
+				file,
+				source,
+				onClose: () => { closeFile = undefined; },
+			});
 		},
 	});
 	handle = tui.showOverlay(panel, { anchor: "center", width: "90%", maxHeight: "80%", margin: 1 });
+	panel.start();
 	void readGitChanges(root).then(files => {
 		if (closed) return;
 		panel.setFiles(files);

@@ -1,8 +1,8 @@
 /** File-level Git preview data, loaded on demand rather than by the footer's polling loop. */
-import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { lstat, open, readlink } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { resolveGitPath as localPath, runGit as git } from "./git-command.ts";
+import { compareGitFiles } from "./git-path-order.ts";
 
 export type GitChangeCategory =
 	| "modified"
@@ -52,38 +52,7 @@ const STATUS_CATEGORIES: ReadonlyArray<readonly [string, GitChangeCategory]> = [
 	["C", "copied"],
 	["T", "typeChanged"],
 ];
-const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
-const GIT_TIMEOUT_MS = 15_000;
 const BINARY_PROBE_BYTES = 8000;
-
-/** Close stdin even when it is empty: Git plumbing must never wait for terminal input. */
-function git(root: string, args: string[], input?: Buffer, differencesAllowed = false): Promise<Buffer> {
-	return new Promise((resolveOutput, reject) => {
-		const child = execFile("git", ["--no-optional-locks", ...args], {
-			cwd: root,
-			encoding: "buffer",
-			maxBuffer: MAX_OUTPUT_BYTES,
-			timeout: GIT_TIMEOUT_MS,
-			windowsHide: true,
-		}, (error, stdout) => {
-			if (error && !(differencesAllowed && error.code === 1)) reject(error);
-			else resolveOutput(stdout);
-		});
-		child.stdin?.on("error", () => {});
-		child.stdin?.end(input);
-	});
-}
-
-/** Validate paths before any filesystem access; Git paths must stay inside this repository. */
-function localPath(root: string, path: string): string | undefined {
-	if (!path || path.includes("\0") || isAbsolute(path)) return undefined;
-	const target = resolve(root, path);
-	const suffix = relative(root, target);
-	if (!suffix || suffix === ".." || suffix.startsWith("../") || suffix.startsWith("..\\") || isAbsolute(suffix)) {
-		return undefined;
-	}
-	return target;
-}
 
 /** Consume only metadata separators: spaces and tabs inside a filename are not delimiters. */
 function statusFields(record: string, separators: number): { fields: string[]; path: string } | undefined {
@@ -295,9 +264,5 @@ export async function readGitChanges(root: string): Promise<GitChangeFile[]> {
 			file.deletions = null;
 		}
 	});
-	return files.sort((left, right) => {
-		const a = left.path.toLowerCase();
-		const b = right.path.toLowerCase();
-		return a < b ? -1 : a > b ? 1 : left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
-	});
+	return files.sort(compareGitFiles);
 }
