@@ -35,7 +35,7 @@ export const en = {
   "gitPreview.codeTooLarge": "File size or diff complexity exceeds the safe preview limit (16 MiB per version).",
   "gitPreview.codeUnavailable": "This entry has no readable file content (for example, a submodule or an unavailable path).",
   "gitPreview.codeEmpty": "Empty file.",
-  "gitPreview.codeHint": "↑/↓ Scroll · ←/→ Pan · Esc Back",
+  "gitPreview.codeHint": "↑/↓ Scroll · ←/→ Pan · Ruler: Jump · Esc Back",
   "language.description": "Switch MPEP language: Auto / Chinese / English",
   "language.title": "MPEP language",
   "language.auto": "Auto",

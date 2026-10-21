@@ -20,6 +20,11 @@ import {
 	readGitFileDiff,
 } from "../shared/git-file-diff.ts";
 import { t } from "../shared/i18n/index.ts";
+import {
+	buildDiffOverview,
+	DIFF_OVERVIEW_WIDTH,
+	type DiffOverviewBucket,
+} from "./git-diff-overview.ts";
 import { displayPath } from "./git-preview-format.ts";
 
 type CodeTheme = Pick<Theme, "fg" | "bg" | "getBgAnsi">;
@@ -81,6 +86,8 @@ export class GitCodePreviewPanel implements Component {
 	private vertical = 0;
 	private horizontal = 0;
 	private closeStart = Number.POSITIVE_INFINITY;
+	private overviewStart = Number.POSITIVE_INFINITY;
+	private overview: DiffOverviewBucket[] = [];
 
 	constructor(options: GitCodePreviewOptions) {
 		this.options = options;
@@ -99,28 +106,41 @@ export class GitCodePreviewPanel implements Component {
 
 	invalidate(): void {
 		this.highlighted = undefined;
+		this.overview = [];
 	}
 
 	render(width: number): string[] {
 		this.width = Math.max(0, Math.floor(width));
+		this.viewport = 0;
+		this.overviewStart = Number.POSITIVE_INFINITY;
 		if (this.width === 0) return [];
 		if (this.width < 4) {
-			this.viewport = 0;
 			return [truncateToWidth(displayPath(this.options.path), this.width, "")];
 		}
 		const text = this.data?.kind === "text" ? this.data : undefined;
 		const message = text?.rows.length ? undefined : this.message();
 		const messages = message ? wrapTextWithAnsi(message, Math.max(1, this.width - 4)) : [];
 		const count = text?.rows.length || messages.length;
-		const height = Math.min(count + 2, Math.max(1, Math.floor(this.options.maxHeight())));
+		// Keep the full available height even for short files so the track stays clickable.
+		const height = Math.max(1, Math.floor(this.options.maxHeight()));
 		this.viewport = Math.max(0, height - 2);
 		this.clamp(count);
 		if (height === 1) return [this.top()];
 
+		const overviewWidth = text?.rows.length && this.width >= 10 && this.viewport > 0
+			? DIFF_OVERVIEW_WIDTH : 0;
+		if (overviewWidth && text) {
+			this.overviewStart = this.width - 1 - overviewWidth;
+			// Reuse the full-file aggregation while scrolling; rebuild only for data/height changes.
+			if (this.overview.length !== this.viewport) {
+				this.overview = buildDiffOverview(text.rows, this.viewport);
+			}
+		}
+
 		const lines: string[] = [];
 		if (text && text.rows.length) {
 			const highlighted = this.highlight(text);
-			const codeWidth = Math.max(0, this.width - 6);
+			const codeWidth = Math.max(0, this.width - 6 - overviewWidth);
 			this.horizontal = Math.min(this.horizontal, Math.max(0, highlighted.maxWidth - codeWidth));
 			for (const row of text.rows.slice(this.vertical, this.vertical + this.viewport)) {
 				const source = row.kind === "removed"
@@ -131,12 +151,15 @@ export class GitCodePreviewPanel implements Component {
 				const marker = row.kind === "added"
 					? theme.fg("toolDiffAdded", "+ ")
 					: row.kind === "removed" ? theme.fg("toolDiffRemoved", "- ") : "  ";
-				lines.push(this.frame(marker + code, row.kind));
+				lines.push(this.frame(marker + code, row.kind, lines.length));
 			}
 		} else {
 			for (const line of messages.slice(this.vertical, this.vertical + this.viewport)) {
 				lines.push(this.frame(this.options.theme().fg(this.failed ? "error" : "muted", line)));
 			}
+		}
+		while (lines.length < this.viewport) {
+			lines.push(this.frame("", undefined, lines.length));
 		}
 		return [this.top(), ...lines, this.bottom(count)];
 	}
@@ -173,6 +196,21 @@ export class GitCodePreviewPanel implements Component {
 		if (event.type !== "click") return undefined;
 		if (event.y === 0 && event.x >= this.closeStart && event.x < this.width - 1) {
 			this.options.onClose();
+		} else if (event.x >= this.overviewStart && event.x < this.width - 1 &&
+			event.y >= 1 && event.y <= this.viewport) {
+			const bucket = this.overview[event.y - 1];
+			if (bucket) {
+				// Prefer the clicked change lane, but keep both columns useful for sparse changes.
+				const change = event.x === this.overviewStart
+					? bucket.removed ?? bucket.added
+					: bucket.added ?? bucket.removed;
+				const proportional = Math.round(
+					(event.y - 1) * (this.rowCount() - 1) / Math.max(1, this.viewport - 1),
+				);
+				this.vertical = (change ?? proportional) - Math.floor(this.viewport / 2);
+				this.clamp(this.rowCount());
+				return { handled: true, render: true };
+			}
 		}
 		return { handled: true };
 	}
@@ -193,6 +231,24 @@ export class GitCodePreviewPanel implements Component {
 
 	private clamp(count: number): void {
 		this.vertical = Math.max(0, Math.min(this.vertical, Math.max(0, count - this.viewport)));
+	}
+
+	private overviewCell(index: number): string {
+		const bucket = this.overview[index];
+		if (!bucket) return "";
+		const theme = this.options.theme();
+		const removed = theme.fg(
+			bucket.removed === undefined ? "borderMuted" : "toolDiffRemoved",
+			bucket.removed === undefined ? "│" : "▐",
+		);
+		const added = theme.fg(
+			bucket.added === undefined ? "borderMuted" : "toolDiffAdded",
+			bucket.added === undefined ? "│" : "▌",
+		);
+		const cells = removed + added;
+		// Half blocks expose the viewport background even when both change lanes are filled.
+		const visible = bucket.start < this.vertical + this.viewport && bucket.end > this.vertical;
+		return visible ? theme.bg("selectedBg", cells) : cells;
 	}
 
 	private highlight(data: GitTextDiff): HighlightedFile {
@@ -222,9 +278,12 @@ export class GitCodePreviewPanel implements Component {
 		return this.highlighted;
 	}
 
-	private frame(text: string, kind?: "context" | "added" | "removed"): string {
+	private frame(text: string, kind?: "context" | "added" | "removed", overviewRow?: number): string {
 		const theme = this.options.theme();
-		const inner = Math.max(0, this.width - 2);
+		const overview = Number.isFinite(this.overviewStart) && overviewRow !== undefined
+			? this.overviewCell(overviewRow) : "";
+		// Reserve the track before clipping or painting code; diff backgrounds stop here too.
+		const inner = Math.max(0, this.width - 2 - visibleWidth(overview));
 		const padding = Math.min(1, Math.floor(inner / 2));
 		const content = truncateToWidth(text, Math.max(0, inner - padding * 2), "");
 		let line = " ".repeat(padding) + content;
@@ -235,7 +294,7 @@ export class GitCodePreviewPanel implements Component {
 			// Foreground token colors remain untouched by this separate layer.
 			line = theme.bg(color, line.replace(/\u001b\[(?:0|49)?m/g, reset => reset + theme.getBgAnsi(color)));
 		}
-		return theme.fg("border", "│") + line + theme.fg("border", "│");
+		return theme.fg("border", "│") + line + overview + theme.fg("border", "│");
 	}
 
 	private top(): string {

@@ -36,7 +36,7 @@ export const zhCN = {
   "gitPreview.codeTooLarge": "文件大小或差异复杂度超过安全预览限制（单个版本最大 16 MiB）。",
   "gitPreview.codeUnavailable": "此条目没有可读取的文件内容，例如子模块或不可访问的路径。",
   "gitPreview.codeEmpty": "空文件。",
-  "gitPreview.codeHint": "↑/↓ 滚动 · ←/→ 横移 · Esc 返回",
+  "gitPreview.codeHint": "↑/↓ 滚动 · ←/→ 横移 · 点击标尺跳转 · Esc 返回",
   "language.description": "切换 MPEP 语言：自动 / 简体中文 / English",
   "language.title": "MPEP 语言",
   "language.auto": "自动",
