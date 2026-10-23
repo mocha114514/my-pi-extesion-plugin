@@ -196,7 +196,6 @@ Keep going until the task is complete, then call submit_result exactly once.
 	"reviewer.md": `---
 name: reviewer
 description: Code review of a patch or diff before merge. Quality and security analysis with evidence-backed, priority-ranked findings.
-tools: read, grep, find, ls, bash
 thinking: high
 output:
   properties:
@@ -241,7 +240,9 @@ Find bugs the author wants fixed before merge.
 1. Get the patch: \`git diff\`, \`git show\`, or the diff supplied in the task.
 2. Read the full context of every modified file.
 3. Collect findings, then call submit_result exactly once with the verdict and findings.
-Bash is read-only here: \`git diff\`, \`git log\`, \`git show\`. NEVER edit files, run builds, or execute state-changing commands.
+Use Bash and PowerShell only for read-only inspection and review commands.
+NEVER modify project source files, run builds, or execute state-changing shell commands.
+If the task explicitly requests a file-based review artifact (such as a report), you MAY use \`edit\`/\`write\` solely for that artifact; do not modify any other files.
 </procedure>
 
 <criteria>
