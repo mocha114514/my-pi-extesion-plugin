@@ -2,9 +2,9 @@
  * TUI presence for live subagent instances.
  *
  * Two pieces:
- *   - Indicator: a one-row widget above the editor ("● N subagents"), colored
- *     by the most urgent status present. Hidden entirely when the pool is
- *     empty. Click toggles the overlay.
+ *   - Indicator: the left slot of the shared row above the editor ("● N subagents"),
+ *     colored by the most urgent status present. Hidden entirely when the pool is
+ *     empty. The model occupies the right slot. Click toggles the overlay.
  *   - Overlay: a floating, non-focus-capturing panel anchored bottom-left
  *     (just above the editor), one row per instance with a colored status dot,
  *     id, model and thinking level. Capped height with mouse-wheel scrolling.
@@ -24,9 +24,9 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { t } from "../shared/i18n/index.ts";
+import { setEditorStatusSlot } from "../shared/editor-status-row.ts";
 import type { Instance, InstancePool, InstanceStatus } from "./pool.ts";
 
-const WIDGET_KEY = "mpep-subagent";
 /** Content rows visible before wheel scrolling kicks in. */
 const MAX_VIEWPORT_ROWS = 8;
 
@@ -223,7 +223,7 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 		}
 	};
 
-	ctx.ui.setWidget(WIDGET_KEY, (tuiInstance) => {
+	const indicatorSlot = setEditorStatusSlot(ctx.ui, "left", (tuiInstance) => {
 		tui = tuiInstance;
 		return new SubagentIndicator(ctx, pool, toggleOverlay);
 	});
@@ -252,7 +252,7 @@ export function installSubagentWidget(ctx: ExtensionContext, pool: InstancePool)
 			unsubscribe();
 			process.stdout.off("resize", onResize);
 			closeOverlay();
-			ctx.ui.setWidget(WIDGET_KEY, undefined);
+			indicatorSlot.dispose();
 			tui = undefined;
 		},
 	};

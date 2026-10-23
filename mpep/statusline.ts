@@ -6,6 +6,7 @@ import {
 	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import { t } from "./shared/i18n/index.ts";
+import { setEditorStatusSlot } from "./shared/editor-status-row.ts";
 import { isPluginEnabled } from "./manager/preferences.ts";
 import { showGitPreview } from "./statusline/git-preview.ts";
 import {
@@ -27,7 +28,6 @@ const ORANGE = "\x1b[38;5;214m"; // Context warning (>80%)
 const RED_BRIGHT = "\x1b[91m"; // Context danger (>95%) and git merge conflicts
 const RESET = "\x1b[0m";
 
-const MODEL_WIDGET_KEY = "model-info";
 /** Repaint cadence for the token/context counters; independent of the git probe. */
 const REFRESH_INTERVAL_MS = 1000;
 /** How often the git area re-probes on its own. A round ending or a single click skips the wait. */
@@ -116,8 +116,9 @@ export default function (pi: ExtensionAPI) {
 			activeTracker = tracker;
 			tracker.start();
 
-			ui.setWidget(
-				MODEL_WIDGET_KEY,
+			const modelSlot = setEditorStatusSlot(
+				ui,
+				"right",
 				() => ({
 					invalidate() {},
 					render(width: number): string[] {
@@ -134,11 +135,9 @@ export default function (pi: ExtensionAPI) {
 						}
 
 						const text = truncateToWidth(label.replace(/[\r\n\t]/g, " "), width, "...".slice(0, width));
-						const padding = " ".repeat(Math.max(0, width - visibleWidth(text)));
-						return [`${padding}${CYAN}${text}${RESET}`];
+						return [`${CYAN}${text}${RESET}`];
 					},
 				}),
-				{ placement: "aboveEditor" },
 			);
 
 			// Reactively listen for branch switches and refresh automatically
@@ -159,7 +158,7 @@ export default function (pi: ExtensionAPI) {
 					if (activeTracker === tracker) activeTracker = null;
 					unsubBranch();
 					clearInterval(refreshTimer);
-					ui.setWidget(MODEL_WIDGET_KEY, undefined);
+					modelSlot.dispose();
 				},
 				invalidate() {},
 				render(width: number): string[] {
