@@ -13,9 +13,11 @@
  *   thinking      off|minimal|low|medium|high|xhigh|max; inherits when omitted
  *   tools         allowlist of tool names (comma string or YAML array)
  *   exclude_tools denylist of tool names (mutually exclusive with `tools`)
- *   extensions    extra extension files to load (YAML array), in addition to the
- *                 default compact-forewarn, responses-ws, and
- *                 responses-OpenAI-offical-search siblings. Discovery stays disabled
+ *   extensions    extra extension sources (YAML array), added after internal role
+ *                 defaults. bundled: paths resolve from the MPEP package; bare
+ *                 paths from Pi's global agent/extensions; ./ and ../ from the
+ *                 dispatch cwd; absolute paths stay unchanged; native npm/git/URL
+ *                 sources pass through to Pi. Discovery stays disabled
  *                 (--no-extensions); each plugin keeps its own guards.
  */
 
@@ -141,6 +143,11 @@ name: scout
 description: Exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff.
 tools: read, grep, find, ls
 thinking: medium
+extensions:
+  # - bundled:list/index.ts # MPEP package extension, resolved from the package root.
+  # - my-extension.ts # Global extension, resolved from Pi's agent/extensions directory.
+  # - ./extensions/my-extension.ts # Project path; ../ works too, and absolute paths stay unchanged.
+  # - npm:@scope/pi-extension # Native Pi package source; npm/git/URL sources pass through unchanged.
 output:
   properties:
     summary:
@@ -197,6 +204,11 @@ Keep going until the task is complete, then call submit_result exactly once.
 name: reviewer
 description: Code review of a patch or diff before merge. Quality and security analysis with evidence-backed, priority-ranked findings.
 thinking: high
+extensions:
+  # - bundled:list/index.ts # MPEP package extension, resolved from the package root.
+  # - my-extension.ts # Global extension, resolved from Pi's agent/extensions directory.
+  # - ./extensions/my-extension.ts # Project path; ../ works too, and absolute paths stay unchanged.
+  # - npm:@scope/pi-extension # Native Pi package source; npm/git/URL sources pass through unchanged.
 output:
   properties:
     overall_correctness:
@@ -276,6 +288,11 @@ Every finding MUST be patch-anchored and evidence-backed. A clean patch is a val
 name: worker
 description: Well-scoped implementation tasks delegated by the main agent. General-purpose executor with full tool access.
 thinking: medium
+extensions:
+  # - bundled:list/index.ts # MPEP package extension, resolved from the package root.
+  # - my-extension.ts # Global extension, resolved from Pi's agent/extensions directory.
+  # - ./extensions/my-extension.ts # Project path; ../ works too, and absolute paths stay unchanged.
+  # - npm:@scope/pi-extension # Native Pi package source; npm/git/URL sources pass through unchanged.
 output:
   properties:
     summary:

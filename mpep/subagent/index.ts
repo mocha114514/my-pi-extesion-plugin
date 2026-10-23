@@ -28,6 +28,7 @@ import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { discoverAgents, seedPresets, type AgentConfig } from "./agents.ts";
 import { RpcSubprocess } from "./client.ts";
+import { resolveAgentExtension } from "./extensions.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
 import { canonicalId, ensureSubagentDirs, instanceDir } from "./paths.ts";
 import { describeSchema } from "./schema.ts";
@@ -71,6 +72,11 @@ export default function (pi: ExtensionAPI): void {
 	const responsesWsPath = fileURLToPath(new URL("../responses-ws/index.ts", import.meta.url));
 	/** Hosted search and citation repair keep the same opt-in rules in each child. */
 	const responsesSearchPath = fileURLToPath(new URL("../responses-OpenAI-offical-search/index.ts", import.meta.url));
+	/** Additional model/session capabilities; each sibling keeps its own enable guard. */
+	const retryErrorNormalizerPath = fileURLToPath(new URL("../retry-error-normalizer/index.ts", import.meta.url));
+	const reasoningCleanupPath = fileURLToPath(new URL("../drop-useless-reasoning-item-before-compact/index.ts", import.meta.url));
+	const listExtensionPath = fileURLToPath(new URL("../list/index.ts", import.meta.url));
+	const tipsExtensionPath = fileURLToPath(new URL("../tips/index.ts", import.meta.url));
 
 	let ctx: ExtensionContext | undefined;
 	let pool: InstancePool | undefined;
@@ -112,9 +118,10 @@ export default function (pi: ExtensionAPI): void {
 		if (model) args.push("--model", model);
 		args.push("--thinking", thinking);
 		if (agent.tools) {
-			// The allowlist applies to extension tools too, so the channels the
-			// child needs must survive it: submit_result (structured delivery)
-			// and request_compaction (compact-forewarn is loaded by default).
+			// The allowlist applies to extension tools too: list_read/list_write/tips
+			// stay unavailable unless explicitly named, while event hooks and passive
+			// reminders still run. Keep the channels the child needs: submit_result
+			// (structured delivery) and request_compaction (compact-forewarn).
 			const tools = new Set(agent.tools);
 			if (agent.output) tools.add("submit_result");
 			tools.add("request_compaction");
@@ -123,14 +130,22 @@ export default function (pi: ExtensionAPI): void {
 		if (agent.excludeTools) {
 			args.push("--exclude-tools", agent.excludeTools.filter((t) => t !== "submit_result").join(","));
 		}
-		// Default sibling extensions + the agent's own declared ones (deduped).
+		// Shared defaults stay internal so bundled paths remain portable across installs.
 		const extensionPaths = new Set<string>([
 			compactForewarnPath,
 			responsesWsPath,
 			responsesSearchPath,
+			retryErrorNormalizerPath,
+			reasoningCleanupPath,
 		]);
+		// Scout stays a lean researcher: List has no practical value under its tool
+		// allowlist, and Tips would still inject passive reminders if loaded.
+		if (agent.name !== "scout") {
+			extensionPaths.add(listExtensionPath);
+			extensionPaths.add(tipsExtensionPath);
+		}
 		for (const extension of agent.extensions) {
-			extensionPaths.add(path.resolve(cwd, extension));
+			extensionPaths.add(resolveAgentExtension(extension, cwd));
 		}
 		for (const extensionPath of extensionPaths) {
 			args.push("--extension", extensionPath);
