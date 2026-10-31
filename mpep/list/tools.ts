@@ -3,7 +3,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@ea
 import { Text } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import { t } from "../shared/i18n/index.ts";
-import { formatList } from "./format.ts";
+import { formatList, type ListReadView } from "./format.ts";
 import {
 	appendItems,
 	blockedBy,
@@ -64,7 +64,20 @@ const writeSchema = Type.Object({
 	dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Replacement prerequisite IDs for update." })),
 }, { additionalProperties: false });
 
-const readSchema = Type.Object({}, { additionalProperties: false });
+const readSchema = Type.Object({
+	mode: Type.Optional(Type.Union([
+		Type.Literal("overview"),
+		Type.Literal("items"),
+		Type.Literal("full"),
+	], {
+		default: "overview",
+		description: "overview (default) omits item descriptions; items reads selected tasks in full; full reads the entire checklist.",
+	})),
+	ids: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+		minItems: 1,
+		description: "Required only for mode=items. Exact task IDs to read with complete descriptions; unknown IDs cause an error.",
+	})),
+}, { additionalProperties: false });
 
 interface ListToolDetails {
 	list?: ListState;
@@ -103,6 +116,16 @@ function validateWriteArguments(params: Static<typeof writeSchema>): void {
 	}
 }
 
+function getReadView(params: Static<typeof readSchema>): ListReadView {
+	const mode = params.mode ?? "overview";
+	if (mode === "items") {
+		if (!params.ids?.length) throw new Error("items mode requires a non-empty ids array.");
+		return { mode, ids: params.ids };
+	}
+	if (params.ids !== undefined) throw new Error("ids is only supported with mode=items.");
+	return { mode };
+}
+
 function requireList(store: ListStore): ListState {
 	const state = store.read();
 	if (!state) throw new Error("No checklist exists. Use list_write with action=create first.");
@@ -116,7 +139,7 @@ function summary(state: ListState): string {
 	return [
 		`Checklist ${state.id}, revision ${state.revision}: ${done}/${state.items.length} completed.`,
 		ready.length > 0 ? `Ready items: ${ready.map(item => item.id).join(", ")}.` : "No unblocked unfinished items.",
-		"The overall goal, completed items and descriptions are retained. Use list_read to inspect the complete checklist.",
+		"The overall goal, completed items and descriptions are retained. Use list_read for an overview, or mode=full to inspect the complete checklist.",
 	].join("\n");
 }
 
@@ -212,21 +235,30 @@ export function registerListTools(
 		name: "list_read",
 		label: "List Read",
 		description: [
-			"Read the FULL current checklist, including its complete overall goal, every completed item,",
-			"all description paragraphs, explicit dependencies and blocking IDs. State survives context compaction.",
-			"Legacy checklists explicitly report that no overall goal was recorded.",
-			"Revisit the goal to recover the global task and standards;",
-			"never infer the live state solely from an older compaction snapshot.",
+			"Read the current checklist in three modes. With no arguments, mode defaults to overview.",
+			"overview returns the title, complete overall goal and all task IDs, titles, completion states,",
+			"dependencies and blocking IDs, but omits item descriptions.",
+			"items requires ids and returns only those tasks with their full descriptions, in checklist display order;",
+			"the overall goal is omitted in this mode. Unknown IDs cause an error.",
+			"full returns the entire checklist, including the overall goal, every completed task and every description.",
+			"State survives context compaction. Legacy checklists explicitly report a missing goal in overview/full.",
+			"Revisit the goal to recover the global task and standards; never infer live state solely from an older snapshot.",
 		].join(" "),
-		promptSnippet: "Inspect the full checklist and its overall goal, including completed work and dependencies, even after compaction.",
+		promptSnippet: "Read a checklist overview by default, selected full tasks by ID, or the entire checklist with mode=full.",
+		promptGuidelines: [
+			"Start with list_read overview to recover the complete goal and current task status without all descriptions. " +
+				"Use mode=items with ids to read the full descriptions of tasks you will act on; " +
+				"use mode=full when every task's details are needed.",
+		],
 		parameters: readSchema,
 		executionMode: "sequential",
-		async execute(_id, _params, signal, _update, ctx) {
+		async execute(_id, params, signal, _update, ctx) {
 			if (signal?.aborted) throw new Error("Checklist read cancelled.");
+			const view = getReadView(params);
 			const state = getStore(ctx).read();
 			return {
-				// Full text must be in content: details alone is not visible to the LLM.
-				content: [{ type: "text", text: state ? formatList(state) : "No checklist exists yet." }],
+				// Only the chosen view belongs in model-visible content; details serve the UI.
+				content: [{ type: "text", text: state ? formatList(state, view) : "No checklist exists yet." }],
 				details: { list: state },
 			};
 		},
