@@ -13,6 +13,9 @@
  *   thinking      off|minimal|low|medium|high|xhigh|max; inherits when omitted
  *   tools         allowlist of tool names (comma string or YAML array)
  *   exclude_tools denylist of tool names (mutually exclusive with `tools`)
+ *   mcp           MCP server names from Pi's mcp.json (array or comma string).
+ *                 Only configured, enabled servers connect; unknown names are ignored.
+ *                 Omitted or empty means no MCP. Existing config is never changed.
  *   extensions    extra extension sources (YAML array), added after internal role
  *                 defaults. bundled: paths resolve from the MPEP package; bare
  *                 paths from Pi's global agent/extensions; ./ and ../ from the
@@ -24,6 +27,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { normalizeMcpNames } from "./mcp.ts";
 import { agentsDir } from "./paths.ts";
 import { isOutputSchema, type OutputSchemaNode } from "./schema.ts";
 
@@ -35,6 +39,7 @@ export interface AgentConfig {
 	model?: string;
 	thinking?: string;
 	extensions: string[];
+	mcp: string[];
 	/** Structured-output contract; when set the child must submit via submit_result. */
 	output?: OutputSchemaNode;
 	systemPrompt: string;
@@ -50,6 +55,7 @@ type AgentFrontmatter = {
 	model?: unknown;
 	thinking?: unknown;
 	extensions?: unknown;
+	mcp?: unknown;
 	output?: unknown;
 };
 
@@ -103,6 +109,7 @@ function loadAgentFile(filePath: string): AgentConfig | undefined {
 		model: typeof frontmatter.model === "string" ? frontmatter.model : undefined,
 		thinking,
 		extensions: parseStringList(frontmatter.extensions) ?? [],
+		mcp: normalizeMcpNames(parseStringList(frontmatter.mcp)),
 		output: isOutputSchema(frontmatter.output) ? frontmatter.output : undefined,
 		systemPrompt: body,
 		filePath,
@@ -143,6 +150,9 @@ name: scout
 description: Exploratory codebase research, rapid code analysis, and broad pattern searches. Fast read-only scout returning compressed context for handoff.
 tools: read, grep, find, ls
 thinking: medium
+# Optional: start only named, enabled servers already configured in Pi's mcp.json.
+# Unknown names are ignored; omitted or empty means no MCP.
+mcp:
 extensions:
   # - bundled:list/index.ts # MPEP package extension, resolved from the package root.
   # - my-extension.ts # Global extension, resolved from Pi's agent/extensions directory.
@@ -204,6 +214,9 @@ Keep going until the task is complete, then call submit_result exactly once.
 name: reviewer
 description: Code review of a patch or diff before merge. Quality and security analysis with evidence-backed, priority-ranked findings.
 thinking: high
+# Optional: start only named, enabled servers already configured in Pi's mcp.json.
+# Unknown names are ignored; omitted or empty means no MCP.
+mcp:
 extensions:
   # - bundled:list/index.ts # MPEP package extension, resolved from the package root.
   # - my-extension.ts # Global extension, resolved from Pi's agent/extensions directory.
@@ -288,6 +301,9 @@ Every finding MUST be patch-anchored and evidence-backed. A clean patch is a val
 name: worker
 description: Well-scoped implementation tasks delegated by the main agent. General-purpose executor with full tool access.
 thinking: medium
+# Optional: start only named, enabled servers already configured in Pi's mcp.json.
+# Unknown names are ignored; omitted or empty means no MCP.
+mcp:
 extensions:
   # - bundled:list/index.ts # MPEP package extension, resolved from the package root.
   # - my-extension.ts # Global extension, resolved from Pi's agent/extensions directory.

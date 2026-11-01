@@ -29,6 +29,7 @@ import { isPluginEnabled } from "../manager/preferences.ts";
 import { discoverAgents, seedPresets, type AgentConfig } from "./agents.ts";
 import { RpcSubprocess } from "./client.ts";
 import { resolveAgentExtension } from "./extensions.ts";
+import { MCP_SERVERS_ENV, mcpToolNames } from "./mcp.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
 import { canonicalId, ensureSubagentDirs, instanceDir } from "./paths.ts";
 import { describeSchema } from "./schema.ts";
@@ -84,6 +85,7 @@ export default function (pi: ExtensionAPI): void {
 
 	/** Absolute path of the child-side companion extension (this plugin ships it). */
 	const childExtensionPath = fileURLToPath(new URL("./child-output.ts", import.meta.url));
+	const childMcpPath = fileURLToPath(new URL("./child-mcp.ts", import.meta.url));
 	/** Sibling plugin loaded into every subagent by default: pre-compaction
 	 * forewarning matters just as much in a child's context window. Its own
 	 * isPluginEnabled guard still applies, so disabling it in the plugin
@@ -143,7 +145,7 @@ export default function (pi: ExtensionAPI): void {
 			// stay unavailable unless explicitly named, while event hooks and passive
 			// reminders still run. Keep the channels the child needs: submit_result
 			// (structured delivery) and request_compaction (compact-forewarn).
-			const tools = new Set(agent.tools);
+			const tools = new Set([...agent.tools, ...mcpToolNames(agent.mcp)]);
 			if (agent.output) tools.add("submit_result");
 			tools.add("request_compaction");
 			args.push("--tools", [...tools].join(","));
@@ -168,19 +170,28 @@ export default function (pi: ExtensionAPI): void {
 		for (const extension of agent.extensions) {
 			extensionPaths.add(resolveAgentExtension(extension, cwd));
 		}
+		if (agent.mcp.length > 0) {
+			// --no-extensions also disables built-ins. Explicitly restore the MCP
+			// discovery helpers, but use our filtered bridge instead of builtin:mcp.
+			extensionPaths.add("builtin:tool-search");
+			extensionPaths.add("builtin:codemode");
+			extensionPaths.add(childMcpPath);
+		}
 		for (const extensionPath of extensionPaths) {
 			args.push("--extension", extensionPath);
 		}
 
+		// Always reset the selection, including an empty one, rather than inheriting
+		// an ancestor process's selection. Only names, never config secrets, travel.
+		const env: Record<string, string> = {
+			[MCP_SERVERS_ENV]: JSON.stringify(agent.mcp),
+		};
 		// Structured output: load the companion extension into the child and hand
 		// it the schema + output path through the environment.
-		let env: Record<string, string> | undefined;
 		if (agent.output) {
 			args.push("--extension", childExtensionPath);
-			env = {
-				MPEP_SUBAGENT_SCHEMA: JSON.stringify(agent.output),
-				MPEP_SUBAGENT_OUTPUT: path.join(instance.dir, "output.json"),
-			};
+			env.MPEP_SUBAGENT_SCHEMA = JSON.stringify(agent.output);
+			env.MPEP_SUBAGENT_OUTPUT = path.join(instance.dir, "output.json");
 		}
 
 		const promptBody = agent.output
