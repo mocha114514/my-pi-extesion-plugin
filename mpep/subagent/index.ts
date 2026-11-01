@@ -54,6 +54,27 @@ interface RunOutcome {
 	messages: unknown;
 }
 
+/** Validate before creating instance files; never create or silently replace a cwd. */
+function resolveWorkingDirectory(cwd: string): string {
+	// A rooted Windows path without a drive still depends on the current drive.
+	const driveRelativeRoot = process.platform === "win32" && /^[\\/]+$/.test(path.parse(cwd).root);
+	if (!path.isAbsolute(cwd) || driveRelativeRoot) {
+		throw new Error(`Subagent cwd must be an absolute path: "${cwd}".`);
+	}
+
+	const resolved = path.resolve(cwd);
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(resolved);
+	} catch (error) {
+		throw new Error(`Cannot access subagent cwd "${resolved}": ${(error as Error).message}`);
+	}
+	if (!stat.isDirectory()) {
+		throw new Error(`Subagent cwd is not a directory: "${resolved}".`);
+	}
+	return resolved;
+}
+
 export default function (pi: ExtensionAPI): void {
 	if (!isPluginEnabled("subagent")) return;
 	installations[SLOT]?.();
@@ -557,7 +578,8 @@ export default function (pi: ExtensionAPI): void {
 		label: "Subagent",
 		description:
 			"Delegate a task to a specialized subagent running as an isolated resident Pi process. " +
-			"Start a new one with { agent, task }; continue an existing one with { instance, task }. " +
+			"Start a new one with { agent, task } and an optional absolute cwd (defaults to the main agent's directory); " +
+			"continue an existing one with { instance, task } in its original directory (omit cwd). " +
 			`Available agents: ${agentsSummary}. ` +
 			"Every dispatch is ASYNCHRONOUS: the call returns immediately, a light notification arrives when the " +
 			"subagent completes, and you fetch the full result with subagent_check. " +
@@ -572,6 +594,9 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({
 			agent: Type.Optional(Type.String({ description: "Agent name from a .md definition (required for a new instance)." })),
+			cwd: Type.Optional(Type.String({
+				description: "Absolute working directory for a NEW instance; defaults to the main agent's directory. Omit when continuing an existing instance.",
+			})),
 			task: Type.String({ description: "The task or follow-up instruction for the subagent." }),
 			instance: Type.Optional(Type.String({ description: "Existing instance id to continue; omit to start fresh." })),
 			name: Type.Optional(Type.String({
@@ -590,6 +615,9 @@ export default function (pi: ExtensionAPI): void {
 			let agentConfig: AgentConfig | undefined;
 
 			if (params.instance) {
+				if (params.cwd !== undefined) {
+					throw new Error("cwd can only be set when creating a new instance. Omit it to continue in the instance's original directory.");
+				}
 				// Continue an existing instance: resident process if kept, otherwise
 				// respawn from the on-disk session (recovered leftovers).
 				instance = resolveInstance(currentPool, params.instance);
@@ -617,14 +645,17 @@ export default function (pi: ExtensionAPI): void {
 						// All synchronous preparation lives inside the reservation: a
 						// throw here must roll the status back, or the instance wedges
 						// as "running" with no process behind it.
+						// Legacy metadata has no cwd; adopt the old default once, then persist it.
+						const cwd = resolveWorkingDirectory(instance.meta.cwd ?? context.cwd);
+						instance.meta.cwd = cwd;
 						fs.mkdirSync(instance.dir, { recursive: true });
-						const spawnPlan = buildSpawn(agentConfig, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+						const spawnPlan = buildSpawn(agentConfig, instance, cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
 						instance.meta.model = spawnPlan.model;
 						instance.meta.thinking = spawnPlan.thinking;
 						// A respawn builds the child from the CURRENT definition, so the
 						// structured-output contract follows the new process.
 						instance.meta.hasStructuredOutput = agentConfig.output !== undefined;
-						client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+						client = new RpcSubprocess(cwd, spawnPlan.args, spawnPlan.env);
 					} catch (error) {
 						instance.meta.status = previousStatus;
 						throw error;
@@ -678,6 +709,7 @@ export default function (pi: ExtensionAPI): void {
 					const available = agents.map((a) => `${a.name}: ${a.description}`).join("\n") || "(none)";
 					throw new Error(`Unknown agent "${params.agent}". Available agents:\n${available}`);
 				}
+				const cwd = resolveWorkingDirectory(params.cwd ?? context.cwd);
 				const id = composeInstanceId(agent.name, params.name, currentPool);
 				const dir = instanceDir(context.sessionManager.getSessionId() || `pid-${process.pid}`, id);
 				fs.mkdirSync(dir, { recursive: true });
@@ -685,6 +717,7 @@ export default function (pi: ExtensionAPI): void {
 					meta: {
 						id,
 						agent: agent.name,
+						cwd,
 						sessionId: randomUUID(),
 						task,
 						createdAt: Date.now(),
@@ -708,10 +741,10 @@ export default function (pi: ExtensionAPI): void {
 					// buildSpawn writes prompt.md: a synchronous failure here (ENOSPC
 					// etc.) must not leave the registered instance wedged in "running"
 					// with no process behind it — mirror the respawn branch's rollback.
-					const spawnPlan = buildSpawn(agent, instance, context.cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
+					const spawnPlan = buildSpawn(agent, instance, cwd, context.thinkingLevel ?? "off", context.model ? `${context.model.provider}/${context.model.id}` : undefined);
 					instance.meta.model = spawnPlan.model;
 					instance.meta.thinking = spawnPlan.thinking;
-					client = new RpcSubprocess(context.cwd, spawnPlan.args, spawnPlan.env);
+					client = new RpcSubprocess(cwd, spawnPlan.args, spawnPlan.env);
 				} catch (error) {
 					instance.meta.status = "recovered";
 					currentPool.saveMeta(instance);

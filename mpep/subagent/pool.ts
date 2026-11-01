@@ -27,6 +27,8 @@ export type InstanceStatus = "running" | "awaiting_decision" | "kept" | "recover
 export interface InstanceMeta {
 	id: string;
 	agent: string;
+	/** Absolute working directory, fixed at creation; absent only in legacy metadata. */
+	cwd?: string;
 	/** Pi session id (uuid); the session file is <dir>/<sessionId>.jsonl. */
 	sessionId: string;
 	task: string;
