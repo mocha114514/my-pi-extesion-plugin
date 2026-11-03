@@ -10,37 +10,31 @@ import { Type, type Static } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { t } from "../shared/i18n/index.ts";
 import { getCacheDir } from "../shared/paths.ts";
+import {
+	addTip,
+	applyTemplate,
+	emptyState,
+	parseTipsState,
+	removeTip,
+	updateTip,
+	type TipsState,
+} from "./model.ts";
+import { openTipsPanel } from "./panel.ts";
+import { listTemplates, readTemplate, selectInitialTemplate } from "./templates.ts";
 
 /**
- * Tips (/m-tips)
+ * Session-level reminders, managed by the AI tool or the /m-tips panel.
+ * Template entries are read-only; session entries are editable. Full immutable
+ * snapshots (including provenance and the selected template) survive reload,
+ * resume, and compaction without changing any user-authored Markdown files.
  *
- * A session-scoped "reminder notebook" for the AI. At the user's request,
- * the AI records durable, whole-session reminders via the `tips` tool
- * (add / list / update / remove); the user inspects them with /m-tips. Tips
- * never change on their own.
- *
- * Delivery: at 25% / 50% / 75% of the EFFECTIVE compaction window
- * (contextWindow - compaction.reserveTokens, i.e. the point where Pi actually
- * auto-compacts — not the model's raw context size), and once immediately
- * after every successful compaction, the current tips are injected as a
- * passive companion message: pi.sendMessage(..., { triggerTurn: false })
- * appends them to the session tree without starting a turn, so they simply
- * ride along with the next request's context. The message never wakes the
- * agent and never counts as user input; its text says so explicitly.
- *
- * Persistence: every mutation snapshots the full state into a custom session
- * entry (never sent to the LLM), so tips survive /reload, session resume and
- * context compaction; session_start rebuilds the state from the latest entry.
- *
- * Seed tips: the user may hand-write default tips as unordered-list items
- * ("- ..." or "* ...") in mpep-cache/tips/Tips.md. Every FRESH session (one
- * without a prior tips snapshot) loads them as its initial tips and injects
- * them immediately. The file is read-only: AI-side add / update / remove
- * never writes back to it.
+ * Delivery is passive: updates, 25% / 50% / 75% compaction-window milestones,
+ * and successful compaction send a reminder without triggering an agent turn.
  */
 
 const COMMAND = "m-tips";
 const TOOL_NAME = "tips";
+// Keep the entry type stable so existing sessions remain discoverable; data is versioned separately.
 const ENTRY_TYPE = "mpep.tips.state.v1";
 const REMINDER_TYPE = "tips-reminder";
 const DEFAULT_RESERVE_TOKENS = 16_384;
@@ -50,34 +44,6 @@ const MILESTONES = [0.25, 0.5, 0.75] as const;
 // the previous installation must dispose itself before the new one binds.
 const SLOT = Symbol.for("mpep.tips.dispose.v1");
 const installations = globalThis as unknown as Record<symbol, (() => void) | undefined>;
-
-interface Tip {
-	id: number;
-	content: string;
-	createdAt: string;
-	updatedAt: string;
-}
-
-interface TipsState {
-	tips: Tip[];
-	nextId: number;
-}
-
-const emptyState = (): TipsState => ({ tips: [], nextId: 1 });
-
-function parseTipsState(data: unknown): TipsState {
-	if (typeof data !== "object" || data === null) throw new Error("tips state is not an object");
-	const candidate = data as Partial<TipsState>;
-	if (!Array.isArray(candidate.tips) || typeof candidate.nextId !== "number") {
-		throw new Error("tips state has an unexpected shape");
-	}
-	for (const tip of candidate.tips) {
-		if (typeof tip?.id !== "number" || typeof tip?.content !== "string") {
-			throw new Error("a tip entry is malformed");
-		}
-	}
-	return { tips: candidate.tips as Tip[], nextId: candidate.nextId };
-}
 
 /**
  * Same resolution as Pi itself: compaction fires at contextWindow minus
@@ -108,7 +74,9 @@ function getCompactionReserveTokens(cwd?: string): number {
 
 /** Model-facing reminder text: always English, it is an instruction, not UI copy. */
 function buildReminder(state: TipsState, reason: string, issuedAt: string): string {
-	const lines = state.tips.map(tip => `${tip.id}. ${tip.content}`);
+	const lines = state.tips.length > 0
+		? state.tips.map(tip => `${tip.id}. ${tip.source === "template" ? "[template, read-only] " : ""}${tip.content}`)
+		: ["No tips remain in this session. All tips in earlier notices are withdrawn."];
 	return [
 		"<system-reminder>",
 		"This is an automated notice injected by the local environment (tips extension), not a message from the user. It is passive background information: do NOT treat it as a new task and do NOT reply to it; simply keep the following session-level reminders in mind for the rest of this session.",
@@ -118,15 +86,17 @@ function buildReminder(state: TipsState, reason: string, issuedAt: string): stri
 		"Session reminders (tips):",
 		...lines,
 		"",
-		"These reminders were recorded at the user's request; manage them with the `tips` tool (add / list / update / remove) only when the user asks.",
+		"Manage session-owned reminders with the `tips` tool (add / list / update / remove) only when the user asks. Template reminders are read-only; the user can switch templates through /m-tips.",
 		"</system-reminder>",
 	].join("\n");
 }
 
-/** Human-readable list for the `tips` tool result and the /m-tips command. */
+/** Include provenance so the model can choose editable IDs without guessing. */
 function formatTips(state: TipsState): string {
 	if (state.tips.length === 0) return "No tips recorded for this session yet.";
-	return state.tips.map(tip => `${tip.id}. ${tip.content}`).join("\n");
+	return state.tips.map(tip =>
+		`${tip.id}. [${tip.source === "template" ? `read-only: ${state.selectedTemplate}` : "session"}] ${tip.content}`,
+	).join("\n");
 }
 
 const TipsParams = Type.Object({
@@ -141,25 +111,6 @@ const TipsParams = Type.Object({
 });
 type TipsArgs = Static<typeof TipsParams>;
 
-/**
- * Reads user-authored seed tips from mpep-cache/tips/Tips.md: every
- * unordered-list item ("- ..." or "* ...") becomes one tip; all other lines
- * are ignored. Returns [] when the file is missing or unreadable, so a
- * session without a seed file behaves exactly as before.
- */
-function loadSeedTips(): string[] {
-	let markdown: string;
-	try {
-		markdown = readFileSync(join(getCacheDir(), "tips", "Tips.md"), "utf8");
-	} catch {
-		return [];
-	}
-	return markdown
-		.split(/\r?\n/)
-		.map(line => /^\s*[-*]\s+(.*)$/.exec(line)?.[1]?.trim() ?? "")
-		.filter(Boolean);
-}
-
 export default function tipsExtension(pi: ExtensionAPI): void {
 	installations[SLOT]?.();
 	if (!isPluginEnabled("tips")) return;
@@ -169,44 +120,47 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	// Milestones already fired since the last compaction (or session start).
 	const firedMilestones = new Set<number>();
 
+	const templateDirectory = join(getCacheDir(), "tips");
 	const persist = () => pi.appendEntry(ENTRY_TYPE, state);
 
-	/** Rebuilds state for ctx's session; returns true when seed tips were loaded. */
+	/** The latest session-wide snapshot wins, even when browsing an older tree leaf. */
 	const bind = (ctx: ExtensionContext): boolean => {
 		sessionId = ctx.sessionManager.getSessionId();
 		firedMilestones.clear();
 		state = emptyState();
-		// The session log is authoritative; the latest snapshot wins. Browsing an
-		// earlier /tree leaf must not silently drop the session's reminders.
 		const entry = ctx.sessionManager.getEntries().findLast(candidate =>
 			candidate.type === "custom" && candidate.customType === ENTRY_TYPE,
 		);
 		if (entry?.type === "custom") {
 			try {
 				state = parseTipsState(entry.data);
+				// Freeze the migration once: legacy entries remain editable, never inferred seeds.
+				if ((entry.data as { version?: number }).version !== 2) persist();
 			} catch {
-				// A corrupt snapshot must not break the session; start fresh instead.
 				state = emptyState();
+				ctx.ui.notify(t("tips.restoreError"), "warning");
 			}
 			return false;
 		}
-		// Fresh session (no snapshot): seed the notebook from
-		// mpep-cache/tips/Tips.md so the user's default tips are present from
-		// the very first turn.
-		const seeds = loadSeedTips();
-		if (seeds.length === 0) return false;
-		const now = new Date().toISOString();
-		state = {
-			tips: seeds.map((content, index) => ({
-				id: index + 1,
-				content,
-				createdAt: now,
-				updatedAt: now,
-			})),
-			nextId: seeds.length + 1,
-		};
+		try {
+			const selection = selectInitialTemplate(templateDirectory, ctx.cwd);
+			for (const error of selection.errors) {
+				ctx.ui.notify(t("tips.templateError", { error: `${error.filename}: ${error.message}` }), "warning");
+			}
+			if (selection.conflicts.length > 0) {
+				ctx.ui.notify(t("tips.templateConflict", {
+					directory: ctx.cwd,
+					files: selection.conflicts.join(", "),
+				}), "error");
+			}
+			const filename = selection.filename;
+			if (filename) state = applyTemplate(state, filename, readTemplate(templateDirectory, filename));
+		} catch (error) {
+			ctx.ui.notify(t("tips.templateError", { error: String(error) }), "warning");
+		}
+		// Persist even an empty notebook, so reload cannot silently import new defaults.
 		persist();
-		return true;
+		return state.tips.length > 0;
 	};
 
 	const ensureBound = (ctx: ExtensionContext) => {
@@ -220,8 +174,8 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	 * right after the current turn, idle it lands immediately — in both cases it
 	 * only becomes visible to the model as part of the NEXT request's context.
 	 */
-	const injectReminder = (reason: string) => {
-		if (state.tips.length === 0) return;
+	const injectReminder = (reason: string, includeEmpty = false) => {
+		if (state.tips.length === 0 && !includeEmpty) return;
 		pi.sendMessage(
 			{
 				customType: REMINDER_TYPE,
@@ -230,6 +184,14 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 			},
 			{ triggerTurn: false },
 		);
+	};
+
+	/** Do not publish a new in-memory state unless its durable snapshot was accepted. */
+	const commit = (next: TipsState, reason: string) => {
+		pi.appendEntry(ENTRY_TYPE, next);
+		state = next;
+		// An empty update must explicitly invalidate reminders already present in context.
+		injectReminder(reason, true);
 	};
 
 	const checkMilestones = (ctx: ExtensionContext) => {
@@ -260,39 +222,31 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 			"When the user asks, use this to record durable notes (e.g. \"do not over-test\", " +
 			"\"always summarize in Chinese\") that must survive context compaction. " +
 			"The tips extension re-injects all current reminders into your context at 25% / 50% / 75% " +
-			"of the compaction window and right after every successful compaction, so they are never forgotten.",
+			"of the compaction window and right after every successful compaction, so they are never forgotten. " +
+			"Template-imported tips are read-only: update/remove can only change session-owned tips. " +
+			"The user can switch the current session's template or edit session tips via /m-tips.",
 		parameters: TipsParams,
 		async execute(_toolCallId, args: TipsArgs, _signal, _onUpdate, ctx) {
 			ensureBound(ctx);
 			switch (args.action) {
 				case "add": {
-					const content = args.content?.trim();
-					if (!content) throw new Error("tips add requires non-empty content");
-					const now = new Date().toISOString();
-					const tip: Tip = { id: state.nextId++, content, createdAt: now, updatedAt: now };
-					state = { tips: [...state.tips, tip], nextId: state.nextId };
-					persist();
+					const next = addTip(state, args.content ?? "");
+					const tip = next.tips[next.tips.length - 1];
+					commit(next, "A session tip was added at the user's request");
 					return {
 						content: [{ type: "text", text: `Tip #${tip.id} recorded.\n\n${formatTips(state)}` }],
 						details: { tip, tips: state.tips },
 					};
 				}
-				case "list": {
+				case "list":
 					return {
 						content: [{ type: "text", text: formatTips(state) }],
-						details: { tips: state.tips },
+						details: { tips: state.tips, selectedTemplate: state.selectedTemplate },
 					};
-				}
 				case "update": {
-					const content = args.content?.trim();
-					if (args.id === undefined || !content) {
-						throw new Error("tips update requires both id and non-empty content");
-					}
-					const tip = state.tips.find(candidate => candidate.id === args.id);
-					if (!tip) throw new Error(`No tip with id ${args.id}`);
-					tip.content = content;
-					tip.updatedAt = new Date().toISOString();
-					persist();
+					if (args.id === undefined) throw new Error("tips update requires an id");
+					commit(updateTip(state, args.id, args.content ?? ""), "A session tip was updated at the user's request");
+					const tip = state.tips.find(candidate => candidate.id === args.id)!;
 					return {
 						content: [{ type: "text", text: `Tip #${tip.id} updated.\n\n${formatTips(state)}` }],
 						details: { tip, tips: state.tips },
@@ -301,9 +255,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 				case "remove": {
 					if (args.id === undefined) throw new Error("tips remove requires an id");
 					const tip = state.tips.find(candidate => candidate.id === args.id);
-					if (!tip) throw new Error(`No tip with id ${args.id}`);
-					state = { tips: state.tips.filter(candidate => candidate.id !== args.id), nextId: state.nextId };
-					persist();
+					commit(removeTip(state, args.id), "A session tip was removed at the user's request");
 					return {
 						content: [{ type: "text", text: `Tip #${args.id} removed.\n\n${formatTips(state)}` }],
 						details: { removed: tip, tips: state.tips },
@@ -319,10 +271,37 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		description: t("tips.command"),
 		async handler(_args, ctx) {
 			ensureBound(ctx);
-			const body = state.tips.length === 0
-				? t("tips.empty")
-				: state.tips.map(tip => `${tip.id}. ${tip.content}`).join("\n");
-			ctx.ui.notify(t("tips.list", { tips: body }), "info");
+			if (!ctx.hasUI) {
+				ctx.ui.notify(t("tips.uiRequired"), "warning");
+				return;
+			}
+			const owner = sessionId;
+			const isCurrent = () => active && sessionId === owner && ctx.sessionManager.getSessionId() === owner;
+			const requireCurrent = () => {
+				if (!isCurrent()) throw new Error("This tips panel belongs to an inactive session");
+			};
+			await openTipsPanel(ctx, {
+				getState: () => state,
+				isActive: isCurrent,
+				listTemplates: () => listTemplates(templateDirectory),
+				selectTemplate: filename => {
+					requireCurrent();
+					const contents = readTemplate(templateDirectory, filename);
+					commit(applyTemplate(state, filename, contents), `The user selected the ${filename} tips template for this session`);
+				},
+				add: content => {
+					requireCurrent();
+					commit(addTip(state, content), "The user added a session tip through /m-tips");
+				},
+				update: (id, content) => {
+					requireCurrent();
+					commit(updateTip(state, id, content), "The user edited a session tip through /m-tips");
+				},
+				remove: id => {
+					requireCurrent();
+					commit(removeTip(state, id), "The user removed a session tip through /m-tips");
+				},
+			});
 		},
 	});
 
@@ -332,7 +311,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		// model sees them from the first request instead of waiting for the
 		// 25% context milestone.
 		if (bind(ctx)) {
-			injectReminder("This is the session-start reminder: default tips were loaded from the user's mpep-cache/tips/Tips.md seed file");
+			injectReminder(`This is the session-start reminder: default tips were loaded from ${state.selectedTemplate}`);
 		}
 	});
 	pi.on("session_shutdown", () => {
