@@ -21,10 +21,11 @@ import * as path from "node:path";
 import type { RpcSubprocess } from "./client.ts";
 import type { DisplayItem, UsageStats } from "./render.ts";
 import { instanceDir, mainSessionDir } from "./paths.ts";
+import { finishRunTiming, type RunTiming } from "./timing.ts";
 
 export type InstanceStatus = "running" | "awaiting_decision" | "kept" | "recovered";
 
-export interface InstanceMeta {
+export interface InstanceMeta extends RunTiming {
 	id: string;
 	agent: string;
 	/** Absolute working directory, fixed at creation; absent only in legacy metadata. */
@@ -171,6 +172,11 @@ export class InstancePool {
 				instance.client?.killSync();
 			} catch {
 				// Already gone.
+			}
+			if (instance.meta.status === "running" && instance.meta.runStartedAt !== undefined) {
+				// Unlike an unobserved crash, controlled shutdown has a known stop time.
+				finishRunTiming(instance.meta);
+				this.saveMeta(instance);
 			}
 		}
 	}

@@ -33,6 +33,7 @@ import { MCP_SERVERS_ENV, mcpToolNames } from "./mcp.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
 import { canonicalId, ensureSubagentDirs, instanceDir } from "./paths.ts";
 import { describeSchema } from "./schema.ts";
+import { finishRunTiming, formatRunTiming, startRunTiming } from "./timing.ts";
 import { installSubagentWidget, type SubagentWidgetController } from "./widget.ts";
 import {
 	aggregateUsage,
@@ -268,6 +269,7 @@ export default function (pi: ExtensionAPI): void {
 			// deliverable, meta holds the unread mark, so a main-session restart
 			// never loses a result.
 			const deliver = (output: string) => {
+				finishRunTiming(instance.meta);
 				instance.finalOutput = output;
 				instance.meta.status = "awaiting_decision";
 				instance.meta.unread = true;
@@ -306,6 +308,7 @@ export default function (pi: ExtensionAPI): void {
 					// local providers intermittently return empty responses). Treat it
 					// as an interruption, not a delivery — the context is intact and
 					// the work is usually harvestable by a cheap continuation.
+					finishRunTiming(instance.meta);
 					instance.meta.lastError = "Run ended without producing any output (likely a provider failure). The context is intact.";
 					instance.meta.unread = true;
 					instance.meta.status = "recovered";
@@ -336,6 +339,7 @@ export default function (pi: ExtensionAPI): void {
 						return;
 					}
 				}
+				finishRunTiming(instance.meta);
 				const message = error instanceof Error ? error.message : String(error);
 				instance.meta.lastError = message;
 				instance.meta.unread = true;
@@ -651,6 +655,9 @@ export default function (pi: ExtensionAPI): void {
 					// both spawn children onto the same session directory.
 					const previousStatus = instance.meta.status;
 					instance.meta.status = "running";
+					// Startup is not task execution; do not expose the previous run as current.
+					instance.meta.runStartedAt = undefined;
+					instance.meta.runEndedAt = undefined;
 					let client: RpcSubprocess;
 					try {
 						// All synchronous preparation lives inside the reservation: a
@@ -832,6 +839,9 @@ export default function (pi: ExtensionAPI): void {
 				fs.rmSync(path.join(instance.dir, "output.json"), { force: true });
 			}
 
+			// All dispatch paths meet here. Internal nudge prompts stay in this same run.
+			startRunTiming(instance.meta);
+			currentPool.saveMeta(instance);
 			runInBackground(instance, expectsOutput, task, currentPool);
 			return {
 				content: [{
@@ -964,6 +974,7 @@ export default function (pi: ExtensionAPI): void {
 					details: { instanceId: instance.meta.id, aborted: true },
 				};
 			}
+			finishRunTiming(instance.meta);
 			if (!retired || !instance.client.alive) {
 				// Either our 15s deadline force-reaped a wedged child, or the
 				// completion watchdog reaped it while our RPC abort was in flight
@@ -1008,7 +1019,8 @@ export default function (pi: ExtensionAPI): void {
 			"Fetch the result of a subagent instance and mark it as read. This is the ONLY way results are " +
 			"delivered: completion notifications are light pings, the full output lives here. " +
 			"Works for finished (awaiting decision), interrupted (recovered) and kept instances; for a still-running " +
-			"instance it reports progress instead. After reading a finished result you MUST keep or drop it via subagent_decide.",
+			"instance it reports progress instead. Includes the latest task's start time and elapsed duration (not lifetime totals). " +
+			"After reading a finished result you MUST keep or drop it via subagent_decide.",
 		promptSnippet: "fetch a subagent's result and mark it read",
 		parameters: Type.Object({
 			instance: Type.String({ description: "Instance id to check (exact id or the unique name suffix)." }),
@@ -1018,12 +1030,13 @@ export default function (pi: ExtensionAPI): void {
 			const currentPool = ensurePool(context);
 			const instance = resolveInstance(currentPool, params.instance);
 			if (!instance) throw new Error(`No subagent instance "${params.instance}" in this session. Use subagent_list to inspect.`);
+			const timing = formatRunTiming(instance.meta);
 
 			if (instance.meta.status === "running") {
 				return {
 					content: [{
 						type: "text" as const,
-						text: `Subagent "${instance.meta.id}" is still running. You will be notified when it completes; there is no result to read yet.`,
+						text: `${timing}\nSubagent "${instance.meta.id}" is still running. You will be notified when it completes; there is no result to read yet.`,
 					}],
 					details: {
 						instanceId: instance.meta.id,
@@ -1045,7 +1058,7 @@ export default function (pi: ExtensionAPI): void {
 				return {
 					content: [{
 						type: "text" as const,
-						text: `Subagent "${instance.meta.id}" was interrupted and has no result.\n` +
+						text: `${timing}\nSubagent "${instance.meta.id}" was interrupted and has no result.\n` +
 							(instance.meta.lastError ? `Last error: ${instance.meta.lastError}\n` : "") +
 							`Its context is preserved. Do NOT drop it right away: resume it first with a short wrap-up inquiry, e.g. ` +
 							`subagent({ instance: "${instance.meta.id}", task: "You were interrupted. Report what you accomplished so far, then submit your partial findings." }) ` +
@@ -1067,7 +1080,7 @@ export default function (pi: ExtensionAPI): void {
 			const output = instance.finalOutput
 				|| (instance.meta.lastError ? `No result was produced. ${instance.meta.lastError}` : "(subagent produced no text output)");
 			return {
-				content: [{ type: "text" as const, text: output + decisionInstruction(instance.meta.id) }],
+				content: [{ type: "text" as const, text: `${timing}\n${output}` + decisionInstruction(instance.meta.id) }],
 				details: {
 					instanceId: instance.meta.id,
 					agent: instance.meta.agent,
@@ -1088,19 +1101,22 @@ export default function (pi: ExtensionAPI): void {
 		description:
 			"List the subagent instances of the current session with their status " +
 			"(running / awaiting decision / kept / recovered leftover), whether the process is alive, " +
-			"and an UNREAD marker on results not yet fetched via subagent_check.",
+			"an UNREAD marker on results not yet fetched via subagent_check, and each latest task's start time " +
+			"and elapsed duration (not lifetime totals).",
 		promptSnippet: "list the subagent instances of the current session",
 		parameters: Type.Object({}),
 
 		async execute(_toolCallId, _params, _signal, _onUpdate, context) {
 			const currentPool = ensurePool(context);
 			const instances = currentPool.list();
+			const now = Date.now();
 			const lines = instances.length === 0
 				? ["Instances: none"]
 				: ["Instances:", ...instances.map((i) => {
 						const live = i.client?.alive ? "resident" : "no process";
 						const unread = i.meta.unread ? " UNREAD (call subagent_check)" : "";
-						return `  ${i.meta.id} [${i.meta.status}, ${live}${unread}] agent=${i.meta.agent} task="${truncate(i.meta.task, 80)}"`;
+						return `  ${i.meta.id} [${i.meta.status}, ${live}${unread}] agent=${i.meta.agent} ` +
+							`task="${truncate(i.meta.task, 80)}"\n    ${formatRunTiming(i.meta, now)}`;
 					})];
 			return { content: [{ type: "text" as const, text: lines.join("\n") }], details: {} };
 		},
