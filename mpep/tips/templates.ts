@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, normalize, parse } from "node:path";
 import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { TemplateSource } from "./model.ts";
 
 /** Only a leading, closed frontmatter block is metadata, never a reminder list. */
 function parseDocument(markdown: string): { frontmatter: Record<string, unknown>; body: string } {
@@ -37,7 +38,7 @@ export function listTemplates(directory: string): string[] {
 	const defaultName = names.includes("tips.md") ? "tips.md" : names.includes("Tips.md") ? "Tips.md" : undefined;
 	return [
 		...(defaultName ? [defaultName] : []),
-		...names.filter(name => /^tips-.+\.md$/.test(name)).sort((a, b) => a.localeCompare(b)),
+		...names.filter(name => /^(?:tips|Tips)-(path|model)-.+\.md$/.test(name)).sort((a, b) => a.localeCompare(b)),
 	];
 }
 
@@ -45,9 +46,9 @@ export function defaultTemplate(names: string[]): string | undefined {
 	return names.find(name => name === "tips.md" || name === "Tips.md");
 }
 
-export interface InitialTemplateSelection {
-	filename: string | undefined;
-	conflicts: string[];
+export interface TemplateSelection {
+	templates: TemplateSource[];
+	conflicts: { kind: "path" | "model"; target: string; filenames: string[] }[];
 	errors: { filename: string; message: string }[];
 }
 
@@ -66,31 +67,45 @@ function directoryKey(value: string): string {
 	return process.platform === "win32" ? key.toLowerCase() : key;
 }
 
-/** Fresh sessions alone use this resolver; persisted selections remain authoritative. */
-export function selectInitialTemplate(directory: string, cwd: string): InitialTemplateSelection {
+/** Resolve each category independently; ambiguous categories never load multiple files. */
+export function selectTemplates(directory: string, cwd: string, model?: string): TemplateSelection {
 	const names = listTemplates(directory);
 	const fallback = defaultTemplate(names);
-	const result: InitialTemplateSelection = { filename: fallback, conflicts: [], errors: [] };
-	const currentDirectory = directoryKey(cwd);
-	const matches: string[] = [];
+	const result: TemplateSelection = { templates: [], conflicts: [], errors: [] };
+	const targets = { path: directoryKey(cwd), model };
+	const matches: Record<"path" | "model", string[]> = { path: [], model: [] };
 	for (const filename of names) {
-		// The global default is a fallback only, even if it contains a path field.
+		// The global default never participates in matching, regardless of metadata.
 		if (filename === fallback) continue;
+		const kind = /^(?:tips|Tips)-path-/.test(filename) ? "path" : "model";
 		try {
 			const { frontmatter } = parseDocument(readFileSync(join(directory, filename), "utf8"));
-			if (frontmatter.path === undefined) continue;
-			if (!Array.isArray(frontmatter.path) || !frontmatter.path.every(value => typeof value === "string")) {
-				throw new Error("Tips frontmatter path must be a list of absolute directory strings");
+			const other = kind === "path" ? "model" : "path";
+			if (frontmatter[other] !== undefined) {
+				throw new Error(`A tips-${kind}-*.md template must not contain a ${other} field`);
 			}
-			const paths = frontmatter.path.map(value => directoryKey(value));
-			// Repeating a path within one file is still a single template match.
-			if (paths.includes(currentDirectory)) matches.push(filename);
+			const values = frontmatter[kind];
+			if (!Array.isArray(values) || !values.every(value => typeof value === "string")) {
+				throw new Error(`Tips frontmatter ${kind} must be a list of strings`);
+			}
+			const keys = kind === "path" ? values.map(value => directoryKey(value)) : values;
+			if (kind === "model" && !keys.every(value => /^[^/\s]+\/\S+$/.test(value))) {
+				throw new Error("Tips model must use provider/modelId without whitespace");
+			}
+			// Repeated values within one file still count as a single match.
+			if (targets[kind] !== undefined && keys.includes(targets[kind])) matches[kind].push(filename);
 		} catch (error) {
 			result.errors.push({ filename, message: error instanceof Error ? error.message : String(error) });
 		}
 	}
-	if (matches.length === 1) result.filename = matches[0];
-	else if (matches.length > 1) result.conflicts = matches;
+	for (const kind of ["path", "model"] as const) {
+		if (matches[kind].length === 1) result.templates.push({ kind, filename: matches[kind][0] });
+		else if (matches[kind].length > 1) {
+			result.conflicts.push({ kind, target: targets[kind]!, filenames: matches[kind] });
+		}
+	}
+	// Preserve conflict fallback, but never displace a valid match in the other category.
+	if (result.templates.length === 0 && fallback) result.templates.push({ kind: "default", filename: fallback });
 	return result;
 }
 

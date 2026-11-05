@@ -12,21 +12,22 @@ import { t } from "../shared/i18n/index.ts";
 import { getCacheDir } from "../shared/paths.ts";
 import {
 	addTip,
-	applyTemplate,
+	applyTemplates,
 	emptyState,
 	parseTipsState,
 	removeTip,
 	updateTip,
 	type TipsState,
+	type LoadedTemplate,
 } from "./model.ts";
 import { openTipsPanel } from "./panel.ts";
-import { listTemplates, readTemplate, selectInitialTemplate } from "./templates.ts";
+import { readTemplate, selectTemplates } from "./templates.ts";
 
 /**
  * Session-level reminders, managed by the AI tool or the /m-tips panel.
  * Template entries are read-only; session entries are editable. Full immutable
- * snapshots (including provenance and the selected template) survive reload,
- * resume, and compaction without changing any user-authored Markdown files.
+ * snapshots preserve session tips and source provenance across reload, resume,
+ * and compaction. Templates are re-matched automatically, never written back.
  *
  * Delivery is passive: updates, 25% / 50% / 75% compaction-window milestones,
  * and successful compaction send a reminder without triggering an agent turn.
@@ -86,7 +87,7 @@ function buildReminder(state: TipsState, reason: string, issuedAt: string): stri
 		"Session reminders (tips):",
 		...lines,
 		"",
-		"Manage session-owned reminders with the `tips` tool (add / list / update / remove) only when the user asks. Template reminders are read-only; the user can switch templates through /m-tips.",
+		"Manage session-owned reminders with the `tips` tool (add / list / update / remove) only when the user asks. Template reminders are read-only and automatically matched by startup directory and provider/model ID. Use /m-tips to view them or edit session reminders.",
 		"</system-reminder>",
 	].join("\n");
 }
@@ -95,7 +96,7 @@ function buildReminder(state: TipsState, reason: string, issuedAt: string): stri
 function formatTips(state: TipsState): string {
 	if (state.tips.length === 0) return "No tips recorded for this session yet.";
 	return state.tips.map(tip =>
-		`${tip.id}. [${tip.source === "template" ? `read-only: ${state.selectedTemplate}` : "session"}] ${tip.content}`,
+		`${tip.id}. [${tip.source === "template" ? `read-only: ${tip.template}` : "session"}] ${tip.content}`,
 	).join("\n");
 }
 
@@ -117,50 +118,71 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	let active = true;
 	let sessionId: string | undefined;
 	let state: TipsState = emptyState();
+	let currentModel: string | undefined;
+	const listeners = new Set<() => void>();
+	const notifyPanels = () => {
+		for (const listener of listeners) listener();
+	};
+	const modelKey = (model: ExtensionContext["model"]) => model ? `${model.provider}/${model.id}` : undefined;
 	// Milestones already fired since the last compaction (or session start).
 	const firedMilestones = new Set<number>();
 
 	const templateDirectory = join(getCacheDir(), "tips");
 	const persist = () => pi.appendEntry(ENTRY_TYPE, state);
 
-	/** The latest session-wide snapshot wins, even when browsing an older tree leaf. */
-	const bind = (ctx: ExtensionContext): boolean => {
+	/** Invalid files are reported independently so a valid source remains usable. */
+	const resolveTemplates = (ctx: ExtensionContext, model: string | undefined): TipsState => {
+		const loaded: LoadedTemplate[] = [];
+		try {
+			const selection = selectTemplates(templateDirectory, ctx.cwd, model);
+			for (const error of selection.errors) {
+				ctx.ui.notify(t("tips.templateError", { error: `${error.filename}: ${error.message}` }), "warning");
+			}
+			for (const conflict of selection.conflicts) {
+				ctx.ui.notify(t("tips.templateConflict", {
+					kind: conflict.kind,
+					target: conflict.target,
+					files: conflict.filenames.join(", "),
+				}), "error");
+			}
+			for (const source of selection.templates) {
+				try {
+					loaded.push({ ...source, contents: readTemplate(templateDirectory, source.filename) });
+				} catch (error) {
+					ctx.ui.notify(t("tips.templateError", { error: `${source.filename}: ${String(error)}` }), "warning");
+				}
+			}
+		} catch (error) {
+			ctx.ui.notify(t("tips.templateError", { error: String(error) }), "warning");
+		}
+		// Never retain a previous model's template when the new selection is empty or invalid.
+		return applyTemplates(state, loaded);
+	};
+
+	/** Restore session-owned entries, then resolve sources against the current environment. */
+	const bind = (ctx: ExtensionContext, model = ctx.model): boolean => {
 		sessionId = ctx.sessionManager.getSessionId();
+		currentModel = modelKey(model);
 		firedMilestones.clear();
 		state = emptyState();
 		const entry = ctx.sessionManager.getEntries().findLast(candidate =>
 			candidate.type === "custom" && candidate.customType === ENTRY_TYPE,
 		);
+		let migrated = false;
 		if (entry?.type === "custom") {
 			try {
 				state = parseTipsState(entry.data);
-				// Freeze the migration once: legacy entries remain editable, never inferred seeds.
-				if ((entry.data as { version?: number }).version !== 2) persist();
+				migrated = (entry.data as { version?: number }).version !== 3;
 			} catch {
-				state = emptyState();
 				ctx.ui.notify(t("tips.restoreError"), "warning");
 			}
-			return false;
 		}
-		try {
-			const selection = selectInitialTemplate(templateDirectory, ctx.cwd);
-			for (const error of selection.errors) {
-				ctx.ui.notify(t("tips.templateError", { error: `${error.filename}: ${error.message}` }), "warning");
-			}
-			if (selection.conflicts.length > 0) {
-				ctx.ui.notify(t("tips.templateConflict", {
-					directory: ctx.cwd,
-					files: selection.conflicts.join(", "),
-				}), "error");
-			}
-			const filename = selection.filename;
-			if (filename) state = applyTemplate(state, filename, readTemplate(templateDirectory, filename));
-		} catch (error) {
-			ctx.ui.notify(t("tips.templateError", { error: String(error) }), "warning");
-		}
-		// Persist even an empty notebook, so reload cannot silently import new defaults.
-		persist();
-		return state.tips.length > 0;
+		const previous = state;
+		state = resolveTemplates(ctx, currentModel);
+		if (!entry || migrated || state !== previous) persist();
+		notifyPanels();
+		// A changed resume must also withdraw old reminders when the new set is empty.
+		return entry ? migrated || state !== previous : state.tips.length > 0;
 	};
 
 	const ensureBound = (ctx: ExtensionContext) => {
@@ -190,6 +212,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	const commit = (next: TipsState, reason: string) => {
 		pi.appendEntry(ENTRY_TYPE, next);
 		state = next;
+		notifyPanels();
 		// An empty update must explicitly invalidate reminders already present in context.
 		injectReminder(reason, true);
 	};
@@ -224,7 +247,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 			"The tips extension re-injects all current reminders into your context at 25% / 50% / 75% " +
 			"of the compaction window and right after every successful compaction, so they are never forgotten. " +
 			"Template-imported tips are read-only: update/remove can only change session-owned tips. " +
-			"The user can switch the current session's template or edit session tips via /m-tips.",
+			"Templates are matched automatically by startup directory and provider/model ID. The user can view them or edit session tips via /m-tips.",
 		parameters: TipsParams,
 		async execute(_toolCallId, args: TipsArgs, _signal, _onUpdate, ctx) {
 			ensureBound(ctx);
@@ -241,7 +264,7 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 				case "list":
 					return {
 						content: [{ type: "text", text: formatTips(state) }],
-						details: { tips: state.tips, selectedTemplate: state.selectedTemplate },
+						details: { tips: state.tips, templates: state.templates },
 					};
 				case "update": {
 					if (args.id === undefined) throw new Error("tips update requires an id");
@@ -283,11 +306,9 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 			await openTipsPanel(ctx, {
 				getState: () => state,
 				isActive: isCurrent,
-				listTemplates: () => listTemplates(templateDirectory),
-				selectTemplate: filename => {
-					requireCurrent();
-					const contents = readTemplate(templateDirectory, filename);
-					commit(applyTemplate(state, filename, contents), `The user selected the ${filename} tips template for this session`);
+				subscribe: listener => {
+					listeners.add(listener);
+					return () => { listeners.delete(listener); };
 				},
 				add: content => {
 					requireCurrent();
@@ -307,19 +328,31 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!active) return;
-		// Seed tips only exist on a fresh session; inject them right away so the
-		// model sees them from the first request instead of waiting for the
-		// 25% context milestone.
 		if (bind(ctx)) {
-			injectReminder(`This is the session-start reminder: default tips were loaded from ${state.selectedTemplate}`);
+			injectReminder("This is the session-start reminder: tips templates were automatically matched", true);
 		}
+	});
+	pi.on("model_select", (event, ctx) => {
+		if (!active) return;
+		// Use the event payload: during restore, ctx.model can still describe the old model.
+		if (sessionId !== ctx.sessionManager.getSessionId()) {
+			if (bind(ctx, event.model)) injectReminder("Tips templates were automatically matched for the selected model", true);
+			return;
+		}
+		const selectedModel = modelKey(event.model);
+		if (selectedModel === currentModel) return;
+		const next = resolveTemplates(ctx, selectedModel);
+		if (next !== state) commit(next, "The model changed; tips templates were automatically re-matched");
+		currentModel = selectedModel;
 	});
 	pi.on("session_shutdown", () => {
 		// A session switch can reuse this extension instance; drop the old binding
 		// without disabling the next session_start. Reload's factory owns dispose.
 		sessionId = undefined;
+		currentModel = undefined;
 		state = emptyState();
 		firedMilestones.clear();
+		notifyPanels();
 	});
 	pi.on("tool_execution_end", (_event, ctx) => {
 		if (!active) return;
@@ -339,6 +372,8 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	const dispose = () => {
 		if (!active) return;
 		active = false;
+		notifyPanels();
+		listeners.clear();
 		if (installations[SLOT] === dispose) delete installations[SLOT];
 	};
 	installations[SLOT] = dispose;

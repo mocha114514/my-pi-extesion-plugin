@@ -19,8 +19,7 @@ import type { Tip, TipsState } from "./model.ts";
 
 export interface TipsPanelOptions {
 	getState(): TipsState;
-	listTemplates(): string[];
-	selectTemplate(filename: string): void;
+	subscribe(listener: () => void): () => void;
 	add(content: string): void;
 	update(id: number, content: string): void;
 	remove(id: number): void;
@@ -30,7 +29,7 @@ export interface TipsPanelOptions {
 type PanelKey = "tui.select.cancel" | "tui.select.confirm" | "tui.select.up" |
 	"tui.select.down" | "tui.select.pageUp" | "tui.select.pageDown" | "tui.input.tab" |
 	"tui.input.submit";
-type Mode = "list" | "dropdown" | "editor" | "delete";
+type Mode = "list" | "editor" | "delete";
 interface Row { text: string; action?: string }
 interface Button { action: string; label: string }
 interface Hit { x: number; y: number; width: number; action: string; label?: string }
@@ -80,8 +79,8 @@ class BoundedEditor extends Editor {
 class TipsPanel implements Component, Focusable {
 	private state: TipsState;
 	private mode: Mode = "list";
-	private templates: string[] = [];
-	private selected = "templates";
+	private readonly unsubscribe: () => void;
+	private selected = "";
 	private tipId: number | undefined;
 	private editor: BoundedEditor | undefined;
 	private editorFocus = 0;
@@ -101,6 +100,9 @@ class TipsPanel implements Component, Focusable {
 
 	constructor(private readonly options: TipsPanelOptions, private readonly host: PanelHost) {
 		this.state = options.getState();
+		this.unsubscribe = options.subscribe(() => {
+			if (!this.closed) this.host.tui.requestRender();
+		});
 	}
 
 	get focused(): boolean { return this.isFocused; }
@@ -110,7 +112,9 @@ class TipsPanel implements Component, Focusable {
 	}
 	invalidate(): void { this.editor?.invalidate(); }
 	dispose(): void {
+		if (this.closed) return;
 		this.closed = true;
+		this.unsubscribe();
 		this.focused = false;
 		this.editor = undefined;
 	}
@@ -151,7 +155,8 @@ class TipsPanel implements Component, Focusable {
 		this.editor = undefined;
 		this.error = "";
 		this.selected = this.tipId !== undefined && this.state.tips.some(tip => tip.id === this.tipId)
-			? `tip:${this.tipId}` : "templates";
+			? `tip:${this.tipId}` : "";
+		if (!this.selected) this.scroll = 0;
 		this.reveal = true;
 	}
 
@@ -193,20 +198,7 @@ class TipsPanel implements Component, Focusable {
 		if (!this.active()) return;
 		if (action === "close") this.close();
 		else if (action === "cancel") this.cancel();
-		else if (action === "templates") {
-			try {
-				this.templates = this.options.listTemplates();
-				this.mode = "dropdown";
-				const index = this.templates.indexOf(this.state.selectedTemplate ?? "");
-				this.selected = this.templates.length ? `template:${Math.max(0, index)}` : "cancel";
-				this.scroll = 0;
-				this.error = "";
-				this.reveal = true;
-			} catch (error) { this.fail(error); }
-		} else if (action.startsWith("template:")) {
-			const filename = this.templates[Number(action.slice(9))];
-			if (filename !== undefined) this.change(() => this.options.selectTemplate(filename));
-		} else if (action === "add") this.edit();
+		else if (action === "add") this.edit();
 		else if (action.startsWith("tip:")) {
 			this.selected = action;
 			const tip = this.currentTip();
@@ -251,8 +243,8 @@ class TipsPanel implements Component, Focusable {
 			this.focused = this.isFocused;
 		} else if (match("tui.select.confirm") || matchesKey(data, Key.space)) {
 			this.activate(this.selected);
-		} else if (this.mode === "list" && (data === "a" || data === "t")) {
-			this.activate(data === "a" ? "add" : "templates");
+		} else if (this.mode === "list" && data === "a") {
+			this.activate("add");
 		} else {
 			const index = Math.max(0, this.targets.indexOf(this.selected));
 			let next = index;
@@ -321,7 +313,6 @@ class TipsPanel implements Component, Focusable {
 			{ action: "confirmDelete", label: t("tips.confirmDelete") },
 			{ action: "cancel", label: t("tips.cancel") },
 		];
-		if (this.mode === "dropdown") return [{ action: "cancel", label: t("tips.back") }];
 		return [{ action: "add", label: t("tips.add") }, { action: "close", label: t("tips.close") }];
 	}
 
@@ -333,32 +324,28 @@ class TipsPanel implements Component, Focusable {
 				for (const line of wrapped) rows.push({ text: style ? style(line) : line, action });
 			}
 		};
+		const appendTip = (tip: Tip) => {
+			const action = `tip:${tip.id}`;
+			append(`#${tip.id} · ${t(tip.source === "template" ? "tips.readOnly" : "tips.edit")}`, action);
+			append(tip.content, action);
+			rows.push({ text: "" });
+		};
 		if (this.error) append(this.error, undefined, text => this.host.theme.fg("error", text));
-		if (this.mode === "dropdown") {
-			append(t("tips.chooseTemplate"));
-			if (this.state.legacy) append(t("tips.legacyWarning"));
-			if (!this.templates.length) append(t("tips.noTemplates"));
-			for (const [index, filename] of this.templates.entries()) {
-				append(`${filename === this.state.selectedTemplate ? "✓" : "○"} ${filename}`, `template:${index}`);
-			}
-		} else if (this.mode === "delete") {
+		if (this.mode === "delete") {
 			append(t("tips.deletePrompt", { id: this.tipId! }));
 			append(this.state.tips.find(tip => tip.id === this.tipId)?.content ?? "");
 		} else {
-			append(t("tips.templateSelector", { filename: this.state.selectedTemplate ?? t("tips.noTemplate") }), "templates");
-			append(t("tips.immediateHint"), undefined, text => this.host.theme.fg("dim", text));
-			for (const source of ["template", "session"] as const) {
-				const tips = this.state.tips.filter(tip => tip.source === source);
-				append(t(source === "template" ? "tips.templateSection" : "tips.sessionSection", { count: tips.length }), undefined,
+			for (const source of this.state.templates) {
+				const tips = this.state.tips.filter(tip => tip.source === "template" && tip.template === source.filename);
+				append(t("tips.templateSection", { filename: source.filename, kind: source.kind, count: tips.length }), undefined,
 					text => this.host.theme.bold(text));
-				for (const tip of tips) {
-					const action = `tip:${tip.id}`;
-					append(`#${tip.id} · ${t(source === "template" ? "tips.readOnly" : "tips.edit")}`, action);
-					append(tip.content, action);
-					rows.push({ text: "" });
-				}
+				for (const tip of tips) appendTip(tip);
 			}
-			if (!this.state.tips.length) append(t("tips.empty"));
+			const sessionTips = this.state.tips.filter(tip => tip.source === "session");
+			append(t("tips.sessionSection", { count: sessionTips.length }), undefined, text => this.host.theme.bold(text));
+			for (const tip of sessionTips) appendTip(tip);
+			if (!sessionTips.length) append(t("tips.empty"));
+			append(t("tips.immediateHint"), undefined, text => this.host.theme.fg("dim", text));
 		}
 		return rows;
 	}
@@ -435,10 +422,13 @@ class TipsPanel implements Component, Focusable {
 			this.rows = this.buildRows(inner);
 			const actions = [...new Set(this.rows.flatMap(row => row.action ? [row.action] : []))];
 			this.targets = [...actions, ...buttons.map(button => button.action)];
+			const resetSelection = !this.targets.includes(this.selected);
+			if (resetSelection) this.selected = this.targets[0];
 			if (!fixedFooter) for (const button of buttons) this.rows.push({ text: `[ ${button.label} ]`, action: button.action });
 			const reveal = this.reveal;
 			this.scrollBy(0);
-			if (reveal || width !== this.previousWidth || budget !== this.previousBudget) {
+			// Initial/fallback focus must not scroll past the template headings.
+			if (!resetSelection && (reveal || width !== this.previousWidth || budget !== this.previousBudget)) {
 				const first = this.rows.findIndex(row => row.action === this.selected);
 				const last = this.rows.findLastIndex(row => row.action === this.selected);
 				if (first >= 0 && (first < this.scroll || first >= this.scroll + this.bodyHeight)) this.scroll = first;
