@@ -19,14 +19,25 @@ const COMPACT_PENDING_SLOT = Symbol.for("mpep.compact-forewarn.pending");
  * The elapsed time is measured from the first agent_start and reported only
  * when Pi has no retry, compaction retry, or queued follow-up left to run.
  */
-export function createTurnNotify(notify: (title: string, body: string, soundPath?: string) => void): { agentStart: () => void; agentSettled: () => void } {
+export function createTurnNotify(
+	notify: (title: string, body: string, soundPath?: string) => void,
+): {
+	agentStart: () => void;
+	agentSettled: (aborted?: boolean) => void;
+} {
 	let startMs: number | null = null;
 	return {
 		agentStart() {
 			// Retries can emit another agent_start before agent_settled. Keep the original clock.
 			if (startMs === null) startMs = Date.now();
 		},
-		agentSettled() {
+		agentSettled(aborted = false) {
+			// Cancellation is not completion. Clear the clock even if compaction
+			// was queued, so the next run cannot inherit the cancelled run's time.
+			if (aborted) {
+				startMs = null;
+				return;
+			}
 			// An active compaction deliberately settles the current run before it
 			// resumes, so this agent_settled is not the real end of the turn. Return
 			// before touching the clock, body, sound, or notify: keeping startMs lets
@@ -52,5 +63,8 @@ export default function turnNotify(pi: ExtensionAPI): void {
 	if (!isPluginEnabled(PLUGIN_ID)) return;
 	const handler = createTurnNotify(notifyTurnComplete);
 	pi.on("agent_start", handler.agentStart);
-	pi.on("agent_settled", handler.agentSettled);
+	pi.on("agent_settled", (event) => {
+		// SDK 0.85.1 lacks this newer flag; Pi 1.1.0 supplies it at runtime.
+		handler.agentSettled("aborted" in event && event.aborted === true);
+	});
 }
