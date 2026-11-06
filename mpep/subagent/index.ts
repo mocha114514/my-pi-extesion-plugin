@@ -26,8 +26,10 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
+import { DELETE_GUARD_CHILD_ENV } from "../shared/delete-approval.ts";
 import { discoverAgents, seedPresets, type AgentConfig } from "./agents.ts";
 import { RpcSubprocess } from "./client.ts";
+import { DELETE_APPROVAL_SUPERVISOR_PROMPT, DeleteApprovalBroker, registerDeleteApprovalTool } from "./delete-approvals.ts";
 import { resolveAgentExtension } from "./extensions.ts";
 import { MCP_SERVERS_ENV, mcpToolNames } from "./mcp.ts";
 import { emptyUsage, InstancePool, type Instance } from "./pool.ts";
@@ -101,12 +103,15 @@ export default function (pi: ExtensionAPI): void {
 	const reasoningCleanupPath = fileURLToPath(new URL("../drop-useless-reasoning-item-before-compact/index.ts", import.meta.url));
 	const listExtensionPath = fileURLToPath(new URL("../list/index.ts", import.meta.url));
 	const tipsExtensionPath = fileURLToPath(new URL("../tips/index.ts", import.meta.url));
+	/** Passive guard hooks also cover scout; its own manager enable guard applies. */
+	const deleteGuardPath = fileURLToPath(new URL("../delete-guard/index.ts", import.meta.url));
 
 	let ctx: ExtensionContext | undefined;
 	let pool: InstancePool | undefined;
 	let poolSessionId = "";
 	let pendingReminder: string | undefined;
 	let widget: SubagentWidgetController | undefined;
+	const deleteApprovals = new DeleteApprovalBroker(content => queueNotice(content));
 
 	// Key the pool by SESSION ID, never by context identity: pi hands a fresh
 	// ExtensionContext object to each tool call, so comparing context references
@@ -114,12 +119,15 @@ export default function (pi: ExtensionAPI): void {
 	function ensurePool(context: ExtensionContext): InstancePool {
 		const sessionId = context.sessionManager.getSessionId() || `pid-${process.pid}`;
 		if (!pool || poolSessionId !== sessionId) {
+			deleteApprovals.closeAll("Main session was replaced.");
 			pool = new InstancePool(sessionId);
 			poolSessionId = sessionId;
 		}
 		ctx = context;
 		return pool;
 	}
+
+	registerDeleteApprovalTool(pi, deleteApprovals, ensurePool);
 
 	function buildSpawn(
 		agent: AgentConfig,
@@ -161,6 +169,7 @@ export default function (pi: ExtensionAPI): void {
 			responsesSearchPath,
 			retryErrorNormalizerPath,
 			reasoningCleanupPath,
+			deleteGuardPath,
 		]);
 		// Scout stays a lean researcher: List has no practical value under its tool
 		// allowlist, and Tips would still inject passive reminders if loaded.
@@ -186,6 +195,7 @@ export default function (pi: ExtensionAPI): void {
 		// an ancestor process's selection. Only names, never config secrets, travel.
 		const env: Record<string, string> = {
 			[MCP_SERVERS_ENV]: JSON.stringify(agent.mcp),
+			[DELETE_GUARD_CHILD_ENV]: "1",
 		};
 		// Structured output: load the companion extension into the child and hand
 		// it the schema + output path through the environment.
@@ -379,6 +389,19 @@ export default function (pi: ExtensionAPI): void {
 			let idleStreak = 0;
 			let failStreak = 0;
 			let probes = 0;
+			const resetWatchdog = () => {
+				idleStreak = 0;
+				failStreak = 0;
+				probes = 0;
+			};
+			const approvalRun = deleteApprovals.openRun({
+				instanceId: instance.meta.id,
+				agent: instance.meta.agent,
+				client,
+				isCurrent: () => pool?.get(instance.meta.id) === instance && instance.client === client &&
+					instance.meta.status === "running" && !instance.abortInitiated,
+				onPending: resetWatchdog,
+			});
 			const pushToolItem = (text: string) => {
 				currentTextItem = "";
 				instance.displayItems.push({ type: "toolCall", text });
@@ -439,7 +462,15 @@ export default function (pi: ExtensionAPI): void {
 			// poll loop is armed the moment the prompt is accepted: probe live state
 			// until the child is durably idle, then deliver. The no-run watchdog
 			// (20 idle probes without agent_start ~ 10s) frees command-only prompts;
-			// the probe cap guarantees delivery even if the child wedges.
+			// the probe cap guarantees delivery even if the child wedges, EXCEPT
+			// while awaiting an intentional, unbounded supervisor approval.
+			const waitForApproval = () => {
+				if (!approvalRun.hasPending()) return false;
+				resetWatchdog();
+				pollActive = false;
+				confirmIdle();
+				return true;
+			};
 			const confirmIdle = () => {
 				// Single polling chain per run: prompt-accept AND every agent_settled
 				// may arm this, and concurrent chains would share (and burn) the
@@ -454,8 +485,10 @@ export default function (pi: ExtensionAPI): void {
 							pollActive = false;
 							return;
 						}
+						if (waitForApproval()) return;
 						try {
 							const state = await client.getState();
+							if (done || waitForApproval()) return;
 							failStreak = 0;
 							const busy = state.isStreaming || state.isCompacting || (state.pendingMessageCount ?? 0) > 0;
 							idleStreak = busy ? 0 : idleStreak + 1;
@@ -467,8 +500,9 @@ export default function (pi: ExtensionAPI): void {
 								return;
 							}
 						} catch {
+							if (done || waitForApproval()) return;
 							// Probe failed. Process gone -> offExit rejects. But a LIVE
-						// child that stops servicing RPC (stalled event loop) must not
+							// child that stops servicing RPC (stalled event loop) must not
 							// hang this handler forever: three consecutive failures with a
 							// live process = wedged, retire as an interruption.
 							pollActive = false;
@@ -510,17 +544,20 @@ export default function (pi: ExtensionAPI): void {
 			};
 
 			const offExit = client.onExit((code) => {
+				done = true;
 				cleanup();
 				reject(new Error(`subagent process exited mid-run (code ${code}). ${client.stderrText()}`.trim()));
 			});
 
 			const onAbort = () => {
+				done = true;
 				cleanup();
 				void client.abort();
 				client.kill();
 				reject(new Error("aborted by user"));
 			};
 			const cleanup = () => {
+				approvalRun.close("Child prompt retired.");
 				offEvent();
 				offExit();
 				if (settleTimer) clearTimeout(settleTimer);
@@ -532,6 +569,7 @@ export default function (pi: ExtensionAPI): void {
 			client.prompt(task).then(
 				() => confirmIdle(), // arm the idle watchdog as soon as accepted
 				(error: unknown) => {
+					done = true;
 					cleanup();
 					reject(error instanceof Error ? error : new Error(String(error)));
 				},
@@ -936,6 +974,7 @@ export default function (pi: ExtensionAPI): void {
 			// Set the flag BEFORE aborting: the background completion handler may
 			// fire as soon as the child's run ends, and it must skip the wake-up.
 			instance.abortInitiated = true;
+			deleteApprovals.closeClient(instance.client, "Child run was aborted by the main agent.");
 			// ONE deadline covers BOTH phases: the RPC abort itself can pend forever
 			// (a child stuck in an abort-insensitive tool, or not answering RPC at
 			// all — our send() has no timeout), and the run handler's retirement
@@ -1036,7 +1075,8 @@ export default function (pi: ExtensionAPI): void {
 				return {
 					content: [{
 						type: "text" as const,
-						text: `${timing}\nSubagent "${instance.meta.id}" is still running. You will be notified when it completes; there is no result to read yet.`,
+						text: `${timing}\nSubagent "${instance.meta.id}" is still running. You will be notified when it completes; there is no result to read yet. ` +
+							"If it is waiting for deletion approval, inspect subagent_delete_approval({ action: \"list\" }).",
 					}],
 					details: {
 						instanceId: instance.meta.id,
@@ -1102,7 +1142,8 @@ export default function (pi: ExtensionAPI): void {
 			"List the subagent instances of the current session with their status " +
 			"(running / awaiting decision / kept / recovered leftover), whether the process is alive, " +
 			"an UNREAD marker on results not yet fetched via subagent_check, and each latest task's start time " +
-			"and elapsed duration (not lifetime totals).",
+			"and elapsed duration (not lifetime totals). " +
+			"Inspect any pending child deletion requests with subagent_delete_approval({ action: \"list\" }).",
 		promptSnippet: "list the subagent instances of the current session",
 		parameters: Type.Object({}),
 
@@ -1201,6 +1242,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_compact_failed", scheduleNoticeFlush);
 
 	pi.on("session_start", (_event, context) => {
+		deleteApprovals.closeAll("Main session started or switched.");
 		ctx = context;
 		poolSessionId = context.sessionManager.getSessionId() || `pid-${process.pid}`;
 		pool = new InstancePool(poolSessionId);
@@ -1220,13 +1262,12 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
-		if (!pendingReminder) return;
 		const reminder = pendingReminder;
 		pendingReminder = undefined;
-		// Contract of the installed Pi (0.85.x): mutations of systemPromptOptions
-		// are ignored; the system prompt changes only via the returned value.
-		// (Newer Pi also honors the return contract, so this works on both.)
-		return { systemPrompt: `${event.systemPrompt}\n\n${reminder}` };
+		// Keep trusted supervisor policy in the system prompt; child request data
+		// lives only in the transient context projection, never in this prompt.
+		return { systemPrompt: `${event.systemPrompt}\n\n${DELETE_APPROVAL_SUPERVISOR_PROMPT}` +
+			(reminder ? `\n\n${reminder}` : "") };
 	});
 
 	// A new run means queued follow-up notifications have been consumed: from
@@ -1247,7 +1288,10 @@ export default function (pi: ExtensionAPI): void {
 	// a parent-owned pipe, and 0.85.x treats stdin EOF as session shutdown.
 	// So reaping is unconditional in every mode; print/json leftovers are
 	// recovered from disk by the next session.
-	const killAll = () => pool?.killAll();
+	const killAll = () => {
+		deleteApprovals.closeAll("Main session shut down or reloaded.");
+		pool?.killAll();
+	};
 	process.on("exit", killAll);
 	// Signals: registering a plain listener would SWALLOW Ctrl+C (Node drops its
 	// default termination once any listener exists). Reap, then re-raise so the

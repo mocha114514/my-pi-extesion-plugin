@@ -1,6 +1,16 @@
 import type { en } from "./en.ts";
 
 export const zhCN = {
+  "plugin.delete-guard.name": "删除操作审批",
+  "plugin.delete-guard.desc": "每次删除独立审批：主 AI 等待用户批准，60 秒超时阻止；子代理不限时等待主 AI 审批",
+  "deleteGuard.title": "删除操作需要你的批准",
+  "deleteGuard.tool": "工具：{name}",
+  "deleteGuard.cwd": "工作目录：{path}",
+  "deleteGuard.rules": "命中规则：{rules}",
+  "deleteGuard.arguments": "其他工具参数：",
+  "deleteGuard.hint": "批准仅对本次调用有效。取消或 60 秒内未回应，均阻止执行。",
+  "deleteGuard.deny": "拒绝（默认）",
+  "deleteGuard.approve": "批准本次调用",
   "manager.invalidPreferences": "MPEP 插件开关配置有误，请检查 Pi 配置目录中的 mpep-cache/plugins.json",
   "status.noModel": "未选择模型",
   "status.thinkingOff": "思考关闭",

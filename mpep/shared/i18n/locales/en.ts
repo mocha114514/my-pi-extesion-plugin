@@ -1,5 +1,15 @@
 // The English dictionary defines the typed message keys and interpolation fields.
 export const en = {
+  "plugin.delete-guard.name": "Deletion approval",
+  "plugin.delete-guard.desc": "Each deletion is approved independently: the main AI waits up to 60s for the user; child deletions wait for supervisor approval without a timeout",
+  "deleteGuard.title": "Deletion requires your approval",
+  "deleteGuard.tool": "Tool: {name}",
+  "deleteGuard.cwd": "Working directory: {path}",
+  "deleteGuard.rules": "Detected: {rules}",
+  "deleteGuard.arguments": "Other tool arguments:",
+  "deleteGuard.hint": "Approve only this call. Cancel or no response within 60s blocks execution.",
+  "deleteGuard.deny": "Deny (default)",
+  "deleteGuard.approve": "Approve this call",
   "manager.invalidPreferences": "Invalid MPEP plugin preferences; check mpep-cache/plugins.json in the Pi configuration directory",
   "status.noModel": "no-model",
   "status.thinkingOff": "thinking off",

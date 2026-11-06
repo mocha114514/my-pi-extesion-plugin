@@ -14,6 +14,7 @@ const builtinIds = [
 	"turn-navigator",
 	"cooking-timer",
 	"list",
+	"delete-guard",
 	"statusline",
 	"tps",
 	"turn-notify",

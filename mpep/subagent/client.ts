@@ -16,8 +16,8 @@
  *     characters split across chunks are not corrupted;
  *   - stdin carries an error listener: a child closing stdin mid-write would
  *     otherwise raise an asynchronous EPIPE that crashes the parent;
- *   - extension UI requests (dialogs) are auto-cancelled at the transport
- *     level — a child awaiting ctx.ui.confirm() must not wedge forever;
+ *   - extension UI requests default to cancellation; a scoped handler may
+ *     retain deletion-approval selects until the supervising agent decides;
  *   - kill() escalates: cooperative abort, SIGTERM/group-TERM, then a hard
  *     kill on a short fuse; on Windows the tree is killed via taskkill
  *     resolved from System32 with spawn errors consumed.
@@ -38,6 +38,11 @@ interface PendingRequest {
 	resolve: (data: unknown) => void;
 	reject: (error: Error) => void;
 }
+
+export type RpcUIResponse = { value: string } | { cancelled: true };
+export type RpcUIResponder = (response: RpcUIResponse) => boolean;
+/** Return true only when the request has been handled or deliberately retained. */
+export type RpcUIRequestHandler = (request: Record<string, unknown>, respond: RpcUIResponder) => boolean;
 
 /**
  * Locate the current pi installation. Same strategy as the official subagent
@@ -78,6 +83,8 @@ export class RpcSubprocess {
 	private pending = new Map<string, PendingRequest>();
 	private listeners = new Set<(event: RpcEvent) => void>();
 	private exitListeners = new Set<(code: number | null) => void>();
+	private uiRequestHandler: RpcUIRequestHandler | undefined;
+	private seenUIRequests = new Set<string>();
 	private stderrTail: string[] = [];
 	private readonly cwd: string;
 	private readonly args: string[];
@@ -101,6 +108,14 @@ export class RpcSubprocess {
 	onExit(listener: (code: number | null) => void): () => void {
 		this.exitListeners.add(listener);
 		return () => this.exitListeners.delete(listener);
+	}
+
+	/** One run owns UI delegation at a time; all unclaimed dialogs still cancel. */
+	onUIRequest(handler: RpcUIRequestHandler): () => void {
+		this.uiRequestHandler = handler;
+		return () => {
+			if (this.uiRequestHandler === handler) this.uiRequestHandler = undefined;
+		};
 	}
 
 	stderrText(): string {
@@ -163,6 +178,8 @@ export class RpcSubprocess {
 	private handleClose(code: number | null): void {
 		if (!this.alive) return;
 		this.alive = false;
+		this.uiRequestHandler = undefined;
+		this.seenUIRequests.clear();
 		const error = new Error(`pi RPC process exited (code ${code}). ${this.stderrText()}`);
 		for (const { reject } of this.pending.values()) reject(error);
 		this.pending.clear();
@@ -203,15 +220,31 @@ export class RpcSubprocess {
 			return;
 		}
 
-		// Dialog requests must be answered or the child wedges awaiting a
-		// response. Subagents have no user to ask: cancel everything politely
-		// (select/input resolve undefined, confirm resolves false).
+		// Only the current run's scoped handler may retain a dialog. Responses
+		// are single-use and bound to this exact process, including after teardown.
 		if (message.type === "extension_ui_request" && typeof message.id === "string") {
+			if (this.seenUIRequests.has(message.id)) return;
+			this.seenUIRequests.add(message.id);
+			const proc = this.proc;
+			let answered = false;
+			const respond: RpcUIResponder = (response) => {
+				if (answered || !this.alive || !proc?.stdin || this.proc !== proc ||
+					proc.stdin.destroyed || proc.stdin.writableEnded) return false;
+				answered = true;
+				try {
+					proc.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: message.id, ...response })}\n`);
+					return true;
+				} catch {
+					// Child is dying; its close handler reports the failure.
+					return false;
+				}
+			};
 			try {
-				this.proc?.stdin?.write(`${JSON.stringify({ type: "extension_ui_response", id: message.id, cancelled: true })}\n`);
+				if (this.uiRequestHandler?.(message, respond)) return;
 			} catch {
-				// Child is dying; its close handler reports the failure.
+				// A failed delegate must never turn an unrelated dialog into a hang.
 			}
+			respond({ cancelled: true });
 			return;
 		}
 

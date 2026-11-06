@@ -49,6 +49,13 @@
     "enabled": true
   },
   {
+    "id": "delete-guard",
+    "name": "删除操作审批",
+    "path": "./delete-guard/index.ts",
+    "desc": "每次删除独立审批：主 AI 等待用户批准，60 秒超时阻止；子代理不限时等待主 AI 审批",
+    "enabled": true
+  },
+  {
     "id": "statusline",
     "name": "高对比彩色状态栏",
     "path": "./statusline.ts",
