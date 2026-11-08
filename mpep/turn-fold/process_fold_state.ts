@@ -39,7 +39,8 @@ function foldAnchor(process: ProcessFoldState, last: MessageState, finalPartInde
 }
 
 /**
- * Seal every pending process at a run or user boundary, whether it succeeded or not.
+ * Complete pending processes at a run or user boundary. A final failure keeps
+ * its activity summaries exposed instead of hiding them in an outer disclosure.
  * The compaction-kept tail is no longer tagged here; the whole region in front of
  * the compaction banner folds behind the "Retained content" header instead
  * (see retained_region.ts).
@@ -51,6 +52,9 @@ export function completeProcessFolds(): void {
 		const last = process.messages.at(-1);
 		if (!last) continue;
 		last.finished = true;
+		// Keep the failed run's activity summary (including error N) accessible.
+		// An outer process disclosure would hide it behind a second fold.
+		if (last.message.stopReason === "error") continue;
 		const finalPartIndex = trailingAnswerIndex(last);
 		const anchor = foldAnchor(process, last, finalPartIndex);
 		// Direct answers with no preceding work do not need an empty disclosure.

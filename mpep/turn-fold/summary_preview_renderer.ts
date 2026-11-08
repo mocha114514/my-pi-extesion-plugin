@@ -73,6 +73,8 @@ export function getActivePreview(group: TurnState): ActivePreview | undefined {
 	// Folded custom notes and notifications carry no stream of their own; preview the latest real work.
 	for (let i = group.activities.length - 1; i >= 0; i--) {
 		const latest = group.activities[i];
+		// A failure stops the live preview; its full text is available on expansion.
+		if (latest.type === "error") return undefined;
 		if (latest.type === "custom" || latest.type === "customEntry" || latest.type === "notification") continue;
 		if (latest.type === "thinking")
 			return { type: "thinking", header: t("activity.thinking"), output: latest.output, isError: false };
@@ -114,12 +116,14 @@ function buildSummaryContent(group: TurnState, theme: DisplayTheme): SummaryCont
 			`${theme.bold(name)} ${theme.fg("accent", String(stat.successes))}${stat.errors ? theme.fg("error", ` ${stat.errors}`) : ""}`,
 		);
 	}
+	const errorCount = group.activities.filter((activity) => activity.type === "error").length;
+	if (errorCount) parts.push(`${theme.bold("error")} ${theme.fg("error", String(errorCount))}`);
 	const lastWork = group.activities.findLast(
 		(activity) => activity.type !== "custom" && activity.type !== "customEntry" && activity.type !== "notification",
 	);
 	const running =
 		[...group.tools.values()].some((tool) => tool.isPartial) || (!group.sealed && lastWork?.type === "thinking");
-	const failed = [...group.tools.values()].some((tool) => tool.isError);
+	const failed = errorCount > 0 || [...group.tools.values()].some((tool) => tool.isError);
 	const icon = running ? theme.fg("warning", "⋯ ") : failed ? theme.fg("error", "! ") : theme.fg("success", "✓ ");
 	return { icon, parts };
 }

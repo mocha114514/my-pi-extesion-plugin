@@ -14,9 +14,8 @@ import type { Activity, TurnState } from "./extension_types.ts";
  * fold away in sequence just like tool outputs.
  *
  * Key properties:
- * - Only the info path (showStatus) is patched. showWarning/showError also write
- *   to the chat directly, but they carry run-critical information and must stay
- *   visible.
+ * - This module handles only the info path (showStatus). Error diagnostics are
+ *   claimed separately by error_capture; warnings keep their native presentation.
  * - showStatus() de-duplicates back-to-back notifications by rewriting the last
  *   Text in place. While a group is collecting, the rewrite lands on a suppressed
  *   component and the fold's delegate view simply follows the new text. Once no

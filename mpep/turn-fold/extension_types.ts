@@ -57,7 +57,14 @@ export interface NotificationRecord {
 	refresh?: () => void;
 }
 
+/** A Pi/runtime failure, independent of a tool's own result status. */
+export interface ErrorRecord {
+	type: "error";
+	output: string;
+}
+
 export type Activity =
+	| ErrorRecord
 	| ThinkingRecord
 	| { type: "tool"; toolCallId: string }
 	| CustomMessageRecord
@@ -88,6 +95,8 @@ export interface MessageState {
 	parts: MessagePart[];
 	blocks: Map<number, ThinkingRecord | "text" | "tool">;
 	finished: boolean;
+	/** One failure per assistant response, even if message_end or rendering repeats. */
+	error?: ErrorRecord;
 	process?: ProcessFoldState;
 	refresh?: () => void;
 }

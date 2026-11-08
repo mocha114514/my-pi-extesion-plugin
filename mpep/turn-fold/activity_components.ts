@@ -79,6 +79,10 @@ class ActivityGroupComponent extends Container {
 					const tool = group.tools.get(activity.toolCallId);
 					if (view) this.addChild(view);
 					else if (tool) this.addChild(new Text(toolHeader(tool), 0, 0));
+				} else if (activity.type === "error") {
+					this.addChild(new Spacer(1));
+					// Text wraps the complete diagnostic; only the summary is folded.
+					this.addChild(new Text(theme.fg("error", `Error: ${activity.output}`), 0, 0));
 				} else if (activity.type === "custom") {
 					// The captured view carries the component's own leading spacer and box.
 					if (activity.view) this.addChild(activity.view);
@@ -188,7 +192,8 @@ export function installActivityComponents(): () => void {
 		}
 		const internals = this as unknown as AssistantInternals;
 		const isStreaming = streaming ?? internals.isStreaming;
-		// Let Pi produce its native stop/error diagnostics, then insert the activity timeline before them.
+		// Retain native stop diagnostics. Claimed errors render in the activity
+		// timeline instead, so they must not also appear below the collapsed group.
 		originalUpdate.call(
 			this,
 			{ ...message, content: message.content.filter((block) => block.type === "toolCall") },
@@ -242,8 +247,10 @@ export function installActivityComponents(): () => void {
 				container.addChild((slice as unknown as AssistantInternals).contentContainer);
 			}
 		}
-		// Abort/error/length text stays visible when the disclosure is collapsed.
-		for (const diagnostic of diagnostics) internals.contentContainer.addChild(diagnostic);
+		// Cancellation and length notices keep their native standalone presentation.
+		if (!state.error) {
+			for (const diagnostic of diagnostics) internals.contentContainer.addChild(diagnostic);
+		}
 	};
 	assistantPrototype.updateContent = update;
 

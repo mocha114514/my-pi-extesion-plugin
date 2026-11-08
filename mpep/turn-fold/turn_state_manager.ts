@@ -100,7 +100,7 @@ export function customMessageKey(customType: string | undefined, timestamp: numb
 
 /**
  * Fold an extension custom message into the active group. Only mid-run displayable
- * messages qualify: a live group means the agent is between agent_start/agent_end,
+ * messages qualify: a live group means the agent is between agent_start/agent_settled,
  * which is exactly where steered and turn-deferred notes land. Idle notifications
  * (no active group) and invisible context injections (display:false) stay outside.
  */
@@ -175,6 +175,14 @@ export function observeCustomEntry(entry: { id?: string }): boolean {
 /** Whether an activity group is currently collecting (agent mid-run). */
 export function hasActiveGroup(): boolean {
 	return activeGroup !== undefined;
+}
+
+/** Claim a live Pi error only when a visible activity group can own it. */
+export function observePiError(output: string): boolean {
+	if (!activeGroup) return false;
+	activeGroup.activities.push({ type: "error", output });
+	activeGroup.refresh?.();
+	return true;
 }
 
 /**
@@ -361,7 +369,22 @@ export function endLiveCollection(): void {
 export function finishAssistant(message: AssistantMessage): void {
 	observeAssistant(message);
 	const state = getMessageState(message);
-	if (state) state.finished = true;
+	if (state) {
+		state.finished = true;
+		if (message.stopReason === "error") {
+			const output = message.errorMessage || "Unknown error";
+			if (state.error) {
+				state.error.output = output;
+			} else {
+				// An empty failed response still needs a host for its diagnostic. Reuse
+				// the active group across attempts; a real text/user boundary seals it.
+				const group = ensureActiveGroup(state);
+				state.error = { type: "error", output };
+				group.activities.push(state.error);
+				group.refresh?.();
+			}
+		}
+	}
 	if (message.stopReason === "error" || message.stopReason === "aborted" || message.stopReason === "length") {
 		for (const block of message.content) {
 			if (block.type !== "toolCall") continue;
@@ -372,7 +395,9 @@ export function finishAssistant(message: AssistantMessage): void {
 				true,
 			);
 		}
-		sealActiveGroup();
+		// A failed attempt is not the end of the run: Pi may automatically retry.
+		// Cancellation and length stops retain their existing boundary behavior.
+		if (message.stopReason !== "error") sealActiveGroup();
 	}
 	activeMessage = undefined;
 }

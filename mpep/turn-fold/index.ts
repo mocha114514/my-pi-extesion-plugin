@@ -3,6 +3,7 @@ import { isPluginEnabled } from "../manager/preferences.ts";
 import { registerBuiltInTools } from "./builtin_tools_override.ts";
 import { orderedSessionEntries } from "./compaction_placement.ts";
 import { installEntryCapture, reconcileEntryClaims, resetEntryCapture } from "./entry_capture.ts";
+import { installErrorCapture } from "./error_capture.ts";
 import { installNotifyCapture, releasePendingNotifications } from "./notify_capture.ts";
 import { completeProcessFolds } from "./process_fold_state.ts";
 import { applyPatches } from "./core_components_patcher.ts";
@@ -28,6 +29,7 @@ export default function (pi: ExtensionAPI): void {
 	const disposePatches = applyPatches();
 	const disposeEntryCapture = installEntryCapture();
 	const disposeNotifyCapture = installNotifyCapture();
+	const disposeErrorCapture = installErrorCapture();
 	// Note: Markdown rendering enhancements were extracted into the standalone
 	// "markdown-enhancer" plugin (see ../markdown-enhancer/).
 	// Speculative MCP compatibility bridge, currently without consumers (see the module header).
@@ -75,7 +77,9 @@ export default function (pi: ExtensionAPI): void {
 	});
 	pi.on("tool_execution_update", (event) => observeToolResult(event.toolCallId, event.partialResult, true, false));
 	pi.on("tool_execution_end", (event) => observeToolResult(event.toolCallId, event.result, false, event.isError));
-	pi.on("agent_end", () => {
+	// agent_end also fires between automatic retry attempts. Only the settled
+	// event closes the entire run, after retry/compaction diagnostics are shown.
+	pi.on("agent_settled", () => {
 		endLiveCollection();
 		releasePendingNotifications();
 	});
@@ -83,6 +87,7 @@ export default function (pi: ExtensionAPI): void {
 		disposePatches();
 		disposeEntryCapture();
 		disposeNotifyCapture();
+		disposeErrorCapture();
 		disposeMcp();
 		resetTurnState();
 	});
