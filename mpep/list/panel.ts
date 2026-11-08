@@ -7,9 +7,10 @@
 // the free space and scroll; nothing is dropped and there is no item cap.
 //
 // Scroll is counted in rendered lines, not items, and it is remembered for
-// the current list id. Completing an item keeps the position (clamped if the
-// text got shorter). Opening the popup or switching list ids resets the
-// viewport and folds the overall goal and every item.
+// the displayed list id. Completing an item keeps the position (clamped if
+// the text got shorter). Opening the popup returns to the newest list;
+// switching lists resets the viewport and folds the goal and every item.
+// History navigation is local to the panel and never writes checklist data.
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
@@ -63,8 +64,13 @@ function wrapColumns(text: string, width: number): string[] {
 }
 
 export class ListPanel implements Component {
-	private readonly readState: () => ListState | undefined;
+	private readonly readState: (listNumber?: number) => ListState | undefined;
 	private readonly theme: () => Theme;
+	private readonly readCount: () => number;
+	// Undefined follows the newest checklist, including newly created lists.
+	// A historical number stays pinned while the session gains newer lists.
+	private historyNumber: number | undefined;
+	private listCount = 0;
 	private allocatedWidth = PANEL_WIDTH;
 	private maxHeight = 0;
 	private configured = false;
@@ -86,9 +92,15 @@ export class ListPanel implements Component {
 		| { state: ListState | undefined; width: number; theme: Theme; locale: string; lines: string[] }
 		| undefined;
 
-	constructor(readState: () => ListState | undefined, theme: () => Theme) {
+	constructor(
+		readState: (listNumber?: number) => ListState | undefined,
+		theme: () => Theme,
+		readCount?: () => number,
+	) {
 		this.readState = readState;
 		this.theme = theme;
+		// Existing callers without history still expose zero or one checklist.
+		this.readCount = readCount ?? (() => this.readState() ? 1 : 0);
 	}
 
 	/** Remember the allocated frame and return the height render() will use. */
@@ -105,12 +117,18 @@ export class ListPanel implements Component {
 		this.bodyCache = undefined;
 	}
 
-	/** Fold all sections on each popup visit without touching checklist data. */
+	/** Reset content presentation without changing the selected checklist. */
 	resetView(): void {
 		this.goalExpanded = false;
 		this.expandedItems.clear();
 		this.scrollOffset = 0;
 		this.invalidate();
+	}
+
+	/** Start each popup visit at the newest checklist, fully folded. */
+	resetNavigation(): void {
+		this.historyNumber = undefined;
+		this.resetView();
 	}
 
 	render(width: number): string[] {
@@ -121,8 +139,7 @@ export class ListPanel implements Component {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
 		if (event.type === "wheel") {
-			const state = this.readState();
-			this.sync(state);
+			const state = this.readSelected();
 			const body = this.measure(state);
 			this.scrollOffset += Math.trunc(event.wheelDelta ?? 0);
 			this.clamp(body, this.frame(body).viewport);
@@ -131,12 +148,15 @@ export class ListPanel implements Component {
 			return { handled: true, focus: false, render: true };
 		}
 		if (event.type === "click") {
-			if (
-				event.button === "left" && !event.shift && !event.alt && !event.ctrl &&
-				(event.clickCount ?? 1) === 1
-			) {
-				const state = this.readState();
-				this.sync(state);
+			if (event.button === "left" && !event.shift && !event.alt && !event.ctrl) {
+				const state = this.readSelected();
+				if (event.y === 0) {
+					return { handled: true, focus: false, render: this.navigate(event.x) };
+				}
+				// Arrows accept rapid repeated clicks; body folds remain single-click only.
+				if ((event.clickCount ?? 1) !== 1) {
+					return { handled: true, focus: false, render: false };
+				}
 				const body = this.measure(state);
 				const { viewport } = this.frame(body);
 				this.clamp(body, viewport);
@@ -167,11 +187,45 @@ export class ListPanel implements Component {
 		return this.theme().fg(color, text);
 	}
 
+	private readSelected(): ListState | undefined {
+		this.listCount = columns(this.readCount());
+		// A restored session can have fewer lists. If the pinned number is no
+		// longer historical, return to the latest rather than an invalid entry.
+		if (this.historyNumber !== undefined && this.historyNumber >= this.listCount) {
+			this.historyNumber = undefined;
+		}
+		const state = this.readState(this.historyNumber);
+		this.sync(state);
+		return state;
+	}
+
 	private sync(state: ListState | undefined): void {
 		const id = state?.id;
 		if (id === this.listId) return;
 		this.listId = id;
+		// Sync resets folds, not navigation: a historical read must stay pinned.
 		this.resetView();
+	}
+
+	private navigationButtonWidth(width: number): number {
+		// Keep both controls in a narrow popup; extremely small direct renders
+		// retain the original clipped border instead of overlapping the buttons.
+		if (width < 8) return 0;
+		return width >= 14 ? 3 : 1;
+	}
+
+	private navigate(x: number): boolean {
+		const buttonWidth = this.navigationButtonWidth(this.width);
+		if (buttonWidth === 0) return false;
+		const direction = x >= 1 && x < 1 + buttonWidth
+			? -1
+			: x >= this.width - buttonWidth - 1 && x < this.width - 1 ? 1 : 0;
+		if (direction === 0) return false;
+		const number = (this.historyNumber ?? this.listCount) + direction;
+		if (number < 1 || number > this.listCount) return false;
+		this.historyNumber = number === this.listCount ? undefined : number;
+		this.resetView();
+		return true;
 	}
 
 	private frame(bodyLength: number): { height: number; viewport: number } {
@@ -196,8 +250,7 @@ export class ListPanel implements Component {
 
 	private layout(width: number): string[] {
 		this.width = width;
-		const state = this.readState();
-		this.sync(state);
+		const state = this.readSelected();
 		if (width <= 0) return [];
 
 		const inner = width - 2;
@@ -371,9 +424,40 @@ export class ListPanel implements Component {
 	private top(state: ListState | undefined, width: number): string {
 		const items = state?.items ?? [];
 		const done = items.filter(item => item.done).length;
-		const progress = t("list.progress", { done, total: items.length });
-		const label = ` ${this.paint("accent", "list")} ${this.paint("text", progress)} `;
-		return this.rule("╭", "╮", label, width);
+		const progress = this.paint("text", t("list.progress", { done, total: items.length }));
+		const list = this.paint("accent", "list");
+		const buttonWidth = this.navigationButtonWidth(width);
+		if (buttonWidth === 0) return this.rule("╭", "╮", ` ${list} ${progress} `, width);
+
+		const number = this.historyNumber ?? this.listCount;
+		const current = this.historyNumber === undefined;
+		const color = current ? "accent" : "muted";
+		const status = this.paint(color, t(current ? "list.current" : "list.history"));
+		const shortStatus = this.paint(color, t(current ? "list.currentShort" : "list.historyShort"));
+		const numbered = this.paint("text", `#${number}`);
+		const total = this.paint("text", `#${number}/${this.listCount}`);
+		const room = width - 2 - 2 * buttonWidth;
+		// Prefer full metadata, then drop progress and shorten the identity.
+		// Number and status take priority over decoration in narrow terminals.
+		const labels = this.listCount > 0
+			? [
+				` ${list} ${total} ${status} ${progress} `,
+				` ${list} ${total} ${status} `,
+				` ${list} ${numbered} ${status} `,
+				` ${numbered} ${status} `,
+				`${numbered}${shortStatus}`,
+			]
+			: [` ${list} ${progress} `, ` ${list} `, list];
+		const label = labels.find(text => visibleWidth(text) <= room) ?? labels[labels.length - 1]!;
+		const text = truncateToWidth(label, room, "");
+		const fill = this.paint("border", "─".repeat(Math.max(0, room - visibleWidth(text))));
+		const previous = buttonWidth === 3 ? "[‹]" : "‹";
+		const next = buttonWidth === 3 ? "[›]" : "›";
+		return this.paint("border", "╭") +
+			this.paint(number > 1 ? "accent" : "dim", previous) +
+			text + fill +
+			this.paint(number < this.listCount ? "accent" : "dim", next) +
+			this.paint("border", "╮");
 	}
 
 	private bottom(total: number, viewport: number, width: number): string {

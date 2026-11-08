@@ -64,7 +64,14 @@ const writeSchema = Type.Object({
 	dependsOn: Type.Optional(Type.Array(Type.String(), { description: "Replacement prerequisite IDs for update." })),
 }, { additionalProperties: false });
 
+const historySchema = Type.Object({}, { additionalProperties: false });
+
 const readSchema = Type.Object({
+	listNumber: Type.Optional(Type.Integer({
+		minimum: 1,
+		maximum: Number.MAX_SAFE_INTEGER,
+		description: "Session checklist number, distinct from task IDs. Omit to read the current checklist. Use list_history to find historical numbers; numbered reads use the same modes and never change the current checklist.",
+	})),
 	mode: Type.Optional(Type.Union([
 		Type.Literal("overview"),
 		Type.Literal("items"),
@@ -81,6 +88,13 @@ const readSchema = Type.Object({
 
 interface ListToolDetails {
 	list?: ListState;
+	listNumber?: number;
+	historical?: boolean;
+}
+
+interface ListHistoryDetails {
+	history: ReturnType<ListStore["history"]>;
+	currentNumber?: number;
 }
 
 function renderResult(
@@ -158,7 +172,7 @@ export function registerListTools(
 			"Every new checklist needs a self-contained, user-confirmed overall goal; it remains fixed until the checklist is replaced.",
 			"Only mark an item complete after its actual work and all prerequisites are finished.",
 			"All updates are atomic. Invalid/missing/cyclic dependencies are rejected. An unfinished checklist cannot be replaced.",
-			"The overall goal, descriptions and completed items remain available until a completed checklist is replaced with a new one.",
+			"Writes always target the current checklist. Replaced completed checklists remain read-only history, accessible through list_history and list_read.",
 		].join(" "),
 		promptSnippet: "Create and update a persistent checklist anchored to a confirmed overall goal, with descriptions and enforced dependencies.",
 		promptGuidelines: [
@@ -236,6 +250,8 @@ export function registerListTools(
 		label: "List Read",
 		description: [
 			"Read the current checklist in three modes. With no arguments, mode defaults to overview.",
+			"Optional listNumber selects a session checklist by number; use list_history to discover historical numbers.",
+			"Historical checklists are read-only references, not active tasks. Numbered reads never change the current checklist.",
 			"overview returns the title, complete overall goal and all task IDs, titles, completion states,",
 			"dependencies and blocking IDs, but omits item descriptions.",
 			"items requires ids and returns only those tasks with their full descriptions, in checklist display order;",
@@ -249,20 +265,74 @@ export function registerListTools(
 			"Start with list_read overview to recover the complete goal and current task status without all descriptions. " +
 				"Use mode=items with ids to read the full descriptions of tasks you will act on; " +
 				"use mode=full when every task's details are needed.",
+			"For earlier work, first use list_history, then pass its listNumber to list_read with any read mode. " +
+				"Omit listNumber to return to the current checklist; historical reads never redirect list_write.",
 		],
 		parameters: readSchema,
 		executionMode: "sequential",
 		async execute(_id, params, signal, _update, ctx) {
 			if (signal?.aborted) throw new Error("Checklist read cancelled.");
 			const view = getReadView(params);
-			const state = getStore(ctx).read();
+			const store = getStore(ctx);
+			const state = store.read(params.listNumber);
+			const listNumber = state ? params.listNumber ?? store.count : undefined;
+			const historical = listNumber !== undefined && listNumber !== store.count;
+			// Preserve parameterless output exactly. Explicit selections identify
+			// historical work before its text, so it cannot be mistaken for live work.
+			const selection = params.listNumber === undefined ? ""
+				: `Checklist #${listNumber} (${historical ? "historical, read-only; not the current checklist" : "current"}).\n`;
 			return {
 				// Only the chosen view belongs in model-visible content; details serve the UI.
-				content: [{ type: "text", text: state ? formatList(state, view) : "No checklist exists yet." }],
-				details: { list: state },
+				content: [{ type: "text", text: state ? selection + formatList(state, view) : "No checklist exists yet." }],
+				details: { list: state, listNumber, historical },
 			};
 		},
-		renderCall: (_args, theme) => new Text(theme.fg("accent", "list · read"), 0, 0),
+		renderCall: (args, theme) => new Text(theme.fg("accent",
+			args.listNumber === undefined ? "list · read" : `list · read #${args.listNumber}`,
+		), 0, 0),
 		renderResult: (result, options, theme, context) => renderResult(result, options.expanded, theme, context.isError),
+	});
+
+	pi.registerTool<typeof historySchema, ListHistoryDetails>({
+		name: "list_history",
+		label: "List History",
+		description: [
+			"List all historical checklist numbers and titles in this session, oldest first, without their goals or task bodies.",
+			"Numbers start at 1 in creation order and remain stable across updates and session resume.",
+			"The latest checklist remains current, even when completed; it enters read-only history when a new checklist replaces it.",
+			"Pass a returned listNumber to list_read with overview, items, or full to inspect that checklist.",
+			"This query never changes the current checklist or writes to the session.",
+		].join(" "),
+		promptSnippet: "Discover historical checklist numbers and titles before reading earlier work with list_read.",
+		parameters: historySchema,
+		executionMode: "sequential",
+		async execute(_id, _params, signal, _update, ctx) {
+			if (signal?.aborted) throw new Error("Checklist history query cancelled.");
+			const store = getStore(ctx);
+			const history = store.history();
+			const currentNumber = store.count || undefined;
+			const lines = currentNumber === undefined
+				? ["No checklist exists yet."]
+				: [
+					`Current checklist: #${currentNumber} (not archived).`,
+					...(history.length ? [
+						"Historical checklists (oldest first, read-only):",
+						...history.map(entry => `- listNumber: ${entry.listNumber}; title: ${JSON.stringify(entry.title)}`),
+						"Use list_read with listNumber and the desired mode to read an entry.",
+					] : ["No historical checklists exist yet."]),
+				];
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { history, currentNumber },
+			};
+		},
+		renderCall: (_args, theme) => new Text(theme.fg("accent", "list · history"), 0, 0),
+		renderResult: (result, options, theme, context) => new Text(
+			theme.fg(context.isError ? "error" : "dim", options.expanded || context.isError
+				? result.content.filter(part => part.type === "text").map(part => part.text).join("\n")
+				: `list · history (${result.details?.history.length ?? 0})`),
+			0,
+			0,
+		),
 	});
 }

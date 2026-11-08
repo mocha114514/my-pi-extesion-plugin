@@ -14,7 +14,11 @@ export interface ListWidget {
 }
 
 /** Capture the TUI without replacing the editor, footer, or another plugin's widget. */
-export function installListWidget(ctx: ExtensionContext, readState: () => ListState | undefined): ListWidget {
+export function installListWidget(
+	ctx: ExtensionContext,
+	readState: (listNumber?: number) => ListState | undefined,
+	readCount?: () => number,
+): ListWidget {
 	if (!ctx.hasUI || ctx.mode !== "tui") {
 		return { changed() {}, toggle() {}, dispose() {} };
 	}
@@ -64,7 +68,7 @@ export function installListWidget(ctx: ExtensionContext, readState: () => ListSt
 			close();
 			return;
 		}
-		panel.resetView();
+		panel.resetNavigation();
 		options = { margin: 0, minWidth: 1, nonCapturing: true };
 		if (!position()) {
 			options = undefined;
@@ -84,7 +88,7 @@ export function installListWidget(ctx: ExtensionContext, readState: () => ListSt
 
 	ctx.ui.setWidget(WIDGET_KEY, (host) => {
 		tui = host;
-		panel = new ListPanel(readState, () => ctx.ui.theme);
+		panel = new ListPanel(readState, () => ctx.ui.theme, readCount);
 		border = createEditorBorder(host, {
 			position: "right",
 			label: () => host.mode === "fullscreen" ? ctx.ui.theme.fg(overlay ? "accent" : "muted", "list") : "",

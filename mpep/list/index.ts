@@ -38,9 +38,12 @@ export default function listExtension(pi: ExtensionAPI): void {
 		} catch (error) {
 			report(ctx, error);
 		}
-		widget = installListWidget(ctx, () => {
-			try { return store.read(); }
+		widget = installListWidget(ctx, listNumber => {
+			try { return store.read(listNumber); }
 			catch { return undefined; }
+		}, () => {
+			try { return store.count; }
+			catch { return 0; }
 		});
 	};
 
