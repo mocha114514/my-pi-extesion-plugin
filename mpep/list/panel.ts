@@ -150,15 +150,16 @@ export class ListPanel implements Component {
 		if (event.type === "click") {
 			if (event.button === "left" && !event.shift && !event.alt && !event.ctrl) {
 				const state = this.readSelected();
-				if (event.y === 0) {
+				const body = this.measure(state);
+				const { height, viewport } = this.frame(body);
+				// Navigation stays on the bottom border as the panel grows or shrinks.
+				if (height >= 2 && event.y === height - 1) {
 					return { handled: true, focus: false, render: this.navigate(event.x) };
 				}
 				// Arrows accept rapid repeated clicks; body folds remain single-click only.
 				if ((event.clickCount ?? 1) !== 1) {
 					return { handled: true, focus: false, render: false };
 				}
-				const body = this.measure(state);
-				const { viewport } = this.frame(body);
 				this.clamp(body, viewport);
 				const inside = event.x > 0 && event.x < this.width - 1 &&
 					event.y > 0 && event.y <= viewport;
@@ -217,9 +218,12 @@ export class ListPanel implements Component {
 	private navigate(x: number): boolean {
 		const buttonWidth = this.navigationButtonWidth(this.width);
 		if (buttonWidth === 0) return false;
-		const direction = x >= 1 && x < 1 + buttonWidth
+		// Match bottom(): both buttons are right-aligned with one border cell between them.
+		const nextStart = this.width - buttonWidth - 1;
+		const previousStart = nextStart - buttonWidth - 1;
+		const direction = x >= previousStart && x < previousStart + buttonWidth
 			? -1
-			: x >= this.width - buttonWidth - 1 && x < this.width - 1 ? 1 : 0;
+			: x >= nextStart && x < nextStart + buttonWidth ? 1 : 0;
 		if (direction === 0) return false;
 		const number = (this.historyNumber ?? this.listCount) + direction;
 		if (number < 1 || number > this.listCount) return false;
@@ -426,8 +430,7 @@ export class ListPanel implements Component {
 		const done = items.filter(item => item.done).length;
 		const progress = this.paint("text", t("list.progress", { done, total: items.length }));
 		const list = this.paint("accent", "list");
-		const buttonWidth = this.navigationButtonWidth(width);
-		if (buttonWidth === 0) return this.rule("╭", "╮", ` ${list} ${progress} `, width);
+		if (width < 8) return this.rule("╭", "╮", ` ${list} ${progress} `, width);
 
 		const number = this.historyNumber ?? this.listCount;
 		const current = this.historyNumber === undefined;
@@ -436,7 +439,7 @@ export class ListPanel implements Component {
 		const shortStatus = this.paint(color, t(current ? "list.currentShort" : "list.historyShort"));
 		const numbered = this.paint("text", `#${number}`);
 		const total = this.paint("text", `#${number}/${this.listCount}`);
-		const room = width - 2 - 2 * buttonWidth;
+		const room = width - 2;
 		// Prefer full metadata, then drop progress and shorten the identity.
 		// Number and status take priority over decoration in narrow terminals.
 		const labels = this.listCount > 0
@@ -449,15 +452,7 @@ export class ListPanel implements Component {
 			]
 			: [` ${list} ${progress} `, ` ${list} `, list];
 		const label = labels.find(text => visibleWidth(text) <= room) ?? labels[labels.length - 1]!;
-		const text = truncateToWidth(label, room, "");
-		const fill = this.paint("border", "─".repeat(Math.max(0, room - visibleWidth(text))));
-		const previous = buttonWidth === 3 ? "[‹]" : "‹";
-		const next = buttonWidth === 3 ? "[›]" : "›";
-		return this.paint("border", "╭") +
-			this.paint(number > 1 ? "accent" : "dim", previous) +
-			text + fill +
-			this.paint(number < this.listCount ? "accent" : "dim", next) +
-			this.paint("border", "╮");
+		return this.rule("╭", "╮", label, width);
 	}
 
 	private bottom(total: number, viewport: number, width: number): string {
@@ -469,7 +464,21 @@ export class ListPanel implements Component {
 				total,
 			}))} `
 			: "";
-		return this.rule("╰", "╯", label, width);
+		const buttonWidth = this.navigationButtonWidth(width);
+		if (buttonWidth === 0) return this.rule("╰", "╯", label, width);
+
+		// Reserve the right-hand controls before clipping the scroll indicator.
+		const room = width - 2 - 2 * buttonWidth - 1;
+		const text = truncateToWidth(label, room, "");
+		const fill = this.paint("border", "─".repeat(Math.max(0, room - visibleWidth(text))));
+		const number = this.historyNumber ?? this.listCount;
+		const previous = buttonWidth === 3 ? "[‹]" : "‹";
+		const next = buttonWidth === 3 ? "[›]" : "›";
+		return this.paint("border", "╰") + text + fill +
+			this.paint(number > 1 ? "accent" : "dim", previous) +
+			this.paint("border", "─") +
+			this.paint(number < this.listCount ? "accent" : "dim", next) +
+			this.paint("border", "╯");
 	}
 
 	private rule(left: string, right: string, label: string, width: number): string {
