@@ -1,4 +1,4 @@
-import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import {
 	DELETE_CANCEL_PREFIX,
 	decodeDeleteDecision,
@@ -6,6 +6,7 @@ import {
 	type DeleteApprovalDecision,
 	type DeleteApprovalRequest,
 } from "../shared/delete-approval.ts";
+import { DeleteApprovalPanel, type DeleteApprovalPrompt } from "./panel.ts";
 
 export const HUMAN_APPROVAL_TIMEOUT_MS = 60_000;
 export type HumanDecision = "approved" | "denied" | "cancelled" | "timeout";
@@ -27,15 +28,18 @@ export class ApprovalQueue {
  * The first option is denial, so pressing Enter never approves by default.
  */
 export function askHuman(
-	ui: Pick<ExtensionUIContext, "select">,
-	title: string,
-	labels: { deny: string; approve: string },
+	ui: Pick<ExtensionUIContext, "select" | "custom">,
+	prompt: DeleteApprovalPrompt,
 	signal: AbortSignal,
+	mode: ExtensionContext["mode"],
 ): Promise<HumanDecision> {
 	if (signal.aborted) return Promise.resolve("cancelled");
 	return new Promise((resolve, reject) => {
 		const controller = new AbortController();
+		const deadline = Date.now() + HUMAN_APPROVAL_TIMEOUT_MS;
 		let settled = false;
+		let closePanel: (() => void) | undefined;
+		let refreshTimer: ReturnType<typeof setInterval> | undefined;
 		const finish = (decision: HumanDecision) => {
 			if (settled) return;
 			settled = true;
@@ -46,28 +50,66 @@ export function askHuman(
 		const timer = setTimeout(() => finish("timeout"), HUMAN_APPROVAL_TIMEOUT_MS);
 		const cleanup = () => {
 			clearTimeout(timer);
+			clearInterval(refreshTimer);
 			signal.removeEventListener("abort", onAbort);
 			controller.abort();
+			closePanel?.();
 		};
-		signal.addEventListener("abort", onAbort, { once: true });
-		// The guard timer is registered before the native UI timer, so an
-		// unanswered countdown is classified as timeout, not user cancellation.
-		try {
-			ui.select(title, [labels.deny, labels.approve], {
-				timeout: HUMAN_APPROVAL_TIMEOUT_MS,
-				signal: controller.signal,
-			}).then(choice => {
-				finish(choice === labels.approve ? "approved" : choice === labels.deny ? "denied" : "cancelled");
-			}, error => {
-				if (settled) return;
-				settled = true;
-				cleanup();
-				reject(error);
-			});
-		} catch (error) {
+		const fail = (error: unknown) => {
+			if (settled) return;
 			settled = true;
 			cleanup();
 			reject(error);
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		// Register the real deadline before opening either UI. Scrolling and
+		// redraws never extend it, and an unanswered dialog remains a timeout.
+		try {
+			let choice: Promise<string | undefined>;
+			if (mode === "tui") {
+				let cancelPanel: (() => void) | undefined;
+				choice = ui.custom<string | undefined>((tui, theme, keys, done) => {
+					const panel = new DeleteApprovalPanel({
+						prompt,
+						theme,
+						rows: () => tui.terminal.rows,
+						remainingSeconds: () => Math.max(0, Math.ceil((deadline - Date.now()) / 1_000)),
+						matches: (data, action) => keys.matches(data, action),
+						choose: done,
+					});
+					cancelPanel = () => {
+						panel.dispose();
+						done(undefined);
+					};
+					if (!settled) refreshTimer = setInterval(() => tui.requestRender(), 1_000);
+					return panel;
+				}, {
+					overlay: true,
+					overlayOptions: {
+						anchor: "center",
+						width: "100%",
+						maxHeight: "100%",
+						margin: { left: 1, right: 1 },
+					},
+					onHandle: () => {
+						// Pi mounts custom components asynchronously. Do not call
+						// done before mounting: it could hide an unrelated overlay.
+						closePanel = cancelPanel;
+						if (settled) closePanel?.();
+					},
+				});
+			} else {
+				// RPC clients own their UI and cannot render terminal components.
+				choice = ui.select(`${prompt.title}\n${prompt.body}`, [prompt.labels.deny, prompt.labels.approve], {
+					timeout: HUMAN_APPROVAL_TIMEOUT_MS,
+					signal: controller.signal,
+				});
+			}
+			choice.then(value => {
+				finish(value === prompt.labels.approve ? "approved" : value === prompt.labels.deny ? "denied" : "cancelled");
+			}, fail);
+		} catch (error) {
+			fail(error);
 		}
 	});
 }

@@ -82,15 +82,18 @@ export default function deleteGuard(pi: ExtensionAPI): void {
 			return await queue.run(async () => {
 				if (signal.aborted || !active) return blocked("Deletion approval was cancelled. Nothing was executed.");
 				if (!ctx.hasUI) return blocked("Deletion blocked: no interactive approval UI is available. Nothing was executed.");
-				const decision = await askHuman(ctx.ui, visible([
-					t("deleteGuard.title"),
-					describeRequest(request),
-					"",
-					t("deleteGuard.hint"),
-				].join("\n")), {
-					deny: t("deleteGuard.deny"),
-					approve: t("deleteGuard.approve"),
-				}, signal);
+				const decision = await askHuman(ctx.ui, {
+					title: t("deleteGuard.title"),
+					body: visible([
+						describeRequest(request),
+						"",
+						t("deleteGuard.hint"),
+					].join("\n")),
+					labels: {
+						deny: t("deleteGuard.deny"),
+						approve: t("deleteGuard.approve"),
+					},
+				}, signal, ctx.mode);
 				if (signal.aborted || !active) return blocked("Deletion approval was cancelled. Nothing was executed.");
 				if (decision === "timeout") {
 					return blocked("Deletion blocked: the user did not respond within 60 seconds and may be away from the window. " +
