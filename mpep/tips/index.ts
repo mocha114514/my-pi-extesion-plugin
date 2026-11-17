@@ -29,8 +29,10 @@ import { readTemplate, selectTemplates } from "./templates.ts";
  * snapshots preserve session tips and source provenance across reload, resume,
  * and compaction. Templates are re-matched automatically, never written back.
  *
- * Delivery is passive: updates, 25% / 50% / 75% compaction-window milestones,
- * and successful compaction send a reminder without triggering an agent turn.
+ * Delivery is passive: session start, model changes, and /m-tips edits stage
+ * updates until the user's next prompt (via before_agent_start), while in-turn
+ * tool edits, 25% / 50% / 75% compaction-window milestones, and compaction send
+ * a reminder without triggering an extra agent turn.
  */
 
 const COMMAND = "m-tips";
@@ -119,6 +121,9 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 	let sessionId: string | undefined;
 	let state: TipsState = emptyState();
 	let currentModel: string | undefined;
+	// Pending reminder reason for idle-time changes (session start, model switch, /m-tips);
+	// flushed on the next before_agent_start so rapid pre-prompt changes coalesce into one notice.
+	let pendingReason: string | null = null;
 	const listeners = new Set<() => void>();
 	const notifyPanels = () => {
 		for (const listener of listeners) listener();
@@ -187,14 +192,20 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 
 	const ensureBound = (ctx: ExtensionContext) => {
 		if (!active) throw new Error("The tips extension is no longer active.");
-		if (sessionId !== ctx.sessionManager.getSessionId()) bind(ctx);
+		if (sessionId !== ctx.sessionManager.getSessionId()) {
+			pendingReason = null;
+			if (bind(ctx)) pendingReason = "Tips templates were automatically matched";
+		}
 	};
 
+	const hasInjectedReminder = (ctx: ExtensionContext): boolean =>
+		ctx.sessionManager.getBranch().some(
+			candidate => candidate.type === "custom_message" && candidate.customType === REMINDER_TYPE,
+		);
+
 	/**
-	 * The one and only delivery path. triggerTurn: false guarantees the message
-	 * is appended to the session tree WITHOUT starting a turn: mid-run it lands
-	 * right after the current turn, idle it lands immediately — in both cases it
-	 * only becomes visible to the model as part of the NEXT request's context.
+	 * Direct delivery path for mid-run updates, milestones, and compaction.
+	 * triggerTurn: false appends to the session tree WITHOUT starting a turn.
 	 */
 	const injectReminder = (reason: string, includeEmpty = false) => {
 		if (state.tips.length === 0 && !includeEmpty) return;
@@ -208,13 +219,25 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		);
 	};
 
-	/** Do not publish a new in-memory state unless its durable snapshot was accepted. */
-	const commit = (next: TipsState, reason: string) => {
+	/** Persist a new snapshot and notify open panels before delivering or staging a notice. */
+	const commitState = (next: TipsState) => {
 		pi.appendEntry(ENTRY_TYPE, next);
 		state = next;
 		notifyPanels();
+	};
+
+	/** Persist and deliver immediately (used by the AI tool mid-turn). */
+	const commit = (next: TipsState, reason: string) => {
+		commitState(next);
+		pendingReason = null;
 		// An empty update must explicitly invalidate reminders already present in context.
 		injectReminder(reason, true);
+	};
+
+	/** Persist and defer context injection until the user submits the next prompt. */
+	const stageCommit = (next: TipsState, reason: string) => {
+		commitState(next);
+		pendingReason = reason;
 	};
 
 	const checkMilestones = (ctx: ExtensionContext) => {
@@ -312,15 +335,15 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 				},
 				add: content => {
 					requireCurrent();
-					commit(addTip(state, content), "The user added a session tip through /m-tips");
+					stageCommit(addTip(state, content), "The user added a session tip through /m-tips");
 				},
 				update: (id, content) => {
 					requireCurrent();
-					commit(updateTip(state, id, content), "The user edited a session tip through /m-tips");
+					stageCommit(updateTip(state, id, content), "The user edited a session tip through /m-tips");
 				},
 				remove: id => {
 					requireCurrent();
-					commit(removeTip(state, id), "The user removed a session tip through /m-tips");
+					stageCommit(removeTip(state, id), "The user removed a session tip through /m-tips");
 				},
 			});
 		},
@@ -328,28 +351,51 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		if (!active) return;
+		pendingReason = null;
 		if (bind(ctx)) {
-			injectReminder("This is the session-start reminder: tips templates were automatically matched", true);
+			pendingReason = "This is the session-start reminder: tips templates were automatically matched";
 		}
 	});
 	pi.on("model_select", (event, ctx) => {
 		if (!active) return;
 		// Use the event payload: during restore, ctx.model can still describe the old model.
 		if (sessionId !== ctx.sessionManager.getSessionId()) {
-			if (bind(ctx, event.model)) injectReminder("Tips templates were automatically matched for the selected model", true);
+			pendingReason = null;
+			if (bind(ctx, event.model)) {
+				pendingReason = "Tips templates were automatically matched for the selected model";
+			}
 			return;
 		}
 		const selectedModel = modelKey(event.model);
 		if (selectedModel === currentModel) return;
 		const next = resolveTemplates(ctx, selectedModel);
-		if (next !== state) commit(next, "The model changed; tips templates were automatically re-matched");
+		if (next !== state) {
+			stageCommit(next, "The model changed; tips templates were automatically re-matched");
+		}
 		currentModel = selectedModel;
+	});
+	pi.on("before_agent_start", (_event, ctx) => {
+		if (!active) return;
+		ensureBound(ctx);
+		if (!pendingReason) return;
+		const reason = pendingReason;
+		pendingReason = null;
+		// Never emit a withdrawal notice if this branch has never received a tips reminder.
+		if (state.tips.length === 0 && !hasInjectedReminder(ctx)) return;
+		return {
+			message: {
+				customType: REMINDER_TYPE,
+				content: buildReminder(state, reason, new Date().toISOString()),
+				display: false,
+			},
+		};
 	});
 	pi.on("session_shutdown", () => {
 		// A session switch can reuse this extension instance; drop the old binding
 		// without disabling the next session_start. Reload's factory owns dispose.
 		sessionId = undefined;
 		currentModel = undefined;
+		pendingReason = null;
 		state = emptyState();
 		firedMilestones.clear();
 		notifyPanels();
@@ -366,12 +412,14 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		// re-inject the current tips immediately and let milestones fire again
 		// as the context grows back.
 		firedMilestones.clear();
+		pendingReason = null;
 		injectReminder("This is the post-compaction reminder: the context was just compacted");
 	});
 
 	const dispose = () => {
 		if (!active) return;
 		active = false;
+		pendingReason = null;
 		notifyPanels();
 		listeners.clear();
 		if (installations[SLOT] === dispose) delete installations[SLOT];
