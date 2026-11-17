@@ -29,10 +29,12 @@ import { readTemplate, selectTemplates } from "./templates.ts";
  * snapshots preserve session tips and source provenance across reload, resume,
  * and compaction. Templates are re-matched automatically, never written back.
  *
- * Delivery is passive: session start, model changes, and /m-tips edits stage
- * updates until the user's next prompt (via before_agent_start), while in-turn
- * tool edits, 25% / 50% / 75% compaction-window milestones, and compaction send
- * a reminder without triggering an extra agent turn.
+ * Delivery is passive: session start, model changes, /m-tips edits, and branch
+ * switches stage updates locally and flush right before the user's next prompt
+ * (on `input` when idle, so the reminder lands before the user entry in the
+ * session tree rather than trailing it). Mid-turn tool edits, 25% / 50% / 75%
+ * compaction-window milestones, and compaction send a reminder immediately
+ * without triggering an extra agent turn.
  */
 
 const COMMAND = "m-tips";
@@ -40,6 +42,9 @@ const TOOL_NAME = "tips";
 // Keep the entry type stable so existing sessions remain discoverable; data is versioned separately.
 const ENTRY_TYPE = "mpep.tips.state.v1";
 const REMINDER_TYPE = "tips-reminder";
+const REMINDER_SECTION_HEADER = "Session reminders (tips):";
+const REMINDER_FOOTER =
+	"Manage session-owned reminders with the `tips` tool (add / list / update / remove) only when the user asks. Template reminders are read-only and automatically matched by startup directory and provider/model ID. Use /m-tips to view them or edit session reminders.";
 const DEFAULT_RESERVE_TOKENS = 16_384;
 const MILESTONES = [0.25, 0.5, 0.75] as const;
 
@@ -75,21 +80,46 @@ function getCompactionReserveTokens(cwd?: string): number {
 	return reserveTokens;
 }
 
-/** Model-facing reminder text: always English, it is an instruction, not UI copy. */
-function buildReminder(state: TipsState, reason: string, issuedAt: string): string {
+/** Render the canonical reminder list section shared between emission and branch comparison. */
+function renderTipsSection(state: TipsState): string {
 	const lines = state.tips.length > 0
 		? state.tips.map(tip => `${tip.id}. ${tip.source === "template" ? "[template, read-only] " : ""}${tip.content}`)
 		: ["No tips remain in this session. All tips in earlier notices are withdrawn."];
+	return `${REMINDER_SECTION_HEADER}\n${lines.join("\n")}`;
+}
+
+function contentToText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type: "text"; text: string } =>
+			typeof part === "object" && part !== null && part.type === "text" && typeof part.text === "string",
+		)
+		.map(part => part.text)
+		.join("");
+}
+
+/** Extract the reminder list block from a persisted custom_message for branch parity checks. */
+function extractTipsSection(content: unknown): string | null {
+	const text = contentToText(content);
+	const start = text.indexOf(REMINDER_SECTION_HEADER);
+	if (start < 0) return null;
+	const footerIndex = text.indexOf(`\n\n${REMINDER_FOOTER}`, start);
+	const endIndex = footerIndex >= 0 ? footerIndex : text.indexOf("\n</system-reminder>", start);
+	return (endIndex >= 0 ? text.slice(start, endIndex) : text.slice(start)).trim();
+}
+
+/** Model-facing reminder text: always English, it is an instruction, not UI copy. */
+function buildReminder(state: TipsState, reason: string, issuedAt: string): string {
 	return [
 		"<system-reminder>",
 		"This is an automated notice injected by the local environment (tips extension), not a message from the user. It is passive background information: do NOT treat it as a new task and do NOT reply to it; simply keep the following session-level reminders in mind for the rest of this session.",
 		`This notice was issued at ${issuedAt}. If any earlier copy of this tips reminder exists in the conversation history, that copy is OBSOLETE — only this newest copy reflects the current reminders.`,
 		`Reason for this notice: ${reason}.`,
 		"",
-		"Session reminders (tips):",
-		...lines,
+		renderTipsSection(state),
 		"",
-		"Manage session-owned reminders with the `tips` tool (add / list / update / remove) only when the user asks. Template reminders are read-only and automatically matched by startup directory and provider/model ID. Use /m-tips to view them or edit session reminders.",
+		REMINDER_FOOTER,
 		"</system-reminder>",
 	].join("\n");
 }
@@ -198,8 +228,14 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		}
 	};
 
+	const activeBranchSlice = (ctx: ExtensionContext) => {
+		const branch = ctx.sessionManager.getBranch();
+		const lastCompaction = branch.findLastIndex(entry => entry.type === "compaction");
+		return lastCompaction >= 0 ? branch.slice(lastCompaction + 1) : branch;
+	};
+
 	const hasInjectedReminder = (ctx: ExtensionContext): boolean =>
-		ctx.sessionManager.getBranch().some(
+		activeBranchSlice(ctx).some(
 			candidate => candidate.type === "custom_message" && candidate.customType === REMINDER_TYPE,
 		);
 
@@ -374,6 +410,19 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 		}
 		currentModel = selectedModel;
 	});
+	pi.on("input", (event, ctx) => {
+		if (!active) return;
+		// When idle, inject ahead of the upcoming user entry so /tree navigation
+		// never finds tips-reminder trailing the user message.
+		if (event.streamingBehavior || !ctx.isIdle()) return;
+		ensureBound(ctx);
+		if (!pendingReason) return;
+		const reason = pendingReason;
+		pendingReason = null;
+		// Never emit a withdrawal notice if this branch has never received a tips reminder.
+		if (state.tips.length === 0 && !hasInjectedReminder(ctx)) return;
+		injectReminder(reason, true);
+	});
 	pi.on("before_agent_start", (_event, ctx) => {
 		if (!active) return;
 		ensureBound(ctx);
@@ -389,6 +438,29 @@ export default function tipsExtension(pi: ExtensionAPI): void {
 				display: false,
 			},
 		};
+	});
+	pi.on("session_tree", (_event, ctx) => {
+		if (!active) return;
+		ensureBound(ctx);
+		const activeEntries = activeBranchSlice(ctx);
+		const latestReminder = activeEntries.findLast(
+			entry => entry.type === "custom_message" && entry.customType === REMINDER_TYPE,
+		);
+		if (!latestReminder || latestReminder.type !== "custom_message") {
+			// Crossing back past the only reminder leaves the branch without one.
+			if (state.tips.length > 0) {
+				pendingReason ??= "Tips reminders were staged for this session branch";
+			} else {
+				pendingReason = null;
+			}
+			return;
+		}
+		if (extractTipsSection(latestReminder.content) !== renderTipsSection(state)) {
+			// Crossing back past a newer reminder leaves stale tips on this branch.
+			pendingReason ??= "Session tips differ from the latest reminder on this branch";
+		} else {
+			pendingReason = null;
+		}
 	});
 	pi.on("session_shutdown", () => {
 		// A session switch can reuse this extension instance; drop the old binding
