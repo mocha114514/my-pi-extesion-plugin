@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { formatCompactDuration } from "./shared/duration.ts";
 import { getLocale, t } from "./shared/i18n/index.ts";
 import { isPluginEnabled } from "./manager/preferences.ts";
 
@@ -41,7 +42,7 @@ export default function (pi: ExtensionAPI) {
 			tps: tokensPerSecond.toFixed(1), output: output.toLocaleString(getLocale()),
 			input: input.toLocaleString(getLocale()), cacheRead: cacheRead.toLocaleString(getLocale()),
 			cacheWrite: cacheWrite.toLocaleString(getLocale()), total: totalTokens.toLocaleString(getLocale()),
-			seconds: elapsedSeconds.toFixed(1),
+			elapsed: formatCompactDuration(elapsedSeconds),
 		});
 		ctx.ui.notify(message, "info");
 	});

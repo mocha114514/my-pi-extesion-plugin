@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
+import { formatCompactDuration } from "../shared/duration.ts";
 import { t } from "../shared/i18n/index.ts";
 import { notifyTurnComplete } from "./notify.ts";
 import { ensureBubbleSound } from "./sound.ts";
@@ -47,7 +48,7 @@ export function createTurnNotify(
 			startMs = null;
 			const body = seconds === null
 				? t("turnNotify.body")
-				: t("turnNotify.bodyWithSeconds", { seconds: seconds.toFixed(1) });
+				: t("turnNotify.bodyWithSeconds", { elapsed: formatCompactDuration(seconds) });
 			// Synthesized bubble chime from the cache; undefined falls back to system sounds.
 			notify(t("turnNotify.title"), body, ensureBubbleSound());
 		},
