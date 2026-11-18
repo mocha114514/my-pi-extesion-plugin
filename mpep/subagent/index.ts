@@ -27,6 +27,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { DELETE_GUARD_CHILD_ENV } from "../shared/delete-approval.ts";
+import { registerSigintCleanup } from "../shared/sigint.ts";
 import { discoverAgents, seedPresets, type AgentConfig } from "./agents.ts";
 import { RpcSubprocess } from "./client.ts";
 import { DELETE_APPROVAL_SUPERVISOR_PROMPT, DeleteApprovalBroker, registerDeleteApprovalTool } from "./delete-approvals.ts";
@@ -1315,20 +1316,14 @@ export default function (pi: ExtensionAPI): void {
 		pool?.killAll();
 	};
 	process.on("exit", killAll);
-	// Signals: registering a plain listener would SWALLOW Ctrl+C (Node drops its
-	// default termination once any listener exists). Reap, then re-raise so the
-	// default behavior (or the host's own handler) still runs.
-	const onSigint = () => {
-		process.off("SIGINT", onSigint);
-		killAll();
-		process.kill(process.pid, "SIGINT");
-	};
+	// Signals: coordinate SIGINT across MPEP plugins so sibling cleanups run
+	// before re-raising SIGINT to terminate cleanly.
+	const unregisterSigint = registerSigintCleanup(killAll);
 	const onSigterm = () => {
 		process.off("SIGTERM", onSigterm);
 		killAll();
 		process.kill(process.pid, "SIGTERM");
 	};
-	process.on("SIGINT", onSigint);
 	process.on("SIGTERM", onSigterm);
 
 	// TUI reload / session replacement invalidates this context right after; all
@@ -1345,7 +1340,7 @@ export default function (pi: ExtensionAPI): void {
 
 	installations[SLOT] = () => {
 		process.off("exit", killAll);
-		process.off("SIGINT", onSigint);
+		unregisterSigint();
 		process.off("SIGTERM", onSigterm);
 		if (compactionFlushTimer) {
 			clearTimeout(compactionFlushTimer);

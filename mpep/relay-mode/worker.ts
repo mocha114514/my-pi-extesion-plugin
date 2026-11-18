@@ -151,69 +151,41 @@ function splitThinkingSuffix(spec: string): { base: string; suffix?: string } {
 	return { base: spec.trim() };
 }
 
-function resolveUniqueModelTarget(
+/**
+ * Resolve `spec` strictly to an exact catalog entry (`provider/id` or unique `id`)
+ * and format `modelArg` as `<provider>/<id>[:thinking]` so BOTH Pi 0.85.1
+ * (which strips `<provider>/` once when `--provider` is also passed) and Pi 1.5.2
+ * resolve the exact model even when `id` itself contains `/` (e.g. `openrouter/free`).
+ */
+function resolveExactCatalogTarget(
 	spec: string,
 	explicitProvider: string | undefined,
 	availableModels: readonly ModelDescriptor[],
 ): { provider: string; modelArg: string } | undefined {
 	const trimmed = spec.trim();
-	if (!trimmed) return undefined;
+	if (!trimmed || availableModels.length === 0) return undefined;
 	const { base, suffix } = splitThinkingSuffix(trimmed);
 	if (!base) return undefined;
-	const withSuffix = (id: string) => (suffix ? `${id}:${suffix}` : id);
+	const baseLower = base.toLowerCase();
+	const formatPinned = (m: ModelDescriptor) => `${m.provider}/${m.id}${suffix ? `:${suffix}` : ""}`;
 
 	if (explicitProvider) {
-		const matched = availableModels.find((m) => m.provider.toLowerCase() === explicitProvider.toLowerCase());
-		return { provider: matched?.provider ?? explicitProvider, modelArg: trimmed };
+		const provLower = explicitProvider.trim().toLowerCase();
+		const scoped = availableModels.filter((m) => m.provider.toLowerCase() === provLower);
+		const exact = scoped.find(
+			(m) => m.id.toLowerCase() === baseLower || `${m.provider}/${m.id}`.toLowerCase() === baseLower,
+		);
+		return exact ? { provider: exact.provider, modelArg: formatPinned(exact) } : undefined;
 	}
 
-	if (availableModels.length > 0) {
-		const baseLower = base.toLowerCase();
-
-		// 1. Exact `provider/id` catalog match first (preserves slash-containing IDs like `openrouter/free`).
-		const fullMatches = availableModels.filter((m) => `${m.provider}/${m.id}`.toLowerCase() === baseLower);
-		if (fullMatches.length === 1 && fullMatches[0]) {
-			return { provider: fullMatches[0].provider, modelArg: withSuffix(fullMatches[0].id) };
-		}
-
-		// 2. Exact `id` catalog match (e.g. `openrouter/free` or `claude-sonnet-4-5`) when unique to one provider.
-		const exactIdMatches = availableModels.filter((m) => m.id.toLowerCase() === baseLower);
-		if (exactIdMatches.length > 0) {
-			const providers = new Set(exactIdMatches.map((m) => m.provider.toLowerCase()));
-			if (providers.size === 1 && exactIdMatches[0]) {
-				return { provider: exactIdMatches[0].provider, modelArg: withSuffix(exactIdMatches[0].id) };
-			}
-			return undefined;
-		}
-
-		// 3. Explicit `provider/` prefix (longest known provider match) for custom/fuzzy specs.
-		const lowerTrimmed = trimmed.toLowerCase();
-		let bestSplit: { provider: string; modelArg: string } | undefined;
-		for (const { provider } of availableModels) {
-			const prefix = provider.trim().toLowerCase();
-			if (!prefix || (bestSplit && bestSplit.provider.length >= provider.length)) continue;
-			const slashIdx = lowerTrimmed.indexOf("/", prefix.length);
-			if (slashIdx === -1 || lowerTrimmed.slice(0, slashIdx).trim() !== prefix) continue;
-			const rest = trimmed.slice(slashIdx + 1).trim();
-			if (rest) bestSplit = { provider, modelArg: rest };
-		}
-		if (bestSplit) return bestSplit;
-
-		// 4. Substring match across catalog IDs only if all candidates belong to one provider.
-		const subMatches = availableModels.filter((m) => m.id.toLowerCase().includes(baseLower));
-		const subProviders = new Set(subMatches.map((m) => m.provider.toLowerCase()));
-		if (subProviders.size === 1 && subMatches[0]) {
-			return {
-				provider: subMatches[0].provider,
-				modelArg: subMatches.length === 1 ? withSuffix(subMatches[0].id) : trimmed,
-			};
-		}
-		return undefined;
+	const fullMatches = availableModels.filter((m) => `${m.provider}/${m.id}`.toLowerCase() === baseLower);
+	if (fullMatches.length === 1 && fullMatches[0]) {
+		return { provider: fullMatches[0].provider, modelArg: formatPinned(fullMatches[0]) };
 	}
 
-	const slash = base.indexOf("/");
-	if (slash > 0 && slash < base.length - 1) {
-		return { provider: base.slice(0, slash), modelArg: trimmed.slice(slash + 1) };
+	const exactIdMatches = availableModels.filter((m) => m.id.toLowerCase() === baseLower);
+	if (exactIdMatches.length === 1 && exactIdMatches[0]) {
+		return { provider: exactIdMatches[0].provider, modelArg: formatPinned(exactIdMatches[0]) };
 	}
 	return undefined;
 }
@@ -283,8 +255,8 @@ export function buildInheritedCliArgs(
 	inheritProvider: string | undefined,
 	inheritModelId: string | undefined,
 	availableModels: readonly ModelDescriptor[],
-	recordedStartupProvider?: string,
-): { args: string[]; modelPinnedByArgs: boolean } {
+	verifiedApiKeyProvider?: string,
+): { args: string[]; modelPinnedByArgs: boolean; apiKeyCandidate?: { provider: string; apiKey: string } } {
 	const argv = process.argv.slice(2);
 	const args: string[] = [];
 	let cliTrust: "--approve" | "--no-approve" | undefined;
@@ -294,7 +266,6 @@ export function buildInheritedCliArgs(
 	let cliProvider: string | undefined;
 	let cliModelArg: string | undefined;
 	let cliModelsArg: string[] | undefined;
-	let cliHasExistingSession = false;
 
 	const takeValue = (idx: number, flag: string): { value?: string; nextIdx: number } => {
 		const eq = flag.indexOf("=");
@@ -309,9 +280,6 @@ export function buildInheritedCliArgs(
 		"--version",
 		"-v",
 		"--no-session",
-	]);
-
-	const BUILTIN_RESUME_FLAGS = new Set([
 		"--continue",
 		"-c",
 		"--resume",
@@ -324,17 +292,15 @@ export function buildInheritedCliArgs(
 		"--append-system-prompt",
 		"--name",
 		"-n",
+		"--session",
+		"--session-id",
+		"--fork",
 		"--session-dir",
 		"--thinking",
 		"--export",
 		"--theme",
 		"--use-theme",
 		"--tui-mode",
-	]);
-
-	const BUILTIN_RESUME_VALUE_FLAGS = new Set([
-		"--session",
-		"--fork",
 	]);
 
 	for (let i = 0; i < argv.length; i++) {
@@ -405,13 +371,6 @@ export function buildInheritedCliArgs(
 			if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---"))) {
 				i++;
 			}
-		} else if (BUILTIN_RESUME_FLAGS.has(arg)) {
-			cliHasExistingSession = true;
-		} else if (BUILTIN_RESUME_VALUE_FLAGS.has(arg)) {
-			cliHasExistingSession = true;
-			if (i + 1 < argv.length) i++;
-		} else if (arg === "--session-id") {
-			if (i + 1 < argv.length) i++;
 		} else if (BUILTIN_NO_ARG_FLAGS.has(arg)) {
 			continue;
 		} else if (BUILTIN_VALUE_SKIP_FLAGS.has(arg)) {
@@ -466,41 +425,37 @@ export function buildInheritedCliArgs(
 	}
 
 	let modelPinnedByArgs = false;
-	// Pi only installs inline --api-key when --model or (non-resumed) --models selected a model.
-	const piBoundInlineKey = Boolean(cliModelArg || (cliModelsArg && cliModelsArg.length > 0 && !cliHasExistingSession));
-	if (apiKey && piBoundInlineKey) {
-		// Trust the actual provider Pi selected at startup (`recordedStartupProvider`)
-		// or an explicit `--provider` (when consistent); never guess from `--models`
-		// or bare `--model` patterns that could resolve via auth to another provider.
-		let startupProvider: string | undefined;
-		if (cliProvider) {
-			const resolvedCliProvider = availableModels.find(
-				(m) => m.provider.toLowerCase() === cliProvider!.toLowerCase(),
-			)?.provider ?? cliProvider;
-			if (!recordedStartupProvider || recordedStartupProvider.toLowerCase() === resolvedCliProvider.toLowerCase()) {
-				startupProvider = resolvedCliProvider;
+	let apiKeyCandidate: { provider: string; apiKey: string } | undefined;
+
+	// Resolve the worker's exact target provider/model from catalog entries only
+	// (never guessing ambiguous or custom/fuzzy specs when forwarding --api-key).
+	const workerTarget = configModel
+		? resolveExactCatalogTarget(configModel, undefined, availableModels)
+		: inheritProvider && inheritModelId
+			? resolveExactCatalogTarget(`${inheritProvider}/${inheritModelId}`, inheritProvider, availableModels)
+			: undefined;
+
+	if (apiKey && workerTarget && (cliModelArg || (cliModelsArg && cliModelsArg.length > 0))) {
+		const cliProviderOk = !cliProvider || cliProvider.toLowerCase() === workerTarget.provider.toLowerCase();
+		const cliExplicitModelTarget = cliModelArg
+			? resolveExactCatalogTarget(cliModelArg, cliProvider, availableModels)
+			: undefined;
+		const cliModelOk = !cliExplicitModelTarget ||
+			cliExplicitModelTarget.provider.toLowerCase() === workerTarget.provider.toLowerCase();
+
+		if (cliProviderOk && cliModelOk) {
+			apiKeyCandidate = { provider: workerTarget.provider, apiKey };
+			if (
+				verifiedApiKeyProvider &&
+				verifiedApiKeyProvider.toLowerCase() === workerTarget.provider.toLowerCase()
+			) {
+				args.push("--api-key", apiKey, "--provider", workerTarget.provider, "--model", workerTarget.modelArg);
+				modelPinnedByArgs = true;
 			}
-		} else if (recordedStartupProvider) {
-			startupProvider = recordedStartupProvider;
-		}
-
-		const workerTarget = configModel
-			? resolveUniqueModelTarget(configModel, undefined, availableModels)
-			: inheritProvider && inheritModelId
-				? { provider: inheritProvider, modelArg: inheritModelId }
-				: undefined;
-
-		if (
-			startupProvider &&
-			workerTarget &&
-			startupProvider.toLowerCase() === workerTarget.provider.toLowerCase()
-		) {
-			args.push("--api-key", apiKey, "--provider", workerTarget.provider, "--model", workerTarget.modelArg);
-			modelPinnedByArgs = true;
 		}
 	}
 
-	return { args, modelPinnedByArgs };
+	return { args, modelPinnedByArgs, apiKeyCandidate };
 }
 
 function formatToolCallSummary(toolName: string, args: Record<string, unknown>): string {
@@ -529,13 +484,43 @@ function formatToolCallSummary(toolName: string, args: Record<string, unknown>):
 	}
 }
 
+function recoverStaleRebaseBackups(dir: string): void {
+	try {
+		const entries = fs.readdirSync(dir);
+		const hasJsonl = entries.some((name) => name.endsWith(".jsonl"));
+		if (!hasJsonl) {
+			const backups = entries
+				.filter((name) => /\.jsonl\.rebased-\d+\.bak$/.test(name))
+				.map((name) => path.join(dir, name));
+			if (backups.length > 0) {
+				backups.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+				const latest = backups[0]!;
+				const restored = latest.replace(/\.rebased-\d+\.bak$/, "");
+				fs.renameSync(latest, restored);
+			}
+		}
+		for (const name of entries) {
+			if (name.startsWith(".rebase-")) {
+				fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+			}
+		}
+	} catch {
+		// Best effort recovery only.
+	}
+}
+
 function findExistingSessionFile(dir: string, sessionId: string): string | undefined {
+	recoverStaleRebaseBackups(dir);
 	try {
 		const files = fs.readdirSync(dir);
 		const exact = `${sessionId}.jsonl`;
 		if (files.includes(exact)) return path.join(dir, exact);
-		const suffixMatch = files.find((name) => name.endsWith(`_${sessionId}.jsonl`) || (name.endsWith(".jsonl") && name.includes(sessionId)));
-		return suffixMatch ? path.join(dir, suffixMatch) : undefined;
+		const matches = files
+			.filter((name) => name.endsWith(`_${sessionId}.jsonl`) || (name.endsWith(".jsonl") && name.includes(sessionId)))
+			.map((name) => path.join(dir, name));
+		if (matches.length === 0) return undefined;
+		matches.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+		return matches[0];
 	} catch {
 		return undefined;
 	}
@@ -648,7 +633,7 @@ export class RelayWorkerManager {
 	private readonly inheritProvider: string | undefined;
 	private readonly inheritModelId: string | undefined;
 	private readonly availableModels: readonly ModelDescriptor[];
-	private readonly recordedStartupProvider: string | undefined;
+	private readonly verifyApiKeyForProvider?: (provider: string, apiKey: string) => Promise<boolean>;
 	private readonly inheritThinking: string;
 	private readonly projectTrusted: boolean | undefined;
 	private readonly ephemeral: boolean;
@@ -670,7 +655,7 @@ export class RelayWorkerManager {
 		inheritProvider?: string,
 		inheritModelId?: string,
 		availableModels: readonly ModelDescriptor[] = [],
-		recordedStartupProvider?: string,
+		verifyApiKeyForProvider?: (provider: string, apiKey: string) => Promise<boolean>,
 	) {
 		this.mainSessionId = mainSessionId;
 		this.storageKey = storageKey;
@@ -681,7 +666,7 @@ export class RelayWorkerManager {
 		this.inheritProvider = inheritProvider;
 		this.inheritModelId = inheritModelId;
 		this.availableModels = availableModels;
-		this.recordedStartupProvider = recordedStartupProvider;
+		this.verifyApiKeyForProvider = verifyApiKeyForProvider;
 		this.inheritThinking = inheritThinking;
 		this.projectTrusted = projectTrusted;
 		this.ephemeral = ephemeral;
@@ -752,119 +737,139 @@ export class RelayWorkerManager {
 		}
 	}
 
-	/**
-	 * Atomic file-based reclaim mutex: never expires based on age alone while
-	 * the holder PID is still alive, preventing a paused reclaimer from racing
-	 * a successor.
-	 */
-	private tryAcquireReclaimLock(reclaimLockPath: string): boolean {
-		const tmpReclaim = `${reclaimLockPath}.${process.pid}.${this.ownerId}.tmp`;
+	private acquireLegacyLockExclusive(): { ok: true } | { ok: false; holderPid?: number } {
+		fs.mkdirSync(this.dir, { recursive: true });
+		const tmpLegacy = `${this.legacyLockPath}.${process.pid}.${this.ownerId}.tmp`;
+		const payload = JSON.stringify({
+			ownerId: this.ownerId,
+			pid: process.pid,
+			createdAt: Date.now(),
+		} satisfies OwnerLock);
 		try {
-			const payload: OwnerLock = {
-				ownerId: this.ownerId,
-				pid: process.pid,
-				createdAt: Date.now(),
-			};
-			const fd = fs.openSync(tmpReclaim, "wx");
+			const fd = fs.openSync(tmpLegacy, "wx");
 			try {
-				fs.writeFileSync(fd, JSON.stringify(payload), "utf-8");
+				fs.writeFileSync(fd, payload, "utf-8");
 			} finally {
 				fs.closeSync(fd);
 			}
 
-			for (let attempt = 0; attempt < 20; attempt++) {
+			for (let attempt = 0; attempt < 3; attempt++) {
 				try {
-					fs.linkSync(tmpReclaim, reclaimLockPath);
-					return true;
+					fs.linkSync(tmpLegacy, this.legacyLockPath);
+					return { ok: true };
 				} catch (err) {
 					const code = (err as NodeJS.ErrnoException).code;
 					if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
 						try {
-							const rfd = fs.openSync(reclaimLockPath, "wx");
+							const lfd = fs.openSync(this.legacyLockPath, "wx");
 							try {
-								fs.writeFileSync(rfd, JSON.stringify(payload), "utf-8");
+								fs.writeFileSync(lfd, payload, "utf-8");
 							} finally {
-								fs.closeSync(rfd);
+								fs.closeSync(lfd);
 							}
-							return true;
+							return { ok: true };
 						} catch (wxErr) {
-							if ((wxErr as NodeJS.ErrnoException).code !== "EEXIST") return false;
+							if ((wxErr as NodeJS.ErrnoException).code !== "EEXIST") return { ok: false };
 						}
 					} else if (code !== "EEXIST") {
-						return false;
+						return { ok: false };
 					}
 
 					try {
-						const holder = JSON.parse(fs.readFileSync(reclaimLockPath, "utf-8")) as Partial<OwnerLock>;
-						if (typeof holder.pid === "number" && holder.pid !== process.pid && isPidAlive(holder.pid)) {
-							this.sleepSync(15);
-							continue;
+						const existing = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
+						if (existing.ownerId === this.ownerId) return { ok: true };
+						if (typeof existing.pid === "number" && existing.pid !== process.pid && isPidAlive(existing.pid)) {
+							return { ok: false, holderPid: existing.pid };
 						}
-						// Dead PID (or same-PID stale lock): safe to remove dead reclaim lock and retry.
-						fs.unlinkSync(reclaimLockPath);
+						const reclaimLegacy = `${this.legacyLockPath}.reclaim.${String(existing.ownerId ?? "corrupt").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+						try {
+							const rfd = fs.openSync(reclaimLegacy, "wx");
+							try {
+								fs.writeFileSync(rfd, payload, "utf-8");
+							} finally {
+								fs.closeSync(rfd);
+							}
+							try {
+								const recheck = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
+								if (recheck.ownerId !== existing.ownerId) continue;
+								fs.unlinkSync(this.legacyLockPath);
+							} finally {
+								fs.rmSync(reclaimLegacy, { force: true });
+							}
+						} catch {
+							this.sleepSync(15);
+						}
 					} catch {
-						// File vanished or unreadable; retry briefly without blindly deleting a live holder.
 						this.sleepSync(15);
 					}
 				}
 			}
-			return false;
+			return { ok: false };
 		} catch {
-			return false;
+			return { ok: false };
 		} finally {
-			fs.rmSync(tmpReclaim, { force: true });
+			fs.rmSync(tmpLegacy, { force: true });
 		}
 	}
 
-	private releaseReclaimLock(reclaimLockPath: string): void {
+	private cleanupStaleReclaimArtifacts(lockParent: string, currentOwnerId?: string): void {
 		try {
-			const holder = JSON.parse(fs.readFileSync(reclaimLockPath, "utf-8")) as Partial<OwnerLock>;
-			if (holder.ownerId === this.ownerId) {
-				fs.unlinkSync(reclaimLockPath);
+			const legacyReclaimDir = `${this.lockPath}.reclaim`;
+			if (fs.existsSync(legacyReclaimDir) && fs.statSync(legacyReclaimDir).isDirectory()) {
+				fs.rmSync(legacyReclaimDir, { recursive: true, force: true });
 			}
 		} catch {
-			// Best effort cleanup.
+			// Best effort cleanup of legacy reclaim directory from earlier revisions.
 		}
-	}
-
-	private writeLegacyLockMirror(): void {
 		try {
-			fs.mkdirSync(this.dir, { recursive: true });
-			const tmp = `${this.legacyLockPath}.${process.pid}.tmp`;
-			fs.writeFileSync(
-				tmp,
-				JSON.stringify({ ownerId: this.ownerId, pid: process.pid, createdAt: Date.now() } satisfies OwnerLock),
-				"utf-8",
-			);
-			fs.renameSync(tmp, this.legacyLockPath);
+			const lockBase = path.basename(this.lockPath);
+			for (const entry of fs.readdirSync(lockParent)) {
+				if (!entry.startsWith(`${lockBase}.reclaim.`)) continue;
+				const full = path.join(lockParent, entry);
+				try {
+					const stat = fs.statSync(full);
+					if (stat.isDirectory()) {
+						fs.rmSync(full, { recursive: true, force: true });
+						continue;
+					}
+					const rec = JSON.parse(fs.readFileSync(full, "utf-8")) as Partial<OwnerLock>;
+					const suffixId = entry.slice(`${lockBase}.reclaim.`.length);
+					const deadHolder = typeof rec.pid !== "number" || !isPidAlive(rec.pid);
+					if (deadHolder || (currentOwnerId && suffixId !== currentOwnerId && Date.now() - stat.mtimeMs > 60_000)) {
+						fs.rmSync(full, { force: true });
+					}
+				} catch {
+					// Leave alone if actively changing.
+				}
+			}
 		} catch {
-			// Non-fatal compatibility mirror.
+			// Ignore scan errors.
 		}
 	}
 
 	/**
 	 * Enforce a single live owner per persistent worker directory using atomic
-	 * pre-populated hard-link creation, a PID-checked reclaim mutex, and mutual
-	 * compatibility with the previous revision's `worker/owner.lock.json`.
+	 * pre-populated hard-link creation, per-dead-owner reclaim locks (never broken
+	 * while their creator PID is alive), and exclusive legacy `worker/owner.lock.json`
+	 * compatibility with earlier revisions.
 	 */
 	private acquireOwnership(): { ok: true } | { ok: false; holderPid?: number } {
 		if (this.ownsDirectory) return { ok: true };
 		const lockParent = path.dirname(this.lockPath);
 		fs.mkdirSync(lockParent, { recursive: true });
+		this.cleanupStaleReclaimArtifacts(lockParent);
 		const tmpPath = `${this.lockPath}.${process.pid}.${this.ownerId}.tmp`;
-		const reclaimLockPath = `${this.lockPath}.reclaim`;
+
+		const rollbackMainLock = () => {
+			try {
+				const mine = JSON.parse(fs.readFileSync(this.lockPath, "utf-8")) as Partial<OwnerLock>;
+				if (mine.ownerId === this.ownerId) fs.unlinkSync(this.lockPath);
+			} catch {
+				// Ignore.
+			}
+		};
 
 		try {
-			// Check legacy `worker/owner.lock.json` held by any older open Pi window first.
-			try {
-				const legacy = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
-				if (typeof legacy.pid === "number" && legacy.pid !== process.pid && isPidAlive(legacy.pid)) {
-					return { ok: false, holderPid: legacy.pid };
-				}
-			} catch {
-				// No live legacy lock.
-			}
-
 			const payload: OwnerLock = {
 				ownerId: this.ownerId,
 				pid: process.pid,
@@ -877,104 +882,136 @@ export class RelayWorkerManager {
 				fs.closeSync(fd);
 			}
 
-			let linkedDirect = false;
-			try {
-				fs.linkSync(tmpPath, this.lockPath);
-				linkedDirect = true;
-			} catch (linkErr) {
-				const code = (linkErr as NodeJS.ErrnoException).code;
-				if (code !== "EEXIST" && code !== "EPERM" && code !== "ENOTSUP" && code !== "EXDEV") {
-					return { ok: false };
-				}
-			}
-
-			if (linkedDirect) {
+			for (let attempt = 0; attempt < 5; attempt++) {
+				let linkedDirect = false;
 				try {
-					const legacy = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
-					if (typeof legacy.pid === "number" && legacy.pid !== process.pid && isPidAlive(legacy.pid)) {
+					fs.linkSync(tmpPath, this.lockPath);
+					linkedDirect = true;
+				} catch (linkErr) {
+					const code = (linkErr as NodeJS.ErrnoException).code;
+					if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
 						try {
-							const mine = JSON.parse(fs.readFileSync(this.lockPath, "utf-8")) as Partial<OwnerLock>;
-							if (mine.ownerId === this.ownerId) fs.unlinkSync(this.lockPath);
+							const lfd = fs.openSync(this.lockPath, "wx");
+							try {
+								fs.writeFileSync(lfd, JSON.stringify(payload), "utf-8");
+							} finally {
+								fs.closeSync(lfd);
+							}
+							linkedDirect = true;
+						} catch (wxErr) {
+							if ((wxErr as NodeJS.ErrnoException).code !== "EEXIST") return { ok: false };
+						}
+					} else if (code !== "EEXIST") {
+						return { ok: false };
+					}
+				}
+
+				if (linkedDirect) {
+					const legacyRes = this.acquireLegacyLockExclusive();
+					if (!legacyRes.ok) {
+						rollbackMainLock();
+						return legacyRes;
+					}
+					this.ownsDirectory = true;
+					return { ok: true };
+				}
+
+				let existingRaw: string;
+				try {
+					existingRaw = fs.readFileSync(this.lockPath, "utf-8");
+				} catch {
+					this.sleepSync(15);
+					continue;
+				}
+
+				let deadTag = "corrupt";
+				let deadOwnerId: string | undefined;
+				try {
+					const existing = JSON.parse(existingRaw) as Partial<OwnerLock>;
+					if (existing.ownerId === this.ownerId) {
+						const legacyRes = this.acquireLegacyLockExclusive();
+						if (!legacyRes.ok) return legacyRes;
+						this.ownsDirectory = true;
+						return { ok: true };
+					}
+					if (typeof existing.pid === "number" && existing.pid !== process.pid && isPidAlive(existing.pid)) {
+						return { ok: false, holderPid: existing.pid };
+					}
+					if (typeof existing.ownerId === "string" && existing.ownerId.trim()) {
+						deadOwnerId = existing.ownerId;
+						deadTag = existing.ownerId.replace(/[^a-zA-Z0-9_-]/g, "_");
+					}
+				} catch {
+					// Corrupt or partial legacy lock file.
+				}
+
+				// Name the reclaim mutex after the specific dead lock ownerId so a
+				// contender never deletes or breaks a live reclaimer's mutex.
+				const reclaimMutex = `${this.lockPath}.reclaim.${deadTag}`;
+				let mutexFd: number | undefined;
+				try {
+					mutexFd = fs.openSync(reclaimMutex, "wx");
+					fs.writeFileSync(mutexFd, JSON.stringify(payload), "utf-8");
+				} catch (mxErr) {
+					if ((mxErr as NodeJS.ErrnoException).code === "EEXIST") {
+						// Wait briefly for the winning reclaimer to replace `owner.lock` and re-check.
+						this.sleepSync(25);
+						continue;
+					}
+					return { ok: false };
+				} finally {
+					if (mutexFd !== undefined) {
+						try {
+							fs.closeSync(mutexFd);
 						} catch {
 							// Ignore.
 						}
-						return { ok: false, holderPid: legacy.pid };
 					}
-				} catch {
-					// No live legacy lock.
 				}
-				this.ownsDirectory = true;
-				this.writeLegacyLockMirror();
-				return { ok: true };
-			}
 
-			if (!this.tryAcquireReclaimLock(reclaimLockPath)) {
-				return { ok: false };
-			}
-			try {
-				// Re-check legacy lock inside mutex before taking ownership.
 				try {
-					const legacy = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
-					if (typeof legacy.pid === "number" && legacy.pid !== process.pid && isPidAlive(legacy.pid)) {
-						return { ok: false, holderPid: legacy.pid };
-					}
-				} catch {
-					// No live legacy lock.
-				}
-
-				let existingRaw: string | undefined;
-				try {
-					existingRaw = fs.readFileSync(this.lockPath, "utf-8");
-				} catch (readErr) {
-					if ((readErr as NodeJS.ErrnoException).code !== "ENOENT") {
-						return { ok: false };
-					}
-				}
-
-				if (existingRaw !== undefined) {
+					const recheckRaw = fs.readFileSync(this.lockPath, "utf-8");
+					let recheckOwnerId: string | undefined;
 					try {
-						const existing = JSON.parse(existingRaw) as Partial<OwnerLock>;
-						if (existing.ownerId === this.ownerId) {
-							this.ownsDirectory = true;
-							this.writeLegacyLockMirror();
-							return { ok: true };
-						}
-						if (typeof existing.pid === "number" && existing.pid !== process.pid && isPidAlive(existing.pid)) {
-							return { ok: false, holderPid: existing.pid };
+						const recheck = JSON.parse(recheckRaw) as Partial<OwnerLock>;
+						recheckOwnerId = typeof recheck.ownerId === "string" ? recheck.ownerId : undefined;
+						if (typeof recheck.pid === "number" && recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
+							return { ok: false, holderPid: recheck.pid };
 						}
 					} catch {
-						// Corrupt/empty stale lock file; safe to replace inside the mutex.
+						// Still corrupt.
 					}
+					if (deadOwnerId !== undefined && recheckOwnerId !== deadOwnerId) {
+						continue;
+					}
+					fs.unlinkSync(this.lockPath);
 					try {
-						fs.unlinkSync(this.lockPath);
-					} catch (unlinkErr) {
-						if ((unlinkErr as NodeJS.ErrnoException).code !== "ENOENT") {
+						fs.linkSync(tmpPath, this.lockPath);
+					} catch (fallbackErr) {
+						const code = (fallbackErr as NodeJS.ErrnoException).code;
+						if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
+							fs.renameSync(tmpPath, this.lockPath);
+						} else {
 							return { ok: false };
 						}
 					}
-				}
-
-				try {
-					fs.linkSync(tmpPath, this.lockPath);
-				} catch (fallbackErr) {
-					const code = (fallbackErr as NodeJS.ErrnoException).code;
-					if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
-						fs.renameSync(tmpPath, this.lockPath);
-					} else {
+					const verified = JSON.parse(fs.readFileSync(this.lockPath, "utf-8")) as Partial<OwnerLock>;
+					if (verified.ownerId !== this.ownerId) {
 						return { ok: false };
 					}
+					const legacyRes = this.acquireLegacyLockExclusive();
+					if (!legacyRes.ok) {
+						rollbackMainLock();
+						return legacyRes;
+					}
+					this.ownsDirectory = true;
+					this.cleanupStaleReclaimArtifacts(lockParent, this.ownerId);
+					return { ok: true };
+				} catch {
+					this.sleepSync(15);
 				}
-
-				const verified = JSON.parse(fs.readFileSync(this.lockPath, "utf-8")) as Partial<OwnerLock>;
-				if (verified.ownerId !== this.ownerId) {
-					return { ok: false };
-				}
-				this.ownsDirectory = true;
-				this.writeLegacyLockMirror();
-				return { ok: true };
-			} finally {
-				this.releaseReclaimLock(reclaimLockPath);
 			}
+			return { ok: false };
 		} catch {
 			return { ok: false };
 		} finally {
@@ -1005,10 +1042,11 @@ export class RelayWorkerManager {
 
 	private readTranscriptHeaderCwd(sessionFile: string): string | undefined {
 		try {
-			const firstLine = fs.readFileSync(sessionFile, "utf-8").split("\n", 1)[0]?.trim();
+			const firstLine = fs.readFileSync(sessionFile, "utf-8").split("\n", 1)[0]?.replace(/\r$/, "");
 			if (!firstLine) return undefined;
 			const header = JSON.parse(firstLine) as { cwd?: unknown };
-			return typeof header.cwd === "string" && header.cwd.trim() ? header.cwd.trim() : undefined;
+			// Do not trim header.cwd because Pi uses the raw string when checking directory existence.
+			return typeof header.cwd === "string" && header.cwd.trim() ? header.cwd : undefined;
 		} catch {
 			return undefined;
 		}
@@ -1016,9 +1054,11 @@ export class RelayWorkerManager {
 
 	/**
 	 * Ensure any resumed worker transcript matches `this.cwd` (both existence
-	 * and canonical path equality) so Pi never opens a worker in an old or
+	 * and exact canonical path equality) so Pi never opens a worker in an old or
 	 * untrusted directory while forwarding the new directory's trust approval.
-	 * Preserves `this.meta.sessionId` so subagent mailboxes remain accessible.
+	 * Stages the rebased file in a temporary subfolder before swapping so the
+	 * original transcript remains discoverable if anything fails mid-rebase,
+	 * and preserves `this.meta.sessionId` so subagent mailboxes stay reachable.
 	 */
 	private ensureSessionMatchesCwd(existingFile: string): { file: string; cwdMatches: boolean } {
 		const headerCwd = this.readTranscriptHeaderCwd(existingFile);
@@ -1027,31 +1067,44 @@ export class RelayWorkerManager {
 			return { file: existingFile, cwdMatches: true };
 		}
 
-		const backupFile = `${existingFile}.rebased-${Date.now()}.bak`;
-		fs.renameSync(existingFile, backupFile);
+		const rebaseDir = path.join(this.dir, `.rebase-${process.pid}-${Date.now()}`);
 		try {
-			const forked = SessionManager.forkFrom(backupFile, this.cwd, this.dir, { id: this.meta.sessionId });
-			const forkedFile = forked.getSessionFile() ?? findExistingSessionFile(this.dir, this.meta.sessionId);
-			if (!forkedFile) {
-				throw new Error("Rebased session file could not be located.");
+			fs.mkdirSync(rebaseDir, { recursive: true });
+			const forked = SessionManager.forkFrom(existingFile, this.cwd, rebaseDir, { id: this.meta.sessionId });
+			const stagedFile = forked.getSessionFile() ?? findExistingSessionFile(rebaseDir, this.meta.sessionId);
+			if (!stagedFile || !fs.existsSync(stagedFile)) {
+				throw new Error("Staged rebased session file could not be located.");
 			}
+			const stagedHeaderCwd = this.readTranscriptHeaderCwd(stagedFile);
+			if (!stagedHeaderCwd || canonicalizeFsPath(stagedHeaderCwd) !== targetCanonical) {
+				throw new Error("Staged rebased session cwd did not match target cwd.");
+			}
+
+			const targetFile = path.join(this.dir, path.basename(stagedFile));
+			const backupFile = `${existingFile}.rebased-${Date.now()}.bak`;
+			fs.renameSync(existingFile, backupFile);
+			try {
+				fs.renameSync(stagedFile, targetFile);
+			} catch (swapErr) {
+				if (!fs.existsSync(existingFile) && fs.existsSync(backupFile)) {
+					try {
+						fs.renameSync(backupFile, existingFile);
+					} catch {
+						// Keep backup on disk; findExistingSessionFile recovers it automatically.
+					}
+				}
+				throw swapErr;
+			}
+
 			this.meta.sessionId = forked.getSessionId();
 			this.meta.cwd = this.cwd;
 			this.writeMeta(this.meta);
 			return {
-				file: forkedFile,
-				cwdMatches: canonicalizeFsPath(this.readTranscriptHeaderCwd(forkedFile) ?? "") === targetCanonical,
+				file: targetFile,
+				cwdMatches: canonicalizeFsPath(this.readTranscriptHeaderCwd(targetFile) ?? "") === targetCanonical,
 			};
-		} catch (err) {
-			// Restore backup if rebasing failed so history is never hidden.
-			if (!fs.existsSync(existingFile) && fs.existsSync(backupFile)) {
-				try {
-					fs.renameSync(backupFile, existingFile);
-				} catch {
-					// Keep backup on disk.
-				}
-			}
-			throw err;
+		} finally {
+			fs.rmSync(rebaseDir, { recursive: true, force: true });
 		}
 	}
 
@@ -1128,16 +1181,33 @@ export class RelayWorkerManager {
 		// Never forward foreground project trust unless the worker session's actual cwd matches `this.cwd`.
 		const effectiveProjectTrusted = sessionMatchesCwd ? this.projectTrusted : false;
 		const model = this.config.model ?? this.inheritModel;
-		const thinking = this.config.thinking ?? this.inheritThinking;
-		const inherited = buildInheritedCliArgs(
+		const configModelHasThinking = Boolean(this.config.model && splitThinkingSuffix(this.config.model).suffix);
+		const thinking = this.config.thinking ?? (configModelHasThinking ? undefined : this.inheritThinking);
+
+		let inherited = buildInheritedCliArgs(
 			this.launchCwd,
 			effectiveProjectTrusted,
 			this.config.model,
 			this.inheritProvider,
 			this.inheritModelId,
 			this.availableModels,
-			this.recordedStartupProvider,
 		);
+		if (inherited.apiKeyCandidate && this.verifyApiKeyForProvider) {
+			const candidate = inherited.apiKeyCandidate;
+			const ok = await this.verifyApiKeyForProvider(candidate.provider, candidate.apiKey).catch(() => false);
+			if (this.disposed || expectedGen !== this.generation) return;
+			if (ok) {
+				inherited = buildInheritedCliArgs(
+					this.launchCwd,
+					effectiveProjectTrusted,
+					this.config.model,
+					this.inheritProvider,
+					this.inheritModelId,
+					this.availableModels,
+					candidate.provider,
+				);
+			}
+		}
 		const args = [
 			"--mode", "rpc",
 			"--session-dir", this.dir,
@@ -1881,15 +1951,17 @@ export class RelayWorkerManager {
 			await this.cleanupClient(false);
 			this.assertActive(gen, signal);
 			try {
-				fs.rmSync(this.dir, { recursive: true, force: true });
+				for (const entry of fs.readdirSync(this.dir)) {
+					if (entry === LEGACY_LOCK_FILE) continue;
+					fs.rmSync(path.join(this.dir, entry), { recursive: true, force: true });
+				}
 			} catch (error) {
-				if (fs.existsSync(this.dir)) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
 					throw new Error(
-						`Failed to remove previous worker directory (${this.dir}): ${(error as Error).message}`,
+						`Failed to clear previous worker directory (${this.dir}): ${(error as Error).message}`,
 					);
 				}
 			}
-			this.writeLegacyLockMirror();
 			this.assertActive(gen, signal);
 			this.recentItems = [];
 			this.finalOutput = "";
@@ -1933,70 +2005,58 @@ export class RelayWorkerManager {
 				const commandsRes = await client.getCommands().catch(() => ({ commands: [] }));
 				this.assertActive(queuedGen, signal);
 				const hasAtomicCmd = Array.isArray(commandsRes.commands) &&
-					commandsRes.commands.some((cmd) => cmd?.name === "mpep-relay-compact-idle");
+					commandsRes.commands.some((cmd) => cmd?.name === "mpep-relay-compact-idle" && cmd?.source === "extension");
 
-				if (hasAtomicCmd) {
-					const nonce = randomUUID();
-					let settleWaiter!: (status: string) => void;
-					const resultPromise = new Promise<string>((resolve) => {
-						settleWaiter = resolve;
-					});
-					this.compactWaiters.set(nonce, settleWaiter);
-
-					const onAbort = () => {
-						void client.abort().catch(() => undefined);
-						const w = this.compactWaiters.get(nonce);
-						if (w) {
-							this.compactWaiters.delete(nonce);
-							w("aborted");
-						}
-					};
-					signal?.addEventListener("abort", onAbort, { once: true });
-
-					try {
-						await client.prompt(`/mpep-relay-compact-idle ${nonce}`, undefined, signal);
-						const outcome = await resultPromise;
-						if (outcome === "aborted") {
-							throw new Error("Operation aborted.");
-						}
-						if (outcome === "busy") {
-							throw new Error(
-								"Worker is currently busy; refusing immediate compaction because manual compact aborts the active run. Wait until idle (or abort first), then compact.",
-							);
-						}
-						if (outcome.startsWith("err:")) {
-							throw new Error(outcome.slice(4) || "Worker compaction failed.");
-						}
-						if (outcome !== "ok") {
-							throw new Error(`Unexpected compaction result: ${outcome}`);
-						}
-					} finally {
-						signal?.removeEventListener("abort", onAbort);
-						this.compactWaiters.delete(nonce);
-					}
-					await this.refreshStateFromRpc(client);
-					return "Worker context compaction completed.";
-				}
-
-				const state = await client.getState();
-				this.assertActive(queuedGen, signal);
-				if (
-					Boolean(state.isStreaming) ||
-					Boolean(state.isCompacting) ||
-					Number(state.pendingMessageCount ?? 0) > 0 ||
-					this.pendingApprovals.size > 0
-				) {
+				if (!hasAtomicCmd) {
 					throw new Error(
-						"Worker became busy before compaction started; wait until idle (or abort first) before compacting.",
+						"Idle-only compaction helper command (mpep-relay-compact-idle) is not available on this worker; refusing raw RPC compact so active background tasks cannot be aborted.",
 					);
 				}
-				try {
-					await client.compact(undefined, signal);
-				} catch (error) {
-					if (signal?.aborted) {
-						void client.abort().catch(() => undefined);
+
+				const nonce = randomUUID();
+				let settleWaiter!: (status: string) => void;
+				const resultPromise = new Promise<string>((resolve) => {
+					settleWaiter = resolve;
+				});
+				this.compactWaiters.set(nonce, settleWaiter);
+
+				const onAbort = () => {
+					// Cancel only the local wait so unrelated active worker turns or
+					// subagent wakeups are never aborted by cancelling this tool call.
+					const w = this.compactWaiters.get(nonce);
+					if (w) {
+						this.compactWaiters.delete(nonce);
+						w("aborted");
 					}
-					throw error;
+				};
+				signal?.addEventListener("abort", onAbort, { once: true });
+
+				try {
+					await client.prompt(`/mpep-relay-compact-idle ${nonce}`, undefined, signal);
+					// Reject promptly if the worker finished handling the command without
+					// emitting the expected MPEP_RELAY_COMPACT notification.
+					if (this.compactWaiters.has(nonce)) {
+						this.compactWaiters.delete(nonce);
+						throw new Error("Worker did not acknowledge idle-only compaction; check relay_status.");
+					}
+					const outcome = await resultPromise;
+					if (outcome === "aborted") {
+						throw new Error("Operation aborted.");
+					}
+					if (outcome === "busy") {
+						throw new Error(
+							"Worker is currently busy; refusing immediate compaction because manual compact aborts the active run. Wait until idle (or abort first), then compact.",
+						);
+					}
+					if (outcome.startsWith("err:")) {
+						throw new Error(outcome.slice(4) || "Worker compaction failed.");
+					}
+					if (outcome !== "ok") {
+						throw new Error(`Unexpected compaction result: ${outcome}`);
+					}
+				} finally {
+					signal?.removeEventListener("abort", onAbort);
+					this.compactWaiters.delete(nonce);
 				}
 				await this.refreshStateFromRpc(client);
 				return "Worker context compaction completed.";

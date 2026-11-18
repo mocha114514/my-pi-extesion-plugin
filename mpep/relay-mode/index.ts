@@ -22,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
+import { registerSigintCleanup } from "../shared/sigint.ts";
 import { buildReminderMilestones, loadRelayConfig, type RelayConfig } from "./config.ts";
 import { buildWorkerSessionKey } from "./paths.ts";
 import { registerRelayTools } from "./tools.ts";
@@ -35,9 +36,7 @@ import {
 
 const LAUNCH_CWD = process.cwd();
 const SLOT = Symbol.for("mpep.relay-mode.dispose.v1");
-const STARTUP_PROVIDER_SLOT = Symbol.for("mpep.relay-mode.startupProvider.v1");
 const installations = globalThis as unknown as Record<symbol, (() => void) | undefined>;
-const globalSlots = globalThis as unknown as Record<symbol, unknown>;
 const COMPACT_PENDING_SLOT = Symbol.for("mpep.compact-forewarn.pending");
 const DEFAULT_RESERVE_TOKENS = 16_384;
 const REMIND_TYPE = "mpep-relay-remind";
@@ -165,11 +164,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	installations[SLOT]?.();
 
 	if (!isPluginEnabled("relay-mode")) {
-		pi.on("session_start", (event, ctx) => {
-			if (event.reason === "startup" && ctx.model?.provider) {
-				globalSlots[STARTUP_PROVIDER_SLOT] = ctx.model.provider;
-			}
-		});
 		// Even while disabled, strip historical relay-mode reminders/notices from
 		// replayed transcripts so they never direct a non-relay session.
 		pi.on("context", (event) => {
@@ -291,31 +285,22 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	let exitHookAttached = false;
-	let reRaiseSigint = false;
+	let unregisterSigint: (() => void) | undefined;
 	const onExitSync = () => {
 		disposeWorkerSync();
-	};
-	const onSigint = () => {
-		const shouldReRaise = reRaiseSigint;
-		detachSignalHandlers();
-		disposeWorkerSync();
-		if (shouldReRaise) {
-			process.kill(process.pid, "SIGINT");
-		}
 	};
 	const attachSignalHandlers = () => {
 		if (exitHookAttached) return;
 		exitHookAttached = true;
-		reRaiseSigint = process.listenerCount("SIGINT") === 0;
 		process.on("exit", onExitSync);
-		process.on("SIGINT", onSigint);
+		unregisterSigint = registerSigintCleanup(disposeWorkerSync);
 	};
 	const detachSignalHandlers = () => {
 		if (!exitHookAttached) return;
 		exitHookAttached = false;
-		reRaiseSigint = false;
 		process.off("exit", onExitSync);
-		process.off("SIGINT", onSigint);
+		unregisterSigint?.();
+		unregisterSigint = undefined;
 	};
 
 	let sessionStartSeq = 0;
@@ -356,10 +341,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		getWorker: () => worker,
 	});
 
-	pi.on("session_start", async (event, ctx) => {
-		if (event.reason === "startup" && ctx.model?.provider) {
-			globalSlots[STARTUP_PROVIDER_SLOT] = ctx.model.provider;
-		}
+	pi.on("session_start", async (_event, ctx) => {
 		const seq = ++sessionStartSeq;
 		const prev = worker;
 		clearPendingUiAndTimers();
@@ -429,9 +411,14 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			id: m.id,
 		}));
 
-		const recordedStartupProvider = typeof globalSlots[STARTUP_PROVIDER_SLOT] === "string"
-			? globalSlots[STARTUP_PROVIDER_SLOT]
-			: undefined;
+		const verifyApiKeyForProvider = async (provider: string, apiKey: string): Promise<boolean> => {
+			try {
+				const resolvedKey = await ctx.modelRegistry?.getApiKeyForProvider?.(provider);
+				return resolvedKey === apiKey;
+			} catch {
+				return false;
+			}
+		};
 
 		const instance = new RelayWorkerManager(
 			sessionId,
@@ -454,7 +441,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			ctx.model?.provider,
 			ctx.model?.id,
 			availableModels,
-			recordedStartupProvider,
+			verifyApiKeyForProvider,
 		);
 		worker = instance;
 		attachSignalHandlers();

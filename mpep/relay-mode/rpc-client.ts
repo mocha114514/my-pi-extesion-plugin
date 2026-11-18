@@ -64,6 +64,7 @@ export class RelayRpcClient {
 	private seenUIRequests = new Set<string>();
 	private stderrTail: string[] = [];
 	private processExited = false;
+	private stopPromise: Promise<void> | undefined;
 
 	alive = false;
 	private readonly cwd: string;
@@ -109,6 +110,7 @@ export class RelayRpcClient {
 		this.proc = proc;
 		this.alive = true;
 		this.processExited = false;
+		this.stopPromise = undefined;
 
 		proc.stdout?.on("data", (chunk: Buffer) => this.handleData(this.stdoutDecoder.write(chunk)));
 		proc.stderr?.on("data", (chunk: Buffer) => {
@@ -367,18 +369,26 @@ export class RelayRpcClient {
 		return this.sendWithTimeout({ type: "get_session_stats" }, 10_000) as Promise<Record<string, unknown>>;
 	}
 
-	getCommands(): Promise<{ commands?: Array<{ name?: unknown }> }> {
+	getCommands(): Promise<{ commands?: Array<{ name?: unknown; source?: unknown }> }> {
 		return this.sendWithTimeout({ type: "get_commands" }, 5_000) as Promise<{
-			commands?: Array<{ name?: unknown }>;
+			commands?: Array<{ name?: unknown; source?: unknown }>;
 		}>;
 	}
 
 	/**
 	 * Ask Pi's RPC server to flush and exit cleanly by closing stdin.
-	 * Responsive workers receive `responsiveTimeoutMs` (default 15s) to finish
-	 * pending credential/MCP writes; unresponsive ones escalate after `unresponsiveTimeoutMs`.
+	 * Shares one single stop promise/deadline per process lifecycle. Measures RPC
+	 * event-loop responsiveness via `get_state` (not `abort`, which can legitimately
+	 * take >1s to unwind a tool) so responsive workers always get `responsiveTimeoutMs`
+	 * (default 15s) to finish pending credential/MCP writes.
 	 */
-	async gracefulStop(responsiveTimeoutMs = 15_000, unresponsiveTimeoutMs = 2_000): Promise<void> {
+	gracefulStop(responsiveTimeoutMs = 15_000, unresponsiveTimeoutMs = 2_000): Promise<void> {
+		if (this.stopPromise) return this.stopPromise;
+		this.stopPromise = this.performGracefulStop(responsiveTimeoutMs, unresponsiveTimeoutMs);
+		return this.stopPromise;
+	}
+
+	private async performGracefulStop(responsiveTimeoutMs: number, unresponsiveTimeoutMs: number): Promise<void> {
 		const proc = this.proc;
 		this.exitListeners.clear();
 		if (!this.isProcessRunning(proc)) {
@@ -387,11 +397,13 @@ export class RelayRpcClient {
 		}
 		let responsive = false;
 		if (this.alive) {
-			try {
-				await this.send({ type: "abort" }, 1_000);
-				responsive = true;
-			} catch {
-				responsive = false;
+			responsive = await this.send({ type: "get_state" }, 1_000).then(
+				() => true,
+				() => false,
+			);
+			if (responsive && this.alive) {
+				// Request abort without blocking the responsiveness probe on tool teardown time.
+				void this.send({ type: "abort" }, 1_000).catch(() => undefined);
 			}
 		}
 		const waitMs = responsive ? responsiveTimeoutMs : unresponsiveTimeoutMs;
