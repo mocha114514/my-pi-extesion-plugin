@@ -359,7 +359,7 @@ export class RelayRpcClient {
 	 * Ask Pi's RPC server to flush and exit cleanly by closing stdin before
 	 * escalating to a tree kill if it does not exit within `timeoutMs`.
 	 */
-	async gracefulStop(timeoutMs = 1_500): Promise<void> {
+	async gracefulStop(timeoutMs = 15_000): Promise<void> {
 		const proc = this.proc;
 		this.exitListeners.clear();
 		if (!this.isProcessRunning(proc)) {

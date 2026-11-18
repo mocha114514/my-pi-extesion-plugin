@@ -26,7 +26,7 @@ import { buildReminderMilestones, loadRelayConfig, type RelayConfig } from "./co
 import { buildWorkerSessionKey } from "./paths.ts";
 import { registerRelayTools } from "./tools.ts";
 import { updateRelayStatusBar } from "./widget.ts";
-import { RELAY_WORKER_ENV, RelayWorkerManager } from "./worker.ts";
+import { RELAY_WORKER_ENV, RelayWorkerManager, type ModelDescriptor } from "./worker.ts";
 
 const LAUNCH_CWD = process.cwd();
 const SLOT = Symbol.for("mpep.relay-mode.dispose.v1");
@@ -253,34 +253,22 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		);
 	};
 
-	let signalsAttached = false;
+	let exitHookAttached = false;
 	const onExitSync = () => {
 		disposeWorkerSync();
 	};
-	const onSigint = () => {
-		detachSignalHandlers();
-		disposeWorkerSync();
-		process.kill(process.pid, "SIGINT");
-	};
-	const onSigterm = () => {
-		detachSignalHandlers();
-		disposeWorkerSync();
-		process.kill(process.pid, "SIGTERM");
-	};
 	const attachSignalHandlers = () => {
-		if (signalsAttached) return;
-		signalsAttached = true;
+		if (exitHookAttached) return;
+		exitHookAttached = true;
 		process.on("exit", onExitSync);
-		process.on("SIGINT", onSigint);
-		process.on("SIGTERM", onSigterm);
 	};
 	const detachSignalHandlers = () => {
-		if (!signalsAttached) return;
-		signalsAttached = false;
+		if (!exitHookAttached) return;
+		exitHookAttached = false;
 		process.off("exit", onExitSync);
-		process.off("SIGINT", onSigint);
-		process.off("SIGTERM", onSigterm);
 	};
+
+	let sessionStartSeq = 0;
 
 	const clearPendingUiAndTimers = () => {
 		if (flushTimer) {
@@ -304,6 +292,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	const disposeWorkerAsync = async () => {
+		sessionStartSeq += 1;
 		clearPendingUiAndTimers();
 		detachSignalHandlers();
 		const old = worker;
@@ -317,18 +306,23 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		getWorker: () => worker,
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
+		const seq = ++sessionStartSeq;
 		const prev = worker;
 		clearPendingUiAndTimers();
 		detachSignalHandlers();
 		worker = undefined;
 		updateRelayStatusBar(ctx, undefined);
-		if (prev) void prev.disposeAsync();
 
 		currentCtx = ctx;
 		firedMilestones.clear();
 		compactionInFlight = false;
 		treeNavInFlight = false;
+
+		if (prev) {
+			await prev.disposeAsync();
+			if (seq !== sessionStartSeq) return;
+		}
 
 		if (!ctx.hasUI || ctx.mode !== "tui") {
 			activeInSession = false;
@@ -377,6 +371,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const inheritModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 		const inheritThinking = pi.getThinkingLevel?.() ?? "off";
 		const projectTrusted = getProjectTrusted(ctx);
+		const availableModels: ModelDescriptor[] = (ctx.modelRegistry?.getAll?.() ?? []).map((m) => ({
+			provider: m.provider,
+			id: m.id,
+		}));
 
 		const instance = new RelayWorkerManager(
 			sessionId,
@@ -396,6 +394,9 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 					}
 				},
 			},
+			ctx.model?.provider,
+			ctx.model?.id,
+			availableModels,
 		);
 		worker = instance;
 		attachSignalHandlers();
@@ -478,6 +479,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 		if (treeNavSafetyTimer) {
 			clearTimeout(treeNavSafetyTimer);
+			treeNavSafetyTimer = undefined;
 		}
 		const release = () => {
 			if (!treeNavInFlight) return;
@@ -488,8 +490,18 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			}
 			scheduleFlushHeldNotices();
 		};
+		const pollIdle = () => {
+			treeNavSafetyTimer = undefined;
+			if (!treeNavInFlight) return;
+			if (event.signal?.aborted || currentCtx?.isIdle?.() === true) {
+				release();
+				return;
+			}
+			treeNavSafetyTimer = setTimeout(pollIdle, 2_000);
+			treeNavSafetyTimer.unref?.();
+		};
 		event.signal?.addEventListener("abort", release, { once: true });
-		treeNavSafetyTimer = setTimeout(release, 45_000);
+		treeNavSafetyTimer = setTimeout(pollIdle, 2_000);
 		treeNavSafetyTimer.unref?.();
 	});
 
