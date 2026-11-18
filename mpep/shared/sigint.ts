@@ -13,6 +13,7 @@ const REGISTRY_SLOT = Symbol.for("mpep.shared.sigintRegistry.v1");
 interface SigintRegistry {
 	callbacks: Set<() => void>;
 	listener?: () => void;
+	detach?: () => void;
 }
 
 function getRegistry(): SigintRegistry {
@@ -38,17 +39,67 @@ export function registerSigintCleanup(callback: () => void): () => void {
 	reg.callbacks.add(callback);
 
 	if (!reg.listener) {
+		const onceWrappedSet = new Set<(...args: never[]) => void>();
+		const addedThisTick = new Set<(...args: never[]) => void>();
+		let removedOnceThisTick = false;
+
+		const markOnceCandidates = () => {
+			for (const raw of process.rawListeners("SIGINT")) {
+				const inner = (raw as { listener?: unknown }).listener;
+				if (typeof inner === "function" && !isSignalExitListener(inner as (...args: never[]) => void)) {
+					onceWrappedSet.add(inner as (...args: never[]) => void);
+				}
+			}
+		};
+		markOnceCandidates();
+
+		let handlerRef: (() => void) | undefined;
+
+		const onNewListener = (event: string | symbol, fn: (...args: never[]) => void) => {
+			if (event !== "SIGINT" || fn === handlerRef || isSignalExitListener(fn)) return;
+			addedThisTick.add(fn);
+			queueMicrotask(() => {
+				addedThisTick.delete(fn);
+				markOnceCandidates();
+			});
+		};
+
+		const onRemoveListener = (event: string | symbol, fn: (...args: never[]) => void) => {
+			if (event !== "SIGINT") return;
+			const wrappedInner = (fn as { listener?: unknown }).listener;
+			const actual = typeof wrappedInner === "function"
+				? (wrappedInner as (...args: never[]) => void)
+				: fn;
+			if (actual === handlerRef || isSignalExitListener(actual)) return;
+			if (wrappedInner !== undefined || onceWrappedSet.delete(actual) || addedThisTick.delete(actual)) {
+				onceWrappedSet.delete(actual);
+				addedThisTick.delete(actual);
+				removedOnceThisTick = true;
+				queueMicrotask(() => {
+					removedOnceThisTick = false;
+				});
+			}
+		};
+
+		const detachHooks = () => {
+			process.off("newListener", onNewListener);
+			process.off("removeListener", onRemoveListener);
+		};
+
 		const handler = () => {
-			// If an external listener (e.g. host TUI or another extension's once())
-			// owns this SIGINT, keep MPEP state and SIGINT registration intact so we
-			// never tear down active workers while the host remains alive.
-			const hasExternalHandler = process.listeners("SIGINT").some(
-				(fn) => fn !== handler && !isSignalExitListener(fn),
-			);
+			// If an external listener (e.g. host TUI or another extension's once() /
+			// prependOnceListener()) owns this SIGINT, keep MPEP state and SIGINT
+			// registration intact so we never tear down active workers while the
+			// host remains alive.
+			const hasExternalHandler =
+				removedOnceThisTick ||
+				process.listeners("SIGINT").some((fn) => fn !== handler && !isSignalExitListener(fn));
 			if (hasExternalHandler) {
 				return;
 			}
 			reg.listener = undefined;
+			reg.detach = undefined;
+			detachHooks();
 			process.off("SIGINT", handler);
 			const snapshot = [...reg.callbacks];
 			reg.callbacks.clear();
@@ -61,7 +112,11 @@ export function registerSigintCleanup(callback: () => void): () => void {
 			}
 			process.kill(process.pid, "SIGINT");
 		};
+		handlerRef = handler;
 		reg.listener = handler;
+		reg.detach = detachHooks;
+		process.on("newListener", onNewListener);
+		process.on("removeListener", onRemoveListener);
 		// Prepend so MPEP runs before any earlier `process.once("SIGINT", ...)`
 		// listener is popped and invoked by Node's EventEmitter.
 		process.prependListener("SIGINT", handler);
@@ -70,6 +125,8 @@ export function registerSigintCleanup(callback: () => void): () => void {
 	return () => {
 		reg.callbacks.delete(callback);
 		if (reg.callbacks.size === 0 && reg.listener) {
+			reg.detach?.();
+			reg.detach = undefined;
 			process.off("SIGINT", reg.listener);
 			reg.listener = undefined;
 		}

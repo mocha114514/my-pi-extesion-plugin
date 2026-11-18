@@ -7,7 +7,7 @@
  * EPIPE safety, UI request retention, and Windows/Unix process-tree cleanup.
  */
 
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -98,7 +98,11 @@ export class RelayRpcClient {
 		return this.stderrTail.join("\n");
 	}
 
-	async start(): Promise<void> {
+	pid(): number | undefined {
+		return this.proc?.pid;
+	}
+
+	async start(onSpawn?: (pid: number) => void): Promise<void> {
 		const invocation = getPiInvocation(this.args);
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd: this.cwd,
@@ -108,6 +112,9 @@ export class RelayRpcClient {
 			detached: process.platform !== "win32",
 		});
 		this.proc = proc;
+		if (typeof proc.pid === "number") {
+			onSpawn?.(proc.pid);
+		}
 		this.alive = true;
 		this.processExited = false;
 		this.stopPromise = undefined;
@@ -406,8 +413,9 @@ export class RelayRpcClient {
 		const deadline = Date.now() + totalBudgetMs;
 
 		// On Pi 0.85.1, stdin EOF calls dispose() without awaiting session.abort(),
-		// so wait for abort acknowledgement within the full shared deadline before closing stdin.
-		if (responsive && this.alive) {
+		// so always attempt abort within the shared deadline (even if get_state
+		// timed out) before closing stdin.
+		if (this.alive) {
 			const abortBudgetMs = Math.max(500, deadline - Date.now());
 			await this.send({ type: "abort" }, abortBudgetMs).catch(() => undefined);
 		}
@@ -476,6 +484,69 @@ export class RelayRpcClient {
 		this.handleClose(null);
 	}
 
+	private reapUnixProcessTree(rootPid: number): void {
+		const descendantPids = new Set<number>();
+		const descendantPgids = new Set<number>();
+		try {
+			const out = execFileSync("ps", ["-eo", "pid=,ppid=,pgid="], {
+				encoding: "utf-8",
+				timeout: 500,
+			});
+			const byParent = new Map<number, Array<{ pid: number; pgid: number }>>();
+			for (const line of out.split("\n")) {
+				const parts = line.trim().split(/\s+/);
+				if (parts.length < 3) continue;
+				const p = Number(parts[0]);
+				const pp = Number(parts[1]);
+				const pg = Number(parts[2]);
+				if (!Number.isInteger(p) || p <= 0 || !Number.isInteger(pp)) continue;
+				let list = byParent.get(pp);
+				if (!list) {
+					list = [];
+					byParent.set(pp, list);
+				}
+				list.push({ pid: p, pgid: Number.isInteger(pg) && pg > 0 ? pg : 0 });
+			}
+			const queue: number[] = [rootPid];
+			while (queue.length > 0) {
+				const cur = queue.shift()!;
+				for (const child of byParent.get(cur) ?? []) {
+					if (child.pid === process.pid || descendantPids.has(child.pid)) continue;
+					descendantPids.add(child.pid);
+					if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
+						descendantPgids.add(child.pgid);
+					}
+					queue.push(child.pid);
+				}
+			}
+		} catch {
+			// Best effort descendant scan; always still signal -rootPid below.
+		}
+		for (const pgid of descendantPgids) {
+			try {
+				process.kill(-pgid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+		for (const pid of descendantPids) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+		try {
+			process.kill(-rootPid, "SIGKILL");
+		} catch {
+			try {
+				process.kill(rootPid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+	}
+
 	killSync(): void {
 		const proc = this.proc;
 		if (this.isProcessRunning(proc)) {
@@ -489,7 +560,7 @@ export class RelayRpcClient {
 						});
 					}
 				} else if (pid !== undefined) {
-					process.kill(-pid, "SIGKILL");
+					this.reapUnixProcessTree(pid);
 				}
 			} catch {
 				// Already gone.

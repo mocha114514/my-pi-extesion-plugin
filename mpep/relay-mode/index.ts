@@ -208,11 +208,15 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 	const sendWakeup = (rawContent: string) => {
 		if (!activeInSession) return;
-		// Pi 0.85.1/1.5.2 sendMessage({ triggerTurn: true }) skips before_agent_start when idle.
-		// If a startup failure wakes the foreground before any user prompt has run, attach a
-		// concise relay role prefix so the foreground agent knows its role and relay tools.
-		const content = !hasSeenPromptInSession && currentConfig?.relayPrompt
-			? `[Relay Mode active — you are the user-facing relay/translator paired with a symbiotic background worker. Use relay_status / relay_control / relay_send / relay_approval, and explain clearly to the user.]\n\n${rawContent}`
+		// Pi 0.85.1/1.5.2 sendMessage({ triggerTurn: true }) skips before_agent_start when idle
+		// (and 0.85.1 clears any prior systemPromptOverride at settle). Include the cached
+		// relay instructions on every idle wake-up so the foreground retains relay policy across
+		// wake-up turns and their tool calls.
+		const needsRelayInstructions =
+			Boolean(currentConfig?.relayPrompt) &&
+			(!hasSeenPromptInSession || (currentCtx?.isIdle?.() ?? true));
+		const content = needsRelayInstructions && currentConfig?.relayPrompt
+			? `${currentConfig.relayPrompt}\n\n${rawContent}`
 			: rawContent;
 		if (compactionInFlight || treeNavInFlight) {
 			heldNotices.push(content);

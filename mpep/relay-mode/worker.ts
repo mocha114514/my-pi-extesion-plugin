@@ -25,7 +25,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import type { RelayConfig } from "./config.ts";
 import { mainSessionDir, workerDir } from "./paths.ts";
-import { RelayRpcClient, type RpcUIResponder } from "./rpc-client.ts";
+import { getPiInvocation, RelayRpcClient, type RpcUIResponder } from "./rpc-client.ts";
 import {
 	DELETE_APPROVAL_PREFIX,
 	DELETE_CANCEL_PREFIX,
@@ -120,7 +120,29 @@ export interface ModelDescriptor {
 interface OwnerLock {
 	ownerId: string;
 	pid: number;
+	workerPid?: number;
 	createdAt: number;
+}
+
+/**
+ * Detect whether the spawned Pi distribution lacks `settleCredentialWrites()` on
+ * RPC EOF disposal (Pi 0.85.1), so we can disable its unawaited startup
+ * background `modelRuntime.refresh()` that could otherwise rotate an OAuth
+ * refresh token without waiting to persist it (#11692).
+ */
+function isLegacyPiWithoutSettle(): boolean {
+	try {
+		const invocation = getPiInvocation([]);
+		const entry = invocation.args[0];
+		if (!entry || !fs.existsSync(entry)) return false;
+		const realEntry = fs.realpathSync.native?.(entry) ?? fs.realpathSync(entry);
+		const runtimePath = path.resolve(path.dirname(realEntry), "core", "agent-session-runtime.js");
+		if (!fs.existsSync(runtimePath)) return false;
+		const content = fs.readFileSync(runtimePath, "utf-8");
+		return !content.includes("settleCredentialWrites");
+	} catch {
+		return false;
+	}
 }
 
 function canonicalizeFsPath(targetPath: string): string {
@@ -366,10 +388,12 @@ export function buildInheritedCliArgs(
 			const { value, nextIdx } = takeValue(i, arg);
 			i = nextIdx;
 			if (value) args.push("--prompt-template", resolveCliExtensionSource(value, launchCwd));
-		} else if (arg === "--api-key" || arg.startsWith("--api-key=")) {
-			const { value, nextIdx } = takeValue(i, arg);
-			i = nextIdx;
-			if (value) apiKey = value;
+		} else if (arg === "--api-key") {
+			// Pi parses ONLY `--api-key <value>` (never `--api-key=value`) as its built-in
+			// credential; `--api-key=...` belongs to extension-registered flags below.
+			if (i + 1 < argv.length) {
+				apiKey = argv[++i];
+			}
 		} else if (arg === "--provider" || arg.startsWith("--provider=")) {
 			const { value, nextIdx } = takeValue(i, arg);
 			i = nextIdx;
@@ -457,10 +481,11 @@ export function buildInheritedCliArgs(
 			})
 			: undefined;
 
-	if (apiKey && workerTarget && (cliModelArg || (cliModelsArg && cliModelsArg.length > 0))) {
+	if (apiKey && workerTarget) {
 		// Respect explicit `--provider`, and let runtime credential verification
-		// confirm which provider Pi actually bound `--api-key` to (supporting
-		// 0.85.1 auth-aware slash-ID fallback like `xiaomi/mimo-v2.5-pro`).
+		// (`getProviderAuthStatus(provider).source === "runtime"`) confirm whether Pi
+		// actually bound `--api-key` to this provider (supporting CLI flags,
+		// settings.enabledModels, and default model selection alike).
 		const cliProviderOk = !cliProvider || cliProvider.toLowerCase() === workerTarget.provider.toLowerCase();
 
 		if (cliProviderOk) {
@@ -631,32 +656,38 @@ function isValidCompleteJsonlFile(filePath: string, expectedSessionId: string): 
 
 /**
  * Recover interrupted rebase state ONLY while holding exclusive ownership.
- * Always prefers restoring a complete `*.rebased-*.bak` transcript over a
- * potentially partial staged copy, and only promotes a staged copy when no
- * backup exists and every JSONL line validates cleanly.
+ * Validates any `.rebased-*.bak` or staged file before replacing or deleting
+ * staging, and preserves staging if no valid complete transcript exists yet so
+ * recoverable history is never deleted.
  */
 function recoverStaleRebaseBackups(dir: string, targetSessionId: string): void {
 	try {
 		const entries = fs.readdirSync(dir);
-		const hasTargetJsonl = entries.some(
-			(name) => name.endsWith(".jsonl") && fileMatchesSessionId(path.join(dir, name), targetSessionId),
-		);
+		let hasValidTargetJsonl = entries.some((name) => {
+			if (!name.endsWith(".jsonl")) return false;
+			const full = path.join(dir, name);
+			return fileMatchesSessionId(full, targetSessionId) && isValidCompleteJsonlFile(full, targetSessionId);
+		});
 
-		if (!hasTargetJsonl) {
-			// 1. Prefer restoring the newest complete `.rebased-*.bak` for targetSessionId.
+		if (!hasValidTargetJsonl) {
+			// 1. Prefer restoring the newest complete, validated `.rebased-*.bak` for targetSessionId.
 			const backups = entries
 				.filter((name) => /\.jsonl\.rebased-\d+\.bak$/.test(name))
 				.map((name) => path.join(dir, name))
 				.filter((full) => path.basename(full).includes(targetSessionId) || readSessionHeader(full)?.id === targetSessionId);
-			if (backups.length > 0) {
-				backups.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-				const latest = backups[0]!;
-				const restored = latest.replace(/\.rebased-\d+\.bak$/, "");
+			backups.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+			for (const candidate of backups) {
+				if (!isValidCompleteJsonlFile(candidate, targetSessionId)) continue;
+				const restored = candidate.replace(/\.rebased-\d+\.bak$/, "");
 				if (!fs.existsSync(restored)) {
-					fs.renameSync(latest, restored);
+					fs.renameSync(candidate, restored);
+					hasValidTargetJsonl = true;
+					break;
 				}
-			} else {
-				// 2. Only if no backup exists, promote a complete validated staged copy.
+			}
+
+			// 2. If no valid backup restored a transcript, promote a complete validated staged copy.
+			if (!hasValidTargetJsonl) {
 				const stagedCandidates: string[] = [];
 				for (const entry of entries) {
 					if (!entry.startsWith(".rebase-")) continue;
@@ -679,15 +710,35 @@ function recoverStaleRebaseBackups(dir: string, targetSessionId: string): void {
 					const dest = path.join(dir, path.basename(chosen));
 					if (!fs.existsSync(dest)) {
 						fs.renameSync(chosen, dest);
+						hasValidTargetJsonl = true;
 					}
 				}
 			}
 		}
 
-		// 3. Clean up stale `.rebase-*` staging directories only after recovery check.
+		// 3. Only prune `.rebase-*` directories when a valid target transcript exists
+		// OR when staging contains no non-empty recoverable file for targetSessionId.
 		for (const name of fs.readdirSync(dir)) {
-			if (name.startsWith(".rebase-")) {
-				fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+			if (!name.startsWith(".rebase-")) continue;
+			const subDir = path.join(dir, name);
+			let keepForSalvage = false;
+			if (!hasValidTargetJsonl) {
+				try {
+					for (const sub of fs.readdirSync(subDir)) {
+						if (!sub.endsWith(".jsonl")) continue;
+						const full = path.join(subDir, sub);
+						const stat = fs.statSync(full);
+						if (stat.size > 0 && fileMatchesSessionId(full, targetSessionId)) {
+							keepForSalvage = true;
+							break;
+						}
+					}
+				} catch {
+					// If unreadable, clean only if empty/irrelevant.
+				}
+			}
+			if (!keepForSalvage) {
+				fs.rmSync(subDir, { recursive: true, force: true });
 			}
 		}
 	} catch {
@@ -977,16 +1028,38 @@ export class RelayWorkerManager {
 	}
 
 	private exclusiveCreatePrepopulatedFile(targetPath: string, payload: string): "ok" | "exists" | "error" {
+		let fd: number | undefined;
 		try {
-			const tfd = fs.openSync(targetPath, "wx");
-			try {
-				fs.writeFileSync(tfd, payload, "utf-8");
-			} finally {
-				fs.closeSync(tfd);
-			}
-			return "ok";
+			fd = fs.openSync(targetPath, "wx");
 		} catch (wxErr) {
 			return (wxErr as NodeJS.ErrnoException).code === "EEXIST" ? "exists" : "error";
+		}
+		try {
+			fs.writeFileSync(fd, payload, "utf-8");
+			return "ok";
+		} catch {
+			// Roll back the empty file we just created so partial writes (e.g. ENOSPC)
+			// never leave an unrecoverable lock behind.
+			try {
+				fs.closeSync(fd);
+			} catch {
+				// Ignore.
+			}
+			fd = undefined;
+			try {
+				fs.unlinkSync(targetPath);
+			} catch {
+				// Ignore.
+			}
+			return "error";
+		} finally {
+			if (fd !== undefined) {
+				try {
+					fs.closeSync(fd);
+				} catch {
+					// Ignore.
+				}
+			}
 		}
 	}
 
@@ -1067,7 +1140,7 @@ export class RelayWorkerManager {
 		return false;
 	}
 
-	private acquireLegacyLockExclusive(): { ok: true } | { ok: false; holderPid?: number } {
+	private acquireLegacyLockExclusive(expectedOwnerId?: string): { ok: true } | { ok: false; holderPid?: number } {
 		fs.mkdirSync(this.dir, { recursive: true });
 		const payload = JSON.stringify({
 			ownerId: this.ownerId,
@@ -1085,9 +1158,6 @@ export class RelayWorkerManager {
 			try {
 				const raw = fs.readFileSync(this.legacyLockPath, "utf-8");
 				if (!raw.trim()) {
-					// Revision 98838f7 creates `worker/owner.lock.json` via openSync("wx") before
-					// writing JSON; if it pauses, we cannot prove the writer is dead, so wait
-					// briefly and fail closed rather than unlinking a live owner's lock.
 					this.sleepSync(40);
 					continue;
 				}
@@ -1100,10 +1170,19 @@ export class RelayWorkerManager {
 				if (existing.pid !== process.pid && isPidAlive(existing.pid)) {
 					return { ok: false, holderPid: existing.pid };
 				}
+				if (typeof existing.workerPid === "number" && existing.workerPid !== process.pid && isPidAlive(existing.workerPid)) {
+					return { ok: false, holderPid: existing.workerPid };
+				}
 				existingOwnerId = typeof existing.ownerId === "string" && existing.ownerId.trim()
 					? existing.ownerId
 					: undefined;
-				deadTag = (existingOwnerId ?? `pid-${existing.pid}`).replace(/[^a-zA-Z0-9_-]/g, "_");
+				// If worker/owner.lock.json does not share the reclaimed owner.lock's
+				// ownerId (e.g. a standalone legacy 98838f7 lock whose reclaimer never
+				// takes owner.lock.reclaim), fail closed rather than risking a race.
+				if (expectedOwnerId === undefined || existingOwnerId !== expectedOwnerId) {
+					return { ok: false };
+				}
+				deadTag = existingOwnerId.replace(/[^a-zA-Z0-9_-]/g, "_");
 			} catch {
 				this.sleepSync(40);
 				continue;
@@ -1122,7 +1201,10 @@ export class RelayWorkerManager {
 				if (recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
 					return { ok: false, holderPid: recheck.pid };
 				}
-				if (existingOwnerId === undefined || recheck.ownerId === existingOwnerId) {
+				if (typeof recheck.workerPid === "number" && recheck.workerPid !== process.pid && isPidAlive(recheck.workerPid)) {
+					return { ok: false, holderPid: recheck.workerPid };
+				}
+				if (recheck.ownerId === expectedOwnerId) {
 					fs.unlinkSync(this.legacyLockPath);
 				}
 			} catch {
@@ -1247,6 +1329,9 @@ export class RelayWorkerManager {
 				if (existing.pid !== process.pid && isPidAlive(existing.pid)) {
 					return { ok: false, holderPid: existing.pid };
 				}
+				if (typeof existing.workerPid === "number" && existing.workerPid !== process.pid && isPidAlive(existing.workerPid)) {
+					return { ok: false, holderPid: existing.workerPid };
+				}
 				if (typeof existing.ownerId === "string" && existing.ownerId.trim()) {
 					deadOwnerId = existing.ownerId;
 				}
@@ -1280,6 +1365,9 @@ export class RelayWorkerManager {
 						if (recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
 							return { ok: false, holderPid: recheck.pid };
 						}
+						if (typeof recheck.workerPid === "number" && recheck.workerPid !== process.pid && isPidAlive(recheck.workerPid)) {
+							return { ok: false, holderPid: recheck.workerPid };
+						}
 					} catch {
 						return { ok: false };
 					}
@@ -1301,7 +1389,7 @@ export class RelayWorkerManager {
 					if (verified.ownerId !== this.ownerId) {
 						return { ok: false };
 					}
-					const legacyRes = this.acquireLegacyLockExclusive();
+					const legacyRes = this.acquireLegacyLockExclusive(deadOwnerId ?? recheckOwnerId);
 					if (!legacyRes.ok) {
 						this.releaseOwnedFile(this.lockPath);
 						return legacyRes;
@@ -1320,6 +1408,27 @@ export class RelayWorkerManager {
 			}
 		}
 		return { ok: false };
+	}
+
+	private updateLockWorkerPid(workerPid: number | undefined): void {
+		if (!this.ownsDirectory) return;
+		const payload = JSON.stringify({
+			ownerId: this.ownerId,
+			pid: process.pid,
+			...(workerPid !== undefined ? { workerPid } : {}),
+			createdAt: Date.now(),
+		} satisfies OwnerLock);
+		for (const target of [this.lockPath, this.legacyLockPath]) {
+			try {
+				const existing = JSON.parse(fs.readFileSync(target, "utf-8")) as Partial<OwnerLock>;
+				if (existing.ownerId !== this.ownerId) continue;
+				const tmp = `${target}.${process.pid}.${this.ownerId}.upd.tmp`;
+				fs.writeFileSync(tmp, payload, "utf-8");
+				fs.renameSync(tmp, target);
+			} catch {
+				// Non-fatal lock metadata update.
+			}
+		}
 	}
 
 	private releaseOwnership(): void {
@@ -1506,17 +1615,21 @@ export class RelayWorkerManager {
 		const env: Record<string, string> = {
 			[RELAY_WORKER_ENV]: "1",
 			[DELETE_GUARD_CHILD_ENV]: "1",
+			...(isLegacyPiWithoutSettle() ? { PI_OFFLINE: "1" } : {}),
 		};
 		const client = new RelayRpcClient(this.meta.cwd, args, env);
 		this.client = client;
 		this.startingClient = client;
 
 		this.detachListeners.push(client.onEvent((event) => this.handleRpcEvent(client, event)));
-		this.detachListeners.push(client.onExit((code) => this.handleRpcExit(client, code)));
+		this.detachListeners.push(client.onExit((code) => {
+			this.updateLockWorkerPid(undefined);
+			this.handleRpcExit(client, code);
+		}));
 		this.detachListeners.push(client.onUIRequest((msg, respond) => this.handleUIRequest(client, msg, respond)));
 
 		try {
-			await client.start();
+			await client.start((pid) => this.updateLockWorkerPid(pid));
 			if (this.disposed || expectedGen !== this.generation || this.client !== client) {
 				if (this.startingClient === client) this.startingClient = undefined;
 				await client.gracefulStop().catch(() => client.killSync());
@@ -2062,6 +2175,7 @@ export class RelayWorkerManager {
 		} catch {
 			// Already terminated.
 		}
+		this.updateLockWorkerPid(undefined);
 	}
 
 	private async cleanupClient(sync: boolean, gracefulTimeoutMs = 15_000): Promise<void> {
@@ -2079,6 +2193,8 @@ export class RelayWorkerManager {
 				await client.gracefulStop(gracefulTimeoutMs);
 			} catch {
 				client.killSync();
+			} finally {
+				this.updateLockWorkerPid(undefined);
 			}
 		})();
 		this.activeShutdownPromise = stopPromise;
