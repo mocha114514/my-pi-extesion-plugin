@@ -440,7 +440,8 @@ export default function (pi: ExtensionAPI): void {
 					event.type === "turn_end" || event.type === "auto_retry_start" ||
 					event.type === "auto_retry_end" || event.type === "compaction_start" ||
 					event.type === "compaction_end" || event.type === "auto_compaction_start" ||
-					event.type === "auto_compaction_end") {
+					event.type === "auto_compaction_end" || event.type === "summarization_retry_scheduled" ||
+					event.type === "summarization_retry_attempt_start" || event.type === "summarization_retry_finished") {
 					touchActivity();
 				} else if (event.type === "tool_execution_end") {
 					touchActivity();
