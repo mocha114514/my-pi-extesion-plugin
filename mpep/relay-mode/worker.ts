@@ -26,7 +26,7 @@ import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import type { RelayConfig } from "./config.ts";
-import { mainSessionDir, workerDir } from "./paths.ts";
+import { mainSessionDir, sessionsDir, workerDir } from "./paths.ts";
 import { getPiInvocation, RelayRpcClient, type RpcUIResponder } from "./rpc-client.ts";
 import {
 	DELETE_APPROVAL_PREFIX,
@@ -314,11 +314,13 @@ function isSamePath(a: string, b: string): boolean {
 }
 
 function resolveCliExtensionSource(source: string, launchCwd: string): string {
-	const trimmed = source.trim();
-	// Mirror Pi's `isLocalPath` + `resolvePath` rules (`utils/paths.ts`) so
-	// explicit `-e` flags resolve to the exact same target the foreground loaded.
-	if (/^(?:npm|git|github|https?|ssh|builtin):/i.test(trimmed)) return source;
-	let normalized = normalizeWindowsShellPath(trimmed);
+	// Mirror Pi's `resolveExtensionLoadPath` (`utils/paths.ts` with
+	// `normalizeUnicodeSpaces: true`, WITHOUT trimming) so `-e` arguments
+	// resolve to the exact file loaded by foreground Pi and never rebind to a
+	// changed worker cwd.
+	if (/^(?:npm|git|github|https?|ssh|builtin):/i.test(source.trim())) return source;
+	const normalizedSpaces = source.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+	const normalized = normalizeWindowsShellPath(normalizedSpaces);
 	const home = homedir();
 	if (normalized === "~") return home;
 	if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
@@ -331,11 +333,7 @@ function resolveCliExtensionSource(source: string, launchCwd: string): string {
 			return source;
 		}
 	}
-	if (path.isAbsolute(normalized)) return path.resolve(normalized);
-	if (/^\.{1,2}(?:[\\/]|$)/.test(normalized)) return path.resolve(launchCwd, normalized);
-	const candidate = path.resolve(launchCwd, normalized);
-	if (fs.existsSync(candidate)) return candidate;
-	return source;
+	return path.isAbsolute(normalized) ? path.resolve(normalized) : path.resolve(launchCwd, normalized);
 }
 
 /**
@@ -853,11 +851,42 @@ function recoverStaleRebaseBackups(
 			}
 		}
 
-		// Check ALL validated live files (newest first) against any preserved backup
-		// before concluding no live transcript satisfies it.
+		// Scan completed `.rebase-*` stages BEFORE choosing a live file so a
+		// truncated live transcript never prunes a fuller completed staged rebase.
+		const completedStages: Array<{ path: string; mtimeMs: number; entryCount: number }> = [];
+		for (const entry of entries) {
+			if (!entry.startsWith(".rebase-")) continue;
+			const subDir = path.join(dir, entry);
+			try {
+				for (const sub of fs.readdirSync(subDir)) {
+					if (!sub.endsWith(".jsonl")) continue;
+					const full = path.join(subDir, sub);
+					const stageCheck = isCompletedRebaseStage(subDir, full, targetSessionId);
+					if (stageCheck.complete) {
+						completedStages.push({
+							path: full,
+							mtimeMs: fs.statSync(full).mtimeMs,
+							entryCount: stageCheck.entryCount,
+						});
+					}
+				}
+			} catch {
+				// Ignore unreadable staging subdir.
+			}
+		}
+		completedStages.sort((a, b) => b.mtimeMs - a.mtimeMs);
+		const newestStage = completedStages[0];
+
+		const minRequiredEntries = Math.max(
+			validBackup?.entryCount ?? 0,
+			newestStage?.entryCount ?? 0,
+		);
+
+		// Check ALL validated live files (newest first) against both any preserved
+		// backup AND any completed rebase stage before concluding no live file wins.
 		let validTopFile: string | undefined;
 		for (const cand of validTopCandidates) {
-			if (!validBackup || cand.entryCount >= validBackup.entryCount) {
+			if (cand.entryCount >= minRequiredEntries) {
 				validTopFile = cand.path;
 				break;
 			}
@@ -865,31 +894,6 @@ function recoverStaleRebaseBackups(
 		}
 
 		if (!validTopFile) {
-			const completedStages: Array<{ path: string; mtimeMs: number; entryCount: number }> = [];
-			for (const entry of entries) {
-				if (!entry.startsWith(".rebase-")) continue;
-				const subDir = path.join(dir, entry);
-				try {
-					for (const sub of fs.readdirSync(subDir)) {
-						if (!sub.endsWith(".jsonl")) continue;
-						const full = path.join(subDir, sub);
-						// Only treat a staged copy as complete when its `.complete` marker verifies
-						// that forkFrom finished writing every expected entry.
-						const stageCheck = isCompletedRebaseStage(subDir, full, targetSessionId);
-						if (stageCheck.complete) {
-							completedStages.push({
-								path: full,
-								mtimeMs: fs.statSync(full).mtimeMs,
-								entryCount: stageCheck.entryCount,
-							});
-						}
-					}
-				} catch {
-					// Ignore unreadable staging subdir.
-				}
-			}
-			completedStages.sort((a, b) => b.mtimeMs - a.mtimeMs);
-			const newestStage = completedStages[0];
 			const useStageFirst = Boolean(
 				newestStage &&
 				(!validBackup || (newestStage.mtimeMs >= validBackup.mtimeMs && newestStage.entryCount >= validBackup.entryCount)),
@@ -1122,6 +1126,7 @@ export class RelayWorkerManager {
 	private pendingApprovals = new Map<string, PendingApprovalEntry>();
 	private seenApprovalCalls = new Set<string>();
 	private compactWaiters = new Map<string, (status: string) => void>();
+	private promptErrorWaiter: ((message: string) => void) | undefined;
 	private detachListeners: Array<() => void> = [];
 	private readonly ownerId = randomUUID();
 	private ownsDirectory = false;
@@ -1161,6 +1166,7 @@ export class RelayWorkerManager {
 		inheritModelId?: string,
 		availableModels: readonly ModelDescriptor[] = [],
 		verifyApiKeyForProvider?: (provider: string, apiKey: string) => Promise<boolean>,
+		legacyWindowsKey?: string,
 	) {
 		this.mainSessionId = mainSessionId;
 		this.storageKey = storageKey;
@@ -1179,9 +1185,53 @@ export class RelayWorkerManager {
 		this.dir = workerDir(storageKey);
 		this.lockPath = path.join(mainSessionDir(storageKey), LOCK_FILE);
 		this.legacyLockPath = path.join(this.dir, LEGACY_LOCK_FILE);
+		if (!ephemeral && legacyWindowsKey && legacyWindowsKey !== storageKey) {
+			this.migrateLegacyWindowsWorkerDir(legacyWindowsKey);
+		}
 		const loaded = this.loadOrInitMeta();
 		this.meta = loaded.meta;
 		this.isResumedSession = loaded.resumed;
+	}
+
+	private migrateLegacyWindowsWorkerDir(legacyKey: string): void {
+		const targetSession = mainSessionDir(this.storageKey);
+		const legacySession = mainSessionDir(legacyKey);
+		if (fs.existsSync(targetSession) || !fs.existsSync(legacySession)) return;
+		const legacyWorker = workerDir(legacyKey);
+		if (!fs.existsSync(legacyWorker)) return;
+		try {
+			// Skip if a live session currently holds either legacy lock.
+			for (const lockFile of [path.join(legacySession, LOCK_FILE), path.join(legacyWorker, LEGACY_LOCK_FILE)]) {
+				if (!fs.existsSync(lockFile)) continue;
+				const parsed = JSON.parse(fs.readFileSync(lockFile, "utf-8")) as Partial<OwnerLock>;
+				if (this.isLockEntryAlive(parsed) !== undefined) return;
+			}
+			// Verify stored session directory identity matches this exact directory
+			// (protecting case-sensitive NTFS sibling folders).
+			let legacyCwd: string | undefined;
+			const metaPath = path.join(legacyWorker, META_FILE);
+			if (fs.existsSync(metaPath)) {
+				const parsedMeta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Partial<WorkerMeta>;
+				if (typeof parsedMeta.cwd === "string") legacyCwd = parsedMeta.cwd;
+			}
+			if (!legacyCwd) {
+				for (const name of fs.readdirSync(legacyWorker)) {
+					if (!name.endsWith(".jsonl")) continue;
+					const hdrCwd = readSessionHeader(path.join(legacyWorker, name))?.cwd;
+					if (hdrCwd) {
+						legacyCwd = hdrCwd;
+						break;
+					}
+				}
+			}
+			if (!legacyCwd || canonicalizeFsPath(legacyCwd) !== canonicalizeFsPath(this.cwd)) {
+				return;
+			}
+			fs.mkdirSync(sessionsDir(), { recursive: true });
+			fs.renameSync(legacySession, targetSession);
+		} catch {
+			// Non-fatal: fall back to clean worker dir if migration fails or races.
+		}
 	}
 
 	private loadOrInitMeta(): { meta: WorkerMeta; resumed: boolean } {
@@ -1400,6 +1450,19 @@ export class RelayWorkerManager {
 		return false;
 	}
 
+	private readDeadLegacyOwnerId(): string | undefined {
+		try {
+			const raw = fs.readFileSync(this.legacyLockPath, "utf-8");
+			if (!raw.trim()) return undefined;
+			const parsed = JSON.parse(raw) as Partial<OwnerLock>;
+			if (typeof parsed.pid !== "number") return undefined;
+			if (this.isLockEntryAlive(parsed) !== undefined) return undefined;
+			return typeof parsed.ownerId === "string" && parsed.ownerId.trim() ? parsed.ownerId : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	private acquireLegacyLockExclusive(
 		allowedOwnerIds?: ReadonlySet<string>,
 	): { ok: true } | { ok: false; holderPid?: number } {
@@ -1553,7 +1616,15 @@ export class RelayWorkerManager {
 			if (strictLink === "error") return { ok: false };
 
 			if (strictLink === "ok") {
-				const legacyRes = this.acquireLegacyLockExclusive();
+				let legacyRes = this.acquireLegacyLockExclusive();
+				if (!legacyRes.ok && legacyRes.holderPid === undefined) {
+					// Recover a verified dead orphan `worker/owner.lock.json` left after a
+					// crash between primary and legacy lock unlinks.
+					const orphanLegacyId = this.readDeadLegacyOwnerId();
+					if (orphanLegacyId) {
+						legacyRes = this.acquireLegacyLockExclusive(new Set([orphanLegacyId]));
+					}
+				}
 				if (!legacyRes.ok) {
 					this.releaseOwnedFile(this.lockPath);
 					return legacyRes;
@@ -1574,7 +1645,13 @@ export class RelayWorkerManager {
 					const fallbackCreate = this.exclusiveCreatePrepopulatedFile(this.lockPath, payload);
 					if (fallbackCreate === "error") return { ok: false };
 					if (fallbackCreate === "ok") {
-						const legacyRes = this.acquireLegacyLockExclusive();
+						let legacyRes = this.acquireLegacyLockExclusive();
+						if (!legacyRes.ok && legacyRes.holderPid === undefined) {
+							const orphanLegacyId = this.readDeadLegacyOwnerId();
+							if (orphanLegacyId) {
+								legacyRes = this.acquireLegacyLockExclusive(new Set([orphanLegacyId]));
+							}
+						}
 						if (!legacyRes.ok) {
 							this.releaseOwnedFile(this.lockPath);
 							return legacyRes;
@@ -1948,13 +2025,25 @@ export class RelayWorkerManager {
 		if (this.startupPromise) return this.startupPromise;
 
 		const gen = this.generation;
-		const promise = this.spawnProcess(gen).then(() => undefined).finally(() => {
-			if (this.startupPromise === promise) {
+		return this.runSpawnWithBarrier(gen, false).then(() => undefined);
+	}
+
+	private runSpawnWithBarrier(expectedGen: number, throwOnFailure: boolean): Promise<boolean> {
+		// Publish `startupPromise` for ALL spawns (start, restart, reset) so
+		// concurrent `relay_send` calls wait until `refreshStateFromRpc` and
+		// `setStatus("idle")` finish before dispatching prompts.
+		const prior = this.startupPromise;
+		const run = (async () => {
+			if (prior) await prior.catch(() => undefined);
+			return this.spawnProcess(expectedGen, throwOnFailure);
+		})();
+		const barrier = run.then(() => undefined, () => undefined).finally(() => {
+			if (this.startupPromise === barrier) {
 				this.startupPromise = undefined;
 			}
 		});
-		this.startupPromise = promise;
-		return promise;
+		this.startupPromise = barrier;
+		return run;
 	}
 
 	private async spawnProcess(expectedGen = this.generation, throwOnFailure = false): Promise<boolean> {
@@ -2336,6 +2425,24 @@ export class RelayWorkerManager {
 				this.updateUsageFromMessages(event.messages);
 				this.cancelPendingApprovals();
 				this.seenApprovalCalls.clear();
+				break;
+			}
+			case "extension_error": {
+				this.touchHeartbeat();
+				const extErr = typeof event.error === "string" && event.error.trim()
+					? event.error.trim()
+					: "Worker extension error.";
+				const extName = typeof event.extensionPath === "string" && event.extensionPath.trim()
+					? path.basename(event.extensionPath.trim())
+					: undefined;
+				const formatted = extName ? `${extName}: ${extErr}` : extErr;
+				this.pushActivity({ type: "event", text: `extension error: ${truncateLine(formatted, 120)}` });
+				if (this.promptErrorWaiter) {
+					this.promptErrorWaiter(formatted);
+				} else if (!this.sawAgentEnd) {
+					this.meta.lastError = formatted;
+					this.hooks.onWakeup(`[Relay worker extension error] ${formatted}`);
+				}
 				break;
 			}
 			case "agent_settled": {
@@ -2764,8 +2871,19 @@ export class RelayWorkerManager {
 			// steers/queues if busy, avoiding TOCTOU races between state check and send.
 			const streamingBehavior: "steer" | "followUp" = mode === "steer" ? "steer" : "followUp";
 			let result: { disposition?: unknown } | undefined;
+			let capturedExtError: string | undefined;
+			const waiter = (errMsg: string) => {
+				if (!capturedExtError) capturedExtError = errMsg;
+			};
+			this.promptErrorWaiter = waiter;
 			try {
 				result = (await client.prompt(trimmed, streamingBehavior, signal)) as { disposition?: unknown } | undefined;
+				const disposition = typeof result?.disposition === "string" ? result.disposition : undefined;
+				if (disposition === "handled" && !capturedExtError) {
+					// Give stdout event delivery a brief tick to surface any `extension_error`
+					// emitted alongside an immediately handled extension slash command.
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
 			} catch (error) {
 				if (signal?.aborted) {
 					throw new Error(
@@ -2773,6 +2891,13 @@ export class RelayWorkerManager {
 					);
 				}
 				throw error;
+			} finally {
+				if (this.promptErrorWaiter === waiter) {
+					this.promptErrorWaiter = undefined;
+				}
+			}
+			if (capturedExtError) {
+				throw new Error(`Worker extension command failed: ${capturedExtError}`);
 			}
 			const disposition = typeof result?.disposition === "string" ? result.disposition : undefined;
 
@@ -2830,7 +2955,7 @@ export class RelayWorkerManager {
 		if (action === "restart") {
 			const gen = ++this.generation;
 			this.assertActive(gen, signal);
-			await this.spawnProcess(gen, true);
+			await this.runSpawnWithBarrier(gen, true);
 			this.assertActive(gen, signal);
 			return `Worker restarted and resumed session ${this.meta.sessionId} (status: ${this.status}).`;
 		}
@@ -2888,7 +3013,7 @@ export class RelayWorkerManager {
 				updatedAt: Date.now(),
 			};
 			this.writeMeta(this.meta);
-			await this.spawnProcess(gen, true);
+			await this.runSpawnWithBarrier(gen, true);
 			this.assertActive(gen, signal);
 			return `Worker history reset; started fresh session ${this.meta.sessionId} (status: ${this.status}).`;
 		}
@@ -3045,9 +3170,17 @@ export class RelayWorkerManager {
 		this.disposed = true;
 		this.generation += 1;
 		if (sync) {
-			const stopped = this.cleanupClientSync();
-			if (!stopped) return;
 			const hadOwnership = this.ownsDirectory;
+			const stopped = this.cleanupClientSync();
+			if (!stopped) {
+				if (this.ephemeral && this.retiringClient && !this.retiringClient.hasExited()) {
+					const pid = this.retiringClient.pid();
+					if (pid !== undefined) {
+						this.spawnDetachedEphemeralReaper(pid, hadOwnership);
+					}
+				}
+				return;
+			}
 			if (this.ephemeral && hadOwnership) {
 				try {
 					fs.rmSync(this.dir, { recursive: true, force: true });
@@ -3070,21 +3203,28 @@ export class RelayWorkerManager {
 
 	private spawnDetachedEphemeralReaper(workerPid: number, hadOwnership: boolean): void {
 		// Hand off owner-verified ephemeral cleanup to a detached helper process
-		// when the foreground TUI is about to call process.exit(0) while the
-		// killed worker OS process has not yet drained.
+		// when the foreground TUI is about to exit while the killed worker OS
+		// process has not yet drained. Never delete if the worker is still alive
+		// after polling or if lock ownership cannot be confirmed.
 		const script = [
 			'const fs = require("node:fs");',
 			'const [pidStr, ownerId, lockPath, legacyPath, dirPath, sessionDir, removeDir] = process.argv.slice(1);',
 			'const pid = Number(pidStr);',
 			'const alive = () => { try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === "EPERM"; } };',
-			'const ownerMatches = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")).ownerId === ownerId; } catch { return true; } };',
+			'const ownerMatchesOrGone = (p) => {',
+			'  if (!fs.existsSync(p)) return true;',
+			'  try { return JSON.parse(fs.readFileSync(p, "utf8")).ownerId === ownerId; } catch { return false; }',
+			'};',
 			'let tries = 0;',
 			'const tick = () => {',
-			'  if (alive() && tries++ < 240) { setTimeout(tick, 250); return; }',
-			'  if (!ownerMatches(lockPath) || !ownerMatches(legacyPath)) return;',
+			'  if (alive()) {',
+			'    if (tries++ < 240) { setTimeout(tick, 250); }',
+			'    return;',
+			'  }',
+			'  if (!ownerMatchesOrGone(lockPath) || !ownerMatchesOrGone(legacyPath)) return;',
 			'  if (removeDir === "1") { try { fs.rmSync(dirPath, { recursive: true, force: true }); } catch {} }',
-			'  try { if (ownerMatches(lockPath)) fs.rmSync(lockPath, { force: true }); } catch {}',
-			'  try { if (ownerMatches(legacyPath)) fs.rmSync(legacyPath, { force: true }); } catch {}',
+			'  try { if (fs.existsSync(lockPath) && ownerMatchesOrGone(lockPath)) fs.rmSync(lockPath, { force: true }); } catch {}',
+			'  try { if (fs.existsSync(legacyPath) && ownerMatchesOrGone(legacyPath)) fs.rmSync(legacyPath, { force: true }); } catch {}',
 			'  if (removeDir === "1") { try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch {} }',
 			'};',
 			'tick();',

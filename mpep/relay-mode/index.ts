@@ -24,7 +24,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { registerSigintCleanup } from "../shared/sigint.ts";
 import { buildReminderMilestones, loadRelayConfig, type RelayConfig } from "./config.ts";
-import { buildWorkerSessionKey } from "./paths.ts";
+import { buildLegacyWindowsWorkerSessionKey, buildWorkerSessionKey } from "./paths.ts";
 import { registerRelayTools } from "./tools.ts";
 import { updateRelayStatusBar } from "./widget.ts";
 import {
@@ -401,6 +401,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		const ephemeral = !sessionFile;
 		const storageKey = buildWorkerSessionKey(sessionId, sessionFile, randomUUID().slice(0, 8));
+		const legacyWindowsKey = !ephemeral ? buildLegacyWindowsWorkerSessionKey(sessionId, sessionFile) : undefined;
 		const inheritModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 		const inheritThinking = pi.getThinkingLevel?.() ?? "off";
 		const projectTrusted = getProjectTrusted(ctx);
@@ -440,6 +441,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			ctx.model?.id,
 			availableModels,
 			verifyApiKeyForProvider,
+			legacyWindowsKey,
 		);
 		worker = instance;
 		attachSignalHandlers();

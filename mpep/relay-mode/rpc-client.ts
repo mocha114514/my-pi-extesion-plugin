@@ -143,7 +143,7 @@ export class RelayRpcClient {
 			this.processExited = true;
 			this.handleClose(null);
 		});
-		proc.on("exit", () => {
+		proc.on("exit", (code) => {
 			this.processExited = true;
 			for (const listener of [...this.processExitListeners]) {
 				try {
@@ -153,6 +153,15 @@ export class RelayRpcClient {
 				}
 			}
 			this.processExitListeners.clear();
+			// If a grandchild retains stdout, `close` may be delayed indefinitely.
+			// Allow a brief 250ms drain for buffered JSONL responses, then settle
+			// pending requests and notify exit listeners so the foreground never hangs.
+			if (this.alive) {
+				const drainTimer = setTimeout(() => {
+					if (this.alive) this.handleClose(code);
+				}, 250);
+				drainTimer.unref?.();
+			}
 		});
 		proc.on("close", (code) => {
 			this.processExited = true;
@@ -296,7 +305,7 @@ export class RelayRpcClient {
 
 	send(command: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<unknown> {
 		const proc = this.proc;
-		if (!proc?.stdin || !this.alive) return Promise.reject(new Error("Worker RPC process is not running"));
+		if (!proc?.stdin || !this.alive || this.processExited) return Promise.reject(new Error("Worker RPC process is not running"));
 		if (signal?.aborted) return Promise.reject(new Error("Operation aborted."));
 		const id = `req-${++this.nextId}`;
 		return new Promise((resolve, reject) => {
@@ -673,7 +682,9 @@ export class RelayRpcClient {
 			verifiedPgids.add(pgid);
 		}
 
+		const ownPgid = liveByPid.get(process.pid)?.pgid;
 		for (const pgid of verifiedPgids) {
+			if (pgid === process.pid || (ownPgid !== undefined && pgid === ownPgid)) continue;
 			const currentMembers = liveByPgid.get(pgid) ?? [];
 			if (currentMembers.length === 0) continue;
 			const allVerified = currentMembers.every((memberPid) => {
@@ -681,7 +692,15 @@ export class RelayRpcClient {
 				const live = liveByPid.get(memberPid);
 				return Boolean(expectedStart && live && live.startId === expectedStart);
 			});
-			if (allVerified) {
+			// Also allow killing the group when at least one identity-verified
+			// original snapshot member currently belongs to `pgid`, catching late
+			// reparented descendants in that same detached process group.
+			const hasVerifiedGroupMember = currentMembers.some((memberPid) => {
+				const expectedStart = snapshot.pids.get(memberPid);
+				const live = liveByPid.get(memberPid);
+				return Boolean(expectedStart && live && live.startId === expectedStart && live.pgid === pgid);
+			});
+			if (allVerified || hasVerifiedGroupMember) {
 				try {
 					process.kill(-pgid, "SIGKILL");
 				} catch {

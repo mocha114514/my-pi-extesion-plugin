@@ -410,10 +410,10 @@ export class RpcSubprocess {
 
 	private reapVerifiedUnixSnapshot(
 		snapshot: { rootPid: number; rootStartId?: string; members: Map<number, string>; pgids: Set<number> },
-	): void {
-		if (snapshot.members.size === 0) return;
+	): boolean {
+		if (snapshot.members.size === 0) return true;
 		const verifyRows = this.readUnixProcessTable();
-		if (verifyRows.length === 0) return;
+		if (verifyRows.length === 0) return false;
 		const liveByPid = new Map<number, { pgid: number; startId: string }>();
 		const liveByParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
 		const liveByPgid = new Map<number, number[]>();
@@ -459,7 +459,9 @@ export class RpcSubprocess {
 			}
 		}
 
+		const ownPgid = liveByPid.get(process.pid)?.pgid;
 		for (const pgid of verifiedPgids) {
+			if (pgid === process.pid || (ownPgid !== undefined && pgid === ownPgid)) continue;
 			const members = liveByPgid.get(pgid) ?? [];
 			if (members.length === 0) continue;
 			const allVerified = members.every((m) => {
@@ -467,7 +469,14 @@ export class RpcSubprocess {
 				const live = liveByPid.get(m);
 				return Boolean(expected && live && live.startId === expected);
 			});
-			if (allVerified) {
+			// Also allow killing the group when an identity-verified original snapshot
+			// member is currently in `pgid`, catching late reparented group members.
+			const hasVerifiedGroupMember = members.some((m) => {
+				const expected = snapshot.members.get(m);
+				const live = liveByPid.get(m);
+				return Boolean(expected && live && live.startId === expected && live.pgid === pgid);
+			});
+			if (allVerified || hasVerifiedGroupMember) {
 				try {
 					process.kill(-pgid, "SIGKILL");
 				} catch {
@@ -484,6 +493,7 @@ export class RpcSubprocess {
 				// Already gone.
 			}
 		}
+		return true;
 	}
 
 	hasConfirmedExit(): boolean {
@@ -547,8 +557,8 @@ export class RpcSubprocess {
 	 */
 	private reapUnixDescendants(rootPid: number): void {
 		const snapshot = this.collectUnixTreeSnapshot(rootPid);
-		if (snapshot === null) {
-			// Process-table lookup unavailable or missed an active child handle: fall
+		if (snapshot === null || !this.reapVerifiedUnixSnapshot(snapshot)) {
+			// Process-table lookup unavailable or verification read failed: fall
 			// back to killing the owned child group/PID directly.
 			if (this.isLiveChildProc(this.proc)) {
 				try {
@@ -563,7 +573,6 @@ export class RpcSubprocess {
 			}
 			return;
 		}
-		this.reapVerifiedUnixSnapshot(snapshot);
 	}
 
 	killSync(): void {

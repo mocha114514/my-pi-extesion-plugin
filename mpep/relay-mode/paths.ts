@@ -77,6 +77,24 @@ export function buildWorkerSessionKey(
 	return `ephemeral-${base}-${token}`;
 }
 
+/**
+ * Prior revisions on Windows lowercased the entire canonical session-file path
+ * before hashing. Return that legacy key when it differs from the current
+ * case-preserving key so existing Windows worker directories migrate seamlessly.
+ */
+export function buildLegacyWindowsWorkerSessionKey(
+	sessionId: string,
+	sessionFile: string | undefined,
+): string | undefined {
+	if (process.platform !== "win32" || !sessionFile || !sessionFile.trim()) return undefined;
+	const canonical = canonicalizeSessionFilePath(sessionFile.trim());
+	const legacy = canonical.toLowerCase();
+	if (legacy === canonical) return undefined;
+	const base = sanitizeId(sessionId);
+	const legacyHash = createHash("sha256").update(legacy).digest("hex").slice(0, 8);
+	return `${base}-${legacyHash}`;
+}
+
 export function relayModeRoot(): string {
 	return join(getCacheDir(), "relay-mode");
 }
