@@ -643,17 +643,22 @@ function hasResumableRebaseArtifacts(dir: string, sessionId: string): boolean {
 	return false;
 }
 
-function isValidCompleteJsonlFile(filePath: string, expectedSessionId: string): boolean {
+interface JsonlValidationResult {
+	valid: boolean;
+	entryCount: number;
+}
+
+function validateJsonlFile(filePath: string, expectedSessionId: string): JsonlValidationResult {
 	let fd: number | undefined;
 	try {
 		const header = readSessionHeader(filePath);
-		if (header?.id !== expectedSessionId) return false;
+		if (header?.id !== expectedSessionId) return { valid: false, entryCount: 0 };
 		const stat = fs.statSync(filePath);
-		if (stat.size <= 0) return false;
+		if (stat.size <= 0) return { valid: false, entryCount: 0 };
 		fd = fs.openSync(filePath, "r");
 		const chunk = Buffer.allocUnsafe(64 * 1024);
 		let pendingParts: Buffer[] = [];
-		let seenLine = false;
+		let lineCount = 0;
 		while (true) {
 			const n = fs.readSync(fd, chunk, 0, chunk.length, null);
 			if (n <= 0) break;
@@ -670,7 +675,7 @@ function isValidCompleteJsonlFile(filePath: string, expectedSessionId: string): 
 				const trimmed = lineBuf.toString("utf-8").replace(/\r$/, "").trim();
 				if (trimmed) {
 					JSON.parse(trimmed);
-					seenLine = true;
+					lineCount += 1;
 				}
 				start = nl + 1;
 			}
@@ -679,20 +684,46 @@ function isValidCompleteJsonlFile(filePath: string, expectedSessionId: string): 
 			const trimmed = Buffer.concat(pendingParts).toString("utf-8").replace(/\r$/, "").trim();
 			if (trimmed) {
 				JSON.parse(trimmed);
-				seenLine = true;
+				lineCount += 1;
 			}
 		}
-		return seenLine;
+		return { valid: lineCount > 0, entryCount: Math.max(0, lineCount - 1) };
 	} catch {
-		return false;
+		return { valid: false, entryCount: 0 };
 	} finally {
 		if (fd !== undefined) {
+			const toClose = fd;
+			fd = undefined;
 			try {
-				fs.closeSync(fd);
+				fs.closeSync(toClose);
 			} catch {
 				// Ignore close errors.
 			}
 		}
+	}
+}
+
+function isValidCompleteJsonlFile(filePath: string, expectedSessionId: string): boolean {
+	return validateJsonlFile(filePath, expectedSessionId).valid;
+}
+
+const REBASE_COMPLETE_FILE = ".complete";
+
+interface RebaseCompleteMarker {
+	target: string;
+	entries: number;
+}
+
+function isCompletedRebaseStage(subDir: string, filePath: string, expectedSessionId: string): boolean {
+	try {
+		const raw = fs.readFileSync(path.join(subDir, REBASE_COMPLETE_FILE), "utf-8");
+		const marker = JSON.parse(raw) as Partial<RebaseCompleteMarker>;
+		if (typeof marker.target !== "string" || marker.target !== path.basename(filePath)) return false;
+		if (typeof marker.entries !== "number" || marker.entries < 0) return false;
+		const res = validateJsonlFile(filePath, expectedSessionId);
+		return res.valid && res.entryCount === marker.entries;
+	} catch {
+		return false;
 	}
 }
 
@@ -724,10 +755,15 @@ function recoverStaleRebaseBackups(
 	try {
 		const entries = fs.readdirSync(dir);
 		const hasStaging = entries.some((name) => name.startsWith(".rebase-"));
+		const hasMatchingBackups = entries.some(
+			(name) =>
+				/\.jsonl\.rebased-\d+\.bak$/.test(name) &&
+				(name.includes(targetSessionId) || readSessionHeader(path.join(dir, name))?.id === targetSessionId),
+		);
 		const topMatches = findMatchingTopLevelJsonls(dir, targetSessionId);
 
-		// Fast path: no interrupted rebase staging and a matching transcript exists.
-		if (!hasStaging && topMatches.length > 0) {
+		// Fast path ONLY for a single unambiguous transcript with no staging or backup competition.
+		if (!hasStaging && !hasMatchingBackups && topMatches.length === 1) {
 			return { file: topMatches[0] };
 		}
 
@@ -749,7 +785,7 @@ function recoverStaleRebaseBackups(
 				.map((full) => ({ path: full, mtimeMs: fs.statSync(full).mtimeMs }))
 				.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-			const stagedCandidates: Array<{ path: string; mtimeMs: number }> = [];
+			const completedStages: Array<{ path: string; mtimeMs: number }> = [];
 			for (const entry of entries) {
 				if (!entry.startsWith(".rebase-")) continue;
 				const subDir = path.join(dir, entry);
@@ -757,41 +793,57 @@ function recoverStaleRebaseBackups(
 					for (const sub of fs.readdirSync(subDir)) {
 						if (!sub.endsWith(".jsonl")) continue;
 						const full = path.join(subDir, sub);
-						if (isValidCompleteJsonlFile(full, targetSessionId)) {
-							stagedCandidates.push({ path: full, mtimeMs: fs.statSync(full).mtimeMs });
+						// Only treat a staged copy as complete when its `.complete` marker verifies
+						// that forkFrom finished writing every expected entry.
+						if (isCompletedRebaseStage(subDir, full, targetSessionId)) {
+							completedStages.push({ path: full, mtimeMs: fs.statSync(full).mtimeMs });
 						}
 					}
 				} catch {
 					// Ignore unreadable staging subdir.
 				}
 			}
-			stagedCandidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+			completedStages.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
 			const validBackup = backupCandidates.find((c) => isValidCompleteJsonlFile(c.path, targetSessionId));
-			const newestStage = stagedCandidates[0];
+			const newestStage = completedStages[0];
 			const useStageFirst = Boolean(
 				newestStage && (!validBackup || newestStage.mtimeMs >= validBackup.mtimeMs),
 			);
 
-			const quarantineDamaged = (targetDest: string) => {
-				if (fs.existsSync(targetDest) && damagedTopFiles.some((d) => isSamePath(d, targetDest))) {
-					fs.renameSync(targetDest, `${targetDest}.corrupt-${Date.now()}`);
+			const quarantineFile = (targetPath: string) => {
+				if (fs.existsSync(targetPath)) {
+					fs.renameSync(targetPath, `${targetPath}.corrupt-${Date.now()}`);
 				}
 			};
 
 			if (useStageFirst && newestStage) {
 				const dest = path.join(dir, path.basename(newestStage.path));
-				quarantineDamaged(dest);
+				if (damagedTopFiles.some((d) => isSamePath(d, dest))) {
+					quarantineFile(dest);
+				}
 				if (!fs.existsSync(dest)) {
 					fs.renameSync(newestStage.path, dest);
 					validTopFile = dest;
 				}
 			} else if (validBackup) {
 				const dest = validBackup.path.replace(/\.rebased-\d+\.bak$/, "");
-				quarantineDamaged(dest);
+				if (damagedTopFiles.some((d) => isSamePath(d, dest))) {
+					quarantineFile(dest);
+				}
 				if (!fs.existsSync(dest)) {
 					fs.renameSync(validBackup.path, dest);
 					validTopFile = dest;
+				}
+			}
+		}
+
+		// Once we have a valid live transcript, quarantine ALL remaining damaged top-level files
+		// (even with different basenames) so subsequent restarts never re-select them.
+		if (validTopFile) {
+			for (const damaged of damagedTopFiles) {
+				if (fs.existsSync(damaged)) {
+					fs.renameSync(damaged, `${damaged}.corrupt-${Date.now()}`);
 				}
 			}
 		}
@@ -979,6 +1031,7 @@ export class RelayWorkerManager {
 	private detachListeners: Array<() => void> = [];
 	private readonly ownerId = randomUUID();
 	private ownsDirectory = false;
+	private provisionalLockOwned = false;
 
 	readonly isResumedSession: boolean;
 	readonly mainSessionId: string;
@@ -1113,8 +1166,9 @@ export class RelayWorkerManager {
 		try {
 			fd = fs.openSync(tmp, "wx");
 			fs.writeFileSync(fd, payload, "utf-8");
-			fs.closeSync(fd);
+			const toClose = fd;
 			fd = undefined;
+			fs.closeSync(toClose);
 			try {
 				fs.linkSync(tmp, targetPath);
 				return "ok";
@@ -1128,8 +1182,10 @@ export class RelayWorkerManager {
 			return "error";
 		} finally {
 			if (fd !== undefined) {
+				const toClose = fd;
+				fd = undefined;
 				try {
-					fs.closeSync(fd);
+					fs.closeSync(toClose);
 				} catch {
 					// Ignore.
 				}
@@ -1147,18 +1203,21 @@ export class RelayWorkerManager {
 		}
 		try {
 			fs.writeFileSync(fd, payload, "utf-8");
-			// Close inside try so quota/writeback failures on close trigger rollback.
-			fs.closeSync(fd);
+			// Clear tracked fd BEFORE closeSync so an EIO/EDQUOT close failure
+			// never closes the already-released descriptor number a second time.
+			const toClose = fd;
 			fd = undefined;
+			fs.closeSync(toClose);
 			return "ok";
 		} catch {
 			if (fd !== undefined) {
+				const toClose = fd;
+				fd = undefined;
 				try {
-					fs.closeSync(fd);
+					fs.closeSync(toClose);
 				} catch {
 					// Ignore.
 				}
-				fd = undefined;
 			}
 			try {
 				fs.unlinkSync(targetPath);
@@ -1349,8 +1408,31 @@ export class RelayWorkerManager {
 	 * both stale takeovers and no-hard-link fallbacks, per-dead-owner reclaim
 	 * markers released in `finally`, and exclusive `worker/owner.lock.json`.
 	 */
+	private verifyCurrentOwnership(): { ok: true } | { ok: false; holderPid?: number } {
+		try {
+			const mainLock = JSON.parse(fs.readFileSync(this.lockPath, "utf-8")) as Partial<OwnerLock>;
+			const legacyLock = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
+			if (mainLock.ownerId === this.ownerId && legacyLock.ownerId === this.ownerId) {
+				return { ok: true };
+			}
+			const holderPid = this.isLockEntryAlive(mainLock) ?? this.isLockEntryAlive(legacyLock);
+			this.ownsDirectory = false;
+			this.provisionalLockOwned = false;
+			return { ok: false, holderPid };
+		} catch {
+			this.ownsDirectory = false;
+			this.provisionalLockOwned = false;
+			return { ok: false };
+		}
+	}
+
 	private acquireOwnership(): { ok: true } | { ok: false; holderPid?: number } {
-		if (this.ownsDirectory) return { ok: true };
+		if (this.ownsDirectory) {
+			const current = this.verifyCurrentOwnership();
+			if (current.ok) return current;
+			if (current.holderPid !== undefined) return current;
+			// Ownership was stolen/lost while cached; continue into full re-acquisition.
+		}
 		const lockParent = path.dirname(this.lockPath);
 		fs.mkdirSync(lockParent, { recursive: true });
 		this.cleanupStaleReclaimArtifacts(lockParent, path.basename(this.lockPath));
@@ -1510,6 +1592,7 @@ export class RelayWorkerManager {
 					if (verified.ownerId !== this.ownerId) {
 						return { ok: false };
 					}
+					this.provisionalLockOwned = true;
 					const allowedLegacyIds = new Set<string>();
 					if (recheckOwnerId) allowedLegacyIds.add(recheckOwnerId);
 					if (deadOwnerId) allowedLegacyIds.add(deadOwnerId);
@@ -1518,10 +1601,12 @@ export class RelayWorkerManager {
 					if (!legacyRes.ok) {
 						if (legacyRes.holderPid !== undefined) {
 							this.releaseOwnedFile(this.lockPath);
+							this.provisionalLockOwned = false;
 						}
 						return legacyRes;
 					}
 					this.updateLockWorkerPid(undefined, true);
+					this.provisionalLockOwned = false;
 					this.ownsDirectory = true;
 					this.cleanupStaleReclaimArtifacts(lockParent, path.basename(this.lockPath), this.ownerId);
 					this.cleanupStaleReclaimArtifacts(this.dir, path.basename(this.legacyLockPath), this.ownerId);
@@ -1562,14 +1647,17 @@ export class RelayWorkerManager {
 				}
 				fd = fs.openSync(tmp, "wx");
 				fs.writeFileSync(fd, payload, "utf-8");
-				fs.closeSync(fd);
+				const toClose = fd;
 				fd = undefined;
+				fs.closeSync(toClose);
 				fs.renameSync(tmp, target);
 			} catch {
 				allOk = false;
 				if (fd !== undefined) {
+					const toClose = fd;
+					fd = undefined;
 					try {
-						fs.closeSync(fd);
+						fs.closeSync(toClose);
 					} catch {
 						// Ignore.
 					}
@@ -1581,10 +1669,14 @@ export class RelayWorkerManager {
 	}
 
 	private releaseOwnership(): void {
-		if (!this.ownsDirectory) return;
+		if (!this.ownsDirectory && !this.provisionalLockOwned) return;
+		const wasFullOwner = this.ownsDirectory;
 		this.ownsDirectory = false;
+		this.provisionalLockOwned = false;
 		this.releaseOwnedFile(this.lockPath);
-		this.releaseOwnedFile(this.legacyLockPath);
+		if (wasFullOwner) {
+			this.releaseOwnedFile(this.legacyLockPath);
+		}
 	}
 
 	private readTranscriptHeaderCwd(sessionFile: string): string | undefined {
@@ -1606,6 +1698,7 @@ export class RelayWorkerManager {
 			return { file: existingFile, cwdMatches: true };
 		}
 
+		const sourceCheck = validateJsonlFile(existingFile, this.meta.sessionId);
 		const rebaseDir = path.join(this.dir, `.rebase-${process.pid}-${Date.now()}`);
 		try {
 			fs.mkdirSync(rebaseDir, { recursive: true });
@@ -1618,6 +1711,37 @@ export class RelayWorkerManager {
 			if (!stagedHeaderCwd || canonicalizeFsPath(stagedHeaderCwd) !== targetCanonical) {
 				throw new Error("Staged rebased session cwd did not match target cwd.");
 			}
+			const stagedCheck = validateJsonlFile(stagedFile, forked.getSessionId());
+			if (!stagedCheck.valid) {
+				throw new Error("Staged rebased session file failed completeness validation.");
+			}
+			let stagedSynced = false;
+			let syncFd: number | undefined;
+			try {
+				syncFd = fs.openSync(stagedFile, "r+");
+				fs.fsyncSync(syncFd);
+				const toClose = syncFd;
+				syncFd = undefined;
+				fs.closeSync(toClose);
+				stagedSynced = true;
+			} catch {
+				if (syncFd !== undefined) {
+					const toClose = syncFd;
+					syncFd = undefined;
+					try {
+						fs.closeSync(toClose);
+					} catch {
+						// Ignore.
+					}
+				}
+			}
+			// Mark staging complete before swapping so recovery never promotes an
+			// unfinished forkFrom output over an existing backup.
+			fs.writeFileSync(
+				path.join(rebaseDir, REBASE_COMPLETE_FILE),
+				JSON.stringify({ target: path.basename(stagedFile), entries: stagedCheck.entryCount } satisfies RebaseCompleteMarker),
+				"utf-8",
+			);
 
 			const targetFile = path.join(this.dir, path.basename(stagedFile));
 			const backupFile = `${existingFile}.rebased-${Date.now()}.bak`;
@@ -1638,7 +1762,12 @@ export class RelayWorkerManager {
 			this.meta.sessionId = forked.getSessionId();
 			this.meta.cwd = this.cwd;
 			this.writeMeta(this.meta);
-			fs.rmSync(backupFile, { force: true });
+			// Only delete the original backup when the replacement is verified lossless
+			// (no source entries skipped by forkFrom) and synced to storage.
+			const lossless = sourceCheck.valid && stagedCheck.entryCount >= sourceCheck.entryCount;
+			if (lossless && stagedSynced) {
+				fs.rmSync(backupFile, { force: true });
+			}
 			return {
 				file: targetFile,
 				cwdMatches: canonicalizeFsPath(this.readTranscriptHeaderCwd(targetFile) ?? "") === targetCanonical,
@@ -1675,7 +1804,14 @@ export class RelayWorkerManager {
 
 	private async spawnProcess(expectedGen = this.generation): Promise<void> {
 		if (this.disposed || expectedGen !== this.generation) return;
-		await this.cleanupClient(false);
+		const stopped = await this.cleanupClient(false);
+		if (!stopped) {
+			const msg = "Previous worker process is still alive after stop timeout; refusing to spawn a second writer.";
+			this.meta.lastError = msg;
+			this.setStatus("error");
+			this.hooks.onWakeup(`[Relay worker shutdown conflict] ${msg}`);
+			return;
+		}
 		if (this.disposed || expectedGen !== this.generation) return;
 
 		const wasOwned = this.ownsDirectory;
@@ -2337,30 +2473,32 @@ export class RelayWorkerManager {
 		return client;
 	}
 
-	private cleanupClientSync(): void {
+	private cleanupClientSync(): boolean {
 		const client = this.clearTimersAndDetach();
-		if (!client) return;
+		if (!client) return true;
 		const pid = client.pid();
 		try {
 			client.killSync();
 		} catch {
 			// Already terminated.
 		}
-		if (pid === undefined || !isPidAlive(pid)) {
+		const dead = pid === undefined || !isPidAlive(pid);
+		if (dead) {
 			this.updateLockWorkerPid(undefined);
 		}
+		return dead;
 	}
 
-	private async cleanupClient(sync: boolean, gracefulTimeoutMs = 15_000): Promise<void> {
+	private async cleanupClient(sync: boolean, gracefulTimeoutMs = 15_000): Promise<boolean> {
 		if (sync) {
-			this.cleanupClientSync();
-			return;
+			return this.cleanupClientSync();
 		}
 		if (this.activeShutdownPromise) {
 			await this.activeShutdownPromise;
 		}
 		const client = this.clearTimersAndDetach();
-		if (!client) return;
+		if (!client) return true;
+		let confirmedDead = true;
 		const stopPromise = (async () => {
 			const pid = client.pid();
 			try {
@@ -2368,7 +2506,8 @@ export class RelayWorkerManager {
 			} catch {
 				client.killSync();
 			} finally {
-				if (pid === undefined || !isPidAlive(pid)) {
+				confirmedDead = pid === undefined || !isPidAlive(pid);
+				if (confirmedDead) {
 					this.updateLockWorkerPid(undefined);
 				}
 			}
@@ -2381,6 +2520,7 @@ export class RelayWorkerManager {
 				this.activeShutdownPromise = undefined;
 			}
 		}
+		return confirmedDead;
 	}
 
 	/** Wait briefly if startup is still in progress when the user sends a first prompt quickly. */
@@ -2521,8 +2661,20 @@ export class RelayWorkerManager {
 			}
 			const gen = ++this.generation;
 			this.assertActive(gen, signal);
-			await this.cleanupClient(false);
+			const stopped = await this.cleanupClient(false);
 			this.assertActive(gen, signal);
+			if (!stopped) {
+				throw new Error(
+					"Previous worker process did not exit cleanly; refusing reset to protect the active transcript.",
+				);
+			}
+			const stillOwned = this.verifyCurrentOwnership();
+			if (!stillOwned.ok) {
+				const holderDesc = stillOwned.holderPid ? ` (PID ${stillOwned.holderPid})` : "";
+				throw new Error(
+					`Worker directory ownership was lost to another Pi session${holderDesc}; refusing reset.`,
+				);
+			}
 			try {
 				for (const entry of fs.readdirSync(this.dir)) {
 					if (entry === LEGACY_LOCK_FILE) continue;
@@ -2709,7 +2861,8 @@ export class RelayWorkerManager {
 		this.disposed = true;
 		this.generation += 1;
 		if (sync) {
-			this.cleanupClientSync();
+			const stopped = this.cleanupClientSync();
+			if (!stopped) return;
 			const hadOwnership = this.ownsDirectory;
 			if (this.ephemeral && hadOwnership) {
 				try {
@@ -2736,7 +2889,12 @@ export class RelayWorkerManager {
 			this.disposed = true;
 			this.generation += 1;
 		}
-		await this.cleanupClient(false, 15_000);
+		const stopped = await this.cleanupClient(false, 15_000);
+		if (!stopped) {
+			// Keep lock files pointing at the still-live workerPid so another session
+			// cannot touch the transcript until that OS process exits.
+			return;
+		}
 		const hadOwnership = this.ownsDirectory;
 		if (this.ephemeral && hadOwnership) {
 			try {

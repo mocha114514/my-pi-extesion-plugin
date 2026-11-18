@@ -23,7 +23,7 @@
  *     resolved from System32 with spawn errors consumed.
  */
 
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -350,6 +350,69 @@ export class RpcSubprocess {
 	 * escalation timer would never fire (unref'd timers do not run during
 	 * exit). Blocks briefly; only ever called at teardown.
 	 */
+	private reapUnixDescendants(rootPid: number): void {
+		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
+		if (psBin) {
+			try {
+				const out = execFileSync(psBin, ["-eo", "pid=,ppid=,pgid="], {
+					encoding: "utf-8",
+					timeout: 500,
+					env: { ...process.env, PATH: "/bin:/usr/bin" },
+				});
+				const byParent = new Map<number, Array<{ pid: number; pgid: number }>>();
+				for (const line of out.split("\n")) {
+					const parts = line.trim().split(/\s+/);
+					if (parts.length < 3) continue;
+					const p = Number(parts[0]);
+					const pp = Number(parts[1]);
+					const pg = Number(parts[2]);
+					if (!Number.isInteger(p) || p <= 0 || !Number.isInteger(pp)) continue;
+					let list = byParent.get(pp);
+					if (!list) {
+						list = [];
+						byParent.set(pp, list);
+					}
+					list.push({ pid: p, pgid: Number.isInteger(pg) && pg > 0 ? pg : 0 });
+				}
+				const pids = new Set<number>();
+				const pgids = new Set<number>();
+				const queue = [rootPid];
+				while (queue.length > 0) {
+					const cur = queue.shift()!;
+					for (const child of byParent.get(cur) ?? []) {
+						if (child.pid === process.pid || pids.has(child.pid)) continue;
+						pids.add(child.pid);
+						if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
+							pgids.add(child.pgid);
+						}
+						queue.push(child.pid);
+					}
+				}
+				for (const pgid of pgids) {
+					try {
+						process.kill(-pgid, "SIGKILL");
+					} catch {
+						// Already gone.
+					}
+				}
+				for (const pid of pids) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// Already gone.
+					}
+				}
+			} catch {
+				// Best effort descendant scan.
+			}
+		}
+		try {
+			process.kill(-rootPid, "SIGKILL");
+		} catch {
+			// Already gone.
+		}
+	}
+
 	killSync(): void {
 		const proc = this.proc;
 		if (proc && proc.exitCode === null && !proc.killed) {
@@ -361,7 +424,7 @@ export class RpcSubprocess {
 						spawnSync(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
 					}
 				} else if (pid !== undefined) {
-					process.kill(-pid, "SIGKILL");
+					this.reapUnixDescendants(pid);
 				}
 			} catch {
 				// Already gone.

@@ -186,7 +186,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	let milestones: number[] = [];
 	const firedMilestones = new Set<number>();
 	let pendingResumeNotice: string | undefined;
-	let hasSeenPromptInSession = false;
+	let promptHookActiveForRun = false;
 
 	// Defer triggerTurn notices while foreground compaction or tree navigation is running.
 	let compactionInFlight = false;
@@ -208,29 +208,17 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	const runtimeCaps = detectPiRuntimeCapabilities();
-	const WAKE_POLICY_RE = /^<relay-mode-wakeup-policy>\n[\s\S]*?\n<\/relay-mode-wakeup-policy>\n\n/;
 
 	const sendWakeup = (rawContent: string) => {
 		if (!activeInSession) return;
-		// Pi 1.5.2 runs before_agent_start on idle custom wake-ups, so no inline
-		// policy copy is needed. Pi 0.85.1 skips before_agent_start on idle custom
-		// wake-ups, so attach a transient policy block that the `context` hook
-		// strips from superseded wake-up messages so copies never accumulate.
-		const needsLegacyPolicyFallback =
-			!runtimeCaps.runsBeforeAgentStartOnCustomWakeup &&
-			Boolean(currentConfig?.relayPrompt) &&
-			(!hasSeenPromptInSession || (currentCtx?.isIdle?.() ?? true));
-		const content = needsLegacyPolicyFallback && currentConfig?.relayPrompt
-			? `<relay-mode-wakeup-policy>\n${currentConfig.relayPrompt}\n</relay-mode-wakeup-policy>\n\n${rawContent}`
-			: rawContent;
 		if (compactionInFlight || treeNavInFlight) {
-			heldNotices.push(content);
+			heldNotices.push(rawContent);
 			return;
 		}
 		if ((globalThis as unknown as Record<symbol, unknown>)[COMPACT_PENDING_SLOT]) {
 			try {
 				pi.sendMessage(
-					{ customType: NOTICE_TYPE, display: false, content },
+					{ customType: NOTICE_TYPE, display: false, content: rawContent },
 					{ triggerTurn: false },
 				);
 			} catch {
@@ -240,7 +228,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 		try {
 			pi.sendMessage(
-				{ customType: NOTICE_TYPE, display: false, content },
+				{ customType: NOTICE_TYPE, display: false, content: rawContent },
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
 		} catch {
@@ -382,7 +370,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 		activeInSession = true;
 		pendingResumeNotice = undefined;
-		hasSeenPromptInSession = false;
+		promptHookActiveForRun = false;
 		const activeTools = pi.getActiveTools();
 		const missingRelayTools = [...RELAY_TOOL_NAMES].filter((name) => !activeTools.includes(name));
 		if (missingRelayTools.length > 0) {
@@ -478,38 +466,29 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			}
 			return;
 		}
-		// Keep transient 0.85.1 wakeup policy blocks from accumulating in context:
-		// retain only on the latest notice if no subsequent user turn ran after it.
-		let lastNoticeIdx = -1;
-		for (let i = event.messages.length - 1; i >= 0; i--) {
-			const rec = event.messages[i] as unknown as { role?: unknown; customType?: unknown };
-			if (rec.role === "custom" && rec.customType === NOTICE_TYPE) {
-				lastNoticeIdx = i;
-				break;
-			}
-		}
-		const hasUserAfterLastNotice = lastNoticeIdx >= 0 && event.messages
-			.slice(lastNoticeIdx + 1)
-			.some((msg) => (msg as unknown as { role?: unknown }).role === "user");
-		let changed = false;
-		const stripped = event.messages.map((msg, idx) => {
-			const rec = msg as unknown as { role?: unknown; customType?: unknown; content?: unknown };
-			if (rec.role !== "custom" || rec.customType !== NOTICE_TYPE || typeof rec.content !== "string") {
-				return msg;
-			}
-			if (idx === lastNoticeIdx && !hasUserAfterLastNotice) return msg;
-			if (!WAKE_POLICY_RE.test(rec.content)) return msg;
-			changed = true;
-			return { ...msg, content: rec.content.replace(WAKE_POLICY_RE, "") } as typeof msg;
-		});
-		if (changed) {
-			return { messages: stripped };
+		// On Pi 0.85.1, idle custom-message wake-up runs skip `before_agent_start`
+		// and clear prior system-prompt overrides at settle. Inject a request-only
+		// policy message for any run where `before_agent_start` did not execute,
+		// keeping persisted transcripts and compaction free of duplicated copies.
+		if (!runtimeCaps.runsBeforeAgentStartOnCustomWakeup && !promptHookActiveForRun && currentConfig?.relayPrompt) {
+			return {
+				messages: [
+					...event.messages,
+					{
+						role: "custom",
+						customType: NOTICE_TYPE,
+						content: `<relay-mode-wakeup-policy>\n${currentConfig.relayPrompt}\n</relay-mode-wakeup-policy>`,
+						display: false,
+						timestamp: Date.now(),
+					} as typeof event.messages[number],
+				],
+			};
 		}
 	});
 
 	pi.on("before_agent_start", (event) => {
 		if (!activeInSession || !currentConfig?.relayPrompt) return;
-		hasSeenPromptInSession = true;
+		promptHookActiveForRun = true;
 		const resumeNotice = pendingResumeNotice;
 		pendingResumeNotice = undefined;
 		return {
@@ -522,6 +501,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				},
 			} : {}),
 		};
+	});
+
+	pi.on("agent_end", () => {
+		promptHookActiveForRun = false;
 	});
 
 	pi.on("tool_execution_end", (_event, ctx) => {

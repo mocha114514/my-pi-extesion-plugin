@@ -417,7 +417,7 @@ export class RelayRpcClient {
 			this.handleClose(null);
 			return;
 		}
-		const unixDescendants =
+		const preAbortSnapshot =
 			process.platform !== "win32" && proc.pid !== undefined
 				? this.collectUnixDescendants(proc.pid)
 				: undefined;
@@ -440,9 +440,17 @@ export class RelayRpcClient {
 			await this.send({ type: "abort" }, abortBudgetMs).catch(() => undefined);
 		}
 
+		// Take a fresh post-abort snapshot right before closing stdin so tools
+		// spawned during abort are also captured, with stable start-time identity.
+		const postAbortSnapshot =
+			process.platform !== "win32" && proc.pid !== undefined && this.isProcessRunning(proc)
+				? this.collectUnixDescendants(proc.pid)
+				: undefined;
+		const mergedSnapshot = this.mergeUnixSnapshots(preAbortSnapshot, postAbortSnapshot);
+
 		this.handleClose(null);
 		if (!this.isProcessRunning(proc)) {
-			if (unixDescendants) this.reapUnixSnapshot(unixDescendants);
+			if (mergedSnapshot) this.reapUnixSnapshot(mergedSnapshot);
 			return;
 		}
 		const remainingWaitMs = Math.max(250, deadline - Date.now());
@@ -454,7 +462,7 @@ export class RelayRpcClient {
 				clearTimeout(timer);
 				proc.removeListener("close", done);
 				proc.removeListener("exit", done);
-				if (unixDescendants) this.reapUnixSnapshot(unixDescendants);
+				if (mergedSnapshot) this.reapUnixSnapshot(mergedSnapshot);
 				resolve();
 			};
 			const timer = setTimeout(() => {
@@ -508,59 +516,124 @@ export class RelayRpcClient {
 		this.handleClose(null);
 	}
 
-	private collectUnixDescendants(rootPid: number): { pids: Set<number>; pgids: Set<number> } {
-		const pids = new Set<number>();
-		const pgids = new Set<number>();
+	private readUnixProcessTable(): Array<{ pid: number; ppid: number; pgid: number; startId: string }> {
 		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
-		if (!psBin) return { pids, pgids };
+		if (!psBin) return [];
 		try {
-			const out = execFileSync(psBin, ["-eo", "pid=,ppid=,pgid="], {
+			const out = execFileSync(psBin, ["-eo", "pid=,ppid=,pgid=,lstart="], {
 				encoding: "utf-8",
 				timeout: 500,
 				env: { ...process.env, PATH: "/bin:/usr/bin" },
 			});
-			const byParent = new Map<number, Array<{ pid: number; pgid: number }>>();
+			const rows: Array<{ pid: number; ppid: number; pgid: number; startId: string }> = [];
 			for (const line of out.split("\n")) {
-				const parts = line.trim().split(/\s+/);
-				if (parts.length < 3) continue;
-				const p = Number(parts[0]);
-				const pp = Number(parts[1]);
-				const pg = Number(parts[2]);
-				if (!Number.isInteger(p) || p <= 0 || !Number.isInteger(pp)) continue;
-				let list = byParent.get(pp);
-				if (!list) {
-					list = [];
-					byParent.set(pp, list);
-				}
-				list.push({ pid: p, pgid: Number.isInteger(pg) && pg > 0 ? pg : 0 });
+				const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+				if (!m) continue;
+				const pid = Number(m[1]);
+				const ppid = Number(m[2]);
+				const pgid = Number(m[3]);
+				const startId = m[4]!.trim();
+				if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || !startId) continue;
+				rows.push({ pid, ppid, pgid: Number.isInteger(pgid) && pgid > 0 ? pgid : 0, startId });
 			}
-			const queue: number[] = [rootPid];
-			while (queue.length > 0) {
-				const cur = queue.shift()!;
-				for (const child of byParent.get(cur) ?? []) {
-					if (child.pid === process.pid || pids.has(child.pid)) continue;
-					pids.add(child.pid);
-					if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
-						pgids.add(child.pgid);
-					}
-					queue.push(child.pid);
-				}
-			}
+			return rows;
 		} catch {
-			// Best effort descendant scan only.
+			return [];
+		}
+	}
+
+	private collectUnixDescendants(
+		rootPid: number,
+	): { pids: Map<number, string>; pgids: Map<number, Set<number>> } {
+		const pids = new Map<number, string>();
+		const pgids = new Map<number, Set<number>>();
+		const rows = this.readUnixProcessTable();
+		const byParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
+		for (const row of rows) {
+			let list = byParent.get(row.ppid);
+			if (!list) {
+				list = [];
+				byParent.set(row.ppid, list);
+			}
+			list.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
+		}
+		const queue: number[] = [rootPid];
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			for (const child of byParent.get(cur) ?? []) {
+				if (child.pid === process.pid || pids.has(child.pid)) continue;
+				pids.set(child.pid, child.startId);
+				if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
+					let members = pgids.get(child.pgid);
+					if (!members) {
+						members = new Set<number>();
+						pgids.set(child.pgid, members);
+					}
+					members.add(child.pid);
+				}
+				queue.push(child.pid);
+			}
 		}
 		return { pids, pgids };
 	}
 
-	private reapUnixSnapshot(snapshot: { pids: Set<number>; pgids: Set<number> }): void {
-		for (const pgid of snapshot.pgids) {
-			try {
-				process.kill(-pgid, "SIGKILL");
-			} catch {
-				// Already gone.
+	private mergeUnixSnapshots(
+		a?: { pids: Map<number, string>; pgids: Map<number, Set<number>> },
+		b?: { pids: Map<number, string>; pgids: Map<number, Set<number>> },
+	): { pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
+		if (!a) return b;
+		if (!b) return a;
+		const pids = new Map(a.pids);
+		for (const [k, v] of b.pids) pids.set(k, v);
+		const pgids = new Map<number, Set<number>>();
+		for (const [pgid, set] of a.pgids) pgids.set(pgid, new Set(set));
+		for (const [pgid, set] of b.pgids) {
+			const target = pgids.get(pgid) ?? new Set<number>();
+			for (const p of set) target.add(p);
+			pgids.set(pgid, target);
+		}
+		return { pids, pgids };
+	}
+
+	private reapUnixSnapshot(snapshot: { pids: Map<number, string>; pgids: Map<number, Set<number>> }): void {
+		if (snapshot.pids.size === 0 && snapshot.pgids.size === 0) return;
+		// Re-verify process start times before signaling so recycled PIDs/PGIDs
+		// are never killed by mistake.
+		const liveRows = this.readUnixProcessTable();
+		if (liveRows.length === 0) return;
+		const liveByPid = new Map<number, { pgid: number; startId: string }>();
+		const liveByPgid = new Map<number, number[]>();
+		for (const row of liveRows) {
+			liveByPid.set(row.pid, { pgid: row.pgid, startId: row.startId });
+			if (row.pgid > 0) {
+				let list = liveByPgid.get(row.pgid);
+				if (!list) {
+					list = [];
+					liveByPgid.set(row.pgid, list);
+				}
+				list.push(row.pid);
 			}
 		}
-		for (const pid of snapshot.pids) {
+
+		for (const [pgid] of snapshot.pgids) {
+			const currentMembers = liveByPgid.get(pgid) ?? [];
+			if (currentMembers.length === 0) continue;
+			const allVerified = currentMembers.every((memberPid) => {
+				const expectedStart = snapshot.pids.get(memberPid);
+				const live = liveByPid.get(memberPid);
+				return Boolean(expectedStart && live && live.startId === expectedStart);
+			});
+			if (allVerified) {
+				try {
+					process.kill(-pgid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		}
+		for (const [pid, expectedStart] of snapshot.pids) {
+			const live = liveByPid.get(pid);
+			if (!live || live.startId !== expectedStart) continue;
 			try {
 				process.kill(pid, "SIGKILL");
 			} catch {
@@ -593,6 +666,7 @@ export class RelayRpcClient {
 						const root = process.env.SystemRoot || "C:\\Windows";
 						spawnSync(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], {
 							stdio: "ignore",
+							timeout: 3_000,
 						});
 					}
 				} else if (pid !== undefined) {
