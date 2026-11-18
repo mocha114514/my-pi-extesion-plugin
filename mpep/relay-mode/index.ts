@@ -26,11 +26,18 @@ import { buildReminderMilestones, loadRelayConfig, type RelayConfig } from "./co
 import { buildWorkerSessionKey } from "./paths.ts";
 import { registerRelayTools } from "./tools.ts";
 import { updateRelayStatusBar } from "./widget.ts";
-import { RELAY_WORKER_ENV, RelayWorkerManager, type ModelDescriptor } from "./worker.ts";
+import {
+	RELAY_COMPACT_PREFIX,
+	RELAY_WORKER_ENV,
+	RelayWorkerManager,
+	type ModelDescriptor,
+} from "./worker.ts";
 
 const LAUNCH_CWD = process.cwd();
 const SLOT = Symbol.for("mpep.relay-mode.dispose.v1");
+const STARTUP_PROVIDER_SLOT = Symbol.for("mpep.relay-mode.startupProvider.v1");
 const installations = globalThis as unknown as Record<symbol, (() => void) | undefined>;
+const globalSlots = globalThis as unknown as Record<symbol, unknown>;
 const COMPACT_PENDING_SLOT = Symbol.for("mpep.compact-forewarn.pending");
 const DEFAULT_RESERVE_TOKENS = 16_384;
 const REMIND_TYPE = "mpep-relay-remind";
@@ -129,10 +136,40 @@ function buildPeriodicReminderMessage(remindPrompt: string, reason: string, issu
 }
 
 export default function relayModeExtension(pi: ExtensionAPI): void {
-	if (process.env[RELAY_WORKER_ENV] === "1") return;
+	if (process.env[RELAY_WORKER_ENV] === "1") {
+		pi.registerCommand("mpep-relay-compact-idle", {
+			description: "Internal relay-mode command: compact worker only if idle.",
+			handler: async (args, ctx) => {
+				const nonce = args.trim();
+				if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+					ctx.ui.notify(`${RELAY_COMPACT_PREFIX}${nonce}:busy`, "info");
+					return;
+				}
+				await new Promise<void>((resolve) => {
+					let done = false;
+					const finish = (status: string) => {
+						if (done) return;
+						done = true;
+						ctx.ui.notify(`${RELAY_COMPACT_PREFIX}${nonce}:${status}`, "info");
+						resolve();
+					};
+					ctx.compact({
+						onComplete: () => finish("ok"),
+						onError: (err) => finish(`err:${err.message}`),
+					});
+				});
+			},
+		});
+		return;
+	}
 	installations[SLOT]?.();
 
 	if (!isPluginEnabled("relay-mode")) {
+		pi.on("session_start", (event, ctx) => {
+			if (event.reason === "startup" && ctx.model?.provider) {
+				globalSlots[STARTUP_PROVIDER_SLOT] = ctx.model.provider;
+			}
+		});
 		// Even while disabled, strip historical relay-mode reminders/notices from
 		// replayed transcripts so they never direct a non-relay session.
 		pi.on("context", (event) => {
@@ -254,18 +291,31 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	let exitHookAttached = false;
+	let reRaiseSigint = false;
 	const onExitSync = () => {
 		disposeWorkerSync();
+	};
+	const onSigint = () => {
+		const shouldReRaise = reRaiseSigint;
+		detachSignalHandlers();
+		disposeWorkerSync();
+		if (shouldReRaise) {
+			process.kill(process.pid, "SIGINT");
+		}
 	};
 	const attachSignalHandlers = () => {
 		if (exitHookAttached) return;
 		exitHookAttached = true;
+		reRaiseSigint = process.listenerCount("SIGINT") === 0;
 		process.on("exit", onExitSync);
+		process.on("SIGINT", onSigint);
 	};
 	const detachSignalHandlers = () => {
 		if (!exitHookAttached) return;
 		exitHookAttached = false;
+		reRaiseSigint = false;
 		process.off("exit", onExitSync);
+		process.off("SIGINT", onSigint);
 	};
 
 	let sessionStartSeq = 0;
@@ -306,7 +356,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		getWorker: () => worker,
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		if (event.reason === "startup" && ctx.model?.provider) {
+			globalSlots[STARTUP_PROVIDER_SLOT] = ctx.model.provider;
+		}
 		const seq = ++sessionStartSeq;
 		const prev = worker;
 		clearPendingUiAndTimers();
@@ -376,6 +429,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			id: m.id,
 		}));
 
+		const recordedStartupProvider = typeof globalSlots[STARTUP_PROVIDER_SLOT] === "string"
+			? globalSlots[STARTUP_PROVIDER_SLOT]
+			: undefined;
+
 		const instance = new RelayWorkerManager(
 			sessionId,
 			storageKey,
@@ -397,6 +454,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			ctx.model?.provider,
 			ctx.model?.id,
 			availableModels,
+			recordedStartupProvider,
 		);
 		worker = instance;
 		attachSignalHandlers();
@@ -493,14 +551,19 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const pollIdle = () => {
 			treeNavSafetyTimer = undefined;
 			if (!treeNavInFlight) return;
-			if (event.signal?.aborted || currentCtx?.isIdle?.() === true) {
+			if (currentCtx?.isIdle?.() === true) {
 				release();
 				return;
 			}
 			treeNavSafetyTimer = setTimeout(pollIdle, 2_000);
 			treeNavSafetyTimer.unref?.();
 		};
-		event.signal?.addEventListener("abort", release, { once: true });
+		event.signal?.addEventListener("abort", () => {
+			if (!treeNavInFlight) return;
+			if (treeNavSafetyTimer) clearTimeout(treeNavSafetyTimer);
+			treeNavSafetyTimer = setTimeout(pollIdle, 100);
+			treeNavSafetyTimer.unref?.();
+		}, { once: true });
 		treeNavSafetyTimer = setTimeout(pollIdle, 2_000);
 		treeNavSafetyTimer.unref?.();
 	});
@@ -515,7 +578,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("input", () => {
-		if (treeNavInFlight) {
+		if (treeNavInFlight && currentCtx?.isIdle?.() === true) {
 			treeNavInFlight = false;
 			if (treeNavSafetyTimer) {
 				clearTimeout(treeNavSafetyTimer);

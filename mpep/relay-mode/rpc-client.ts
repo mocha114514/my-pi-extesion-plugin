@@ -159,6 +159,13 @@ export class RelayRpcClient {
 		}
 	}
 
+	private syncStdoutRef(): void {
+		const stdout = this.proc?.stdout as { ref?: () => void; unref?: () => void } | null | undefined;
+		if (!stdout) return;
+		if (this.pending.size > 0) stdout.ref?.();
+		else stdout.unref?.();
+	}
+
 	private handleClose(code: number | null): void {
 		if (!this.alive) return;
 		this.alive = false;
@@ -167,6 +174,7 @@ export class RelayRpcClient {
 		const error = new Error(`Worker RPC process exited (code ${code}). ${this.stderrText()}`.trim());
 		for (const { reject } of this.pending.values()) reject(error);
 		this.pending.clear();
+		this.syncStdoutRef();
 		const listeners = [...this.exitListeners];
 		this.exitListeners.clear();
 		for (const listener of listeners) listener(code);
@@ -274,6 +282,7 @@ export class RelayRpcClient {
 				if (timer) clearTimeout(timer);
 				signal?.removeEventListener("abort", onAbort);
 				this.pending.delete(id);
+				this.syncStdoutRef();
 				fn();
 			};
 			if (signal) {
@@ -288,6 +297,7 @@ export class RelayRpcClient {
 				resolve: (data) => finish(() => resolve(data)),
 				reject: (err) => finish(() => reject(err)),
 			});
+			this.syncStdoutRef();
 			try {
 				proc.stdin!.write(`${JSON.stringify({ id, ...command })}\n`, (error) => {
 					if (error) {
@@ -304,8 +314,10 @@ export class RelayRpcClient {
 		return this.send(command, ms, signal);
 	}
 
-	prompt(message: string, streamingBehavior: "steer" | "followUp" = "followUp", signal?: AbortSignal): Promise<unknown> {
-		return this.send({ type: "prompt", message, streamingBehavior }, undefined, signal);
+	prompt(message: string, streamingBehavior?: "steer" | "followUp", signal?: AbortSignal): Promise<unknown> {
+		const cmd: Record<string, unknown> = { type: "prompt", message };
+		if (streamingBehavior) cmd.streamingBehavior = streamingBehavior;
+		return this.send(cmd, undefined, signal);
 	}
 
 	steer(message: string, signal?: AbortSignal): Promise<unknown> {
@@ -355,20 +367,34 @@ export class RelayRpcClient {
 		return this.sendWithTimeout({ type: "get_session_stats" }, 10_000) as Promise<Record<string, unknown>>;
 	}
 
+	getCommands(): Promise<{ commands?: Array<{ name?: unknown }> }> {
+		return this.sendWithTimeout({ type: "get_commands" }, 5_000) as Promise<{
+			commands?: Array<{ name?: unknown }>;
+		}>;
+	}
+
 	/**
-	 * Ask Pi's RPC server to flush and exit cleanly by closing stdin before
-	 * escalating to a tree kill if it does not exit within `timeoutMs`.
+	 * Ask Pi's RPC server to flush and exit cleanly by closing stdin.
+	 * Responsive workers receive `responsiveTimeoutMs` (default 15s) to finish
+	 * pending credential/MCP writes; unresponsive ones escalate after `unresponsiveTimeoutMs`.
 	 */
-	async gracefulStop(timeoutMs = 15_000): Promise<void> {
+	async gracefulStop(responsiveTimeoutMs = 15_000, unresponsiveTimeoutMs = 2_000): Promise<void> {
 		const proc = this.proc;
 		this.exitListeners.clear();
 		if (!this.isProcessRunning(proc)) {
 			this.handleClose(null);
 			return;
 		}
+		let responsive = false;
 		if (this.alive) {
-			await this.send({ type: "abort" }, 1_000).catch(() => undefined);
+			try {
+				await this.send({ type: "abort" }, 1_000);
+				responsive = true;
+			} catch {
+				responsive = false;
+			}
 		}
+		const waitMs = responsive ? responsiveTimeoutMs : unresponsiveTimeoutMs;
 		this.handleClose(null);
 		if (!this.isProcessRunning(proc)) return;
 		await new Promise<void>((resolve) => {
@@ -384,7 +410,7 @@ export class RelayRpcClient {
 			const timer = setTimeout(() => {
 				this.killSync();
 				done();
-			}, timeoutMs);
+			}, waitMs);
 			proc.once("close", done);
 			proc.once("exit", done);
 			try {
