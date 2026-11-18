@@ -6,6 +6,7 @@ import { notifyTurnComplete } from "./notify.ts";
 import { ensureBubbleSound } from "./sound.ts";
 
 const PLUGIN_ID = "turn-notify";
+const RELAY_WORKER_ENV = "MPEP_RELAY_WORKER";
 
 /**
  * Cross-plugin slot published by compact-forewarn while a compaction request is
@@ -61,6 +62,9 @@ export function createTurnNotify(
  * so it must not trigger the completion notification.
  */
 export default function turnNotify(pi: ExtensionAPI): void {
+	// Suppress desktop notifications/sounds inside a background relay worker so
+	// only the foreground relay session chimes when reporting back to the user.
+	if (process.env[RELAY_WORKER_ENV] === "1") return;
 	if (!isPluginEnabled(PLUGIN_ID)) return;
 	const handler = createTurnNotify(notifyTurnComplete);
 	pi.on("agent_start", handler.agentStart);

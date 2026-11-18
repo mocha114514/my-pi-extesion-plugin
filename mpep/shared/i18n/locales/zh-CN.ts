@@ -292,4 +292,13 @@ export const zhCN = {
   "tips.immediateHint": "会话提醒保存后立即生效；关闭面板不会撤销已保存的修改。",
   "tips.navigationHint": "↑↓/Tab 选择 · 单击/Enter 打开 · A 新增 · 滚轮/PgUp/PgDn 滚动 · Esc 返回/关闭",
   "tips.editorHint": "Enter 换行 · Ctrl+S 保存 · Tab 切换按钮 · Esc 取消草稿",
+  "plugin.relay-mode.name": "传话模式 (Relay Mode)",
+  "plugin.relay-mode.desc": "把前台会话作为用户传话/翻译入口，自动共生拉起全权限后台执行员工（独立上下文、心跳监测、上下文树按需查阅与删除审批转述）",
+  "relay.status.starting": "Relay: 启动中...",
+  "relay.status.idle": "Relay: 待命",
+  "relay.status.running": "Relay:",
+  "relay.status.retrying": "Relay: 重试 #{attempt}",
+  "relay.status.compacting": "Relay: 压缩中",
+  "relay.status.waitingApproval": "Relay: 待审批",
+  "relay.status.abnormal": "Relay: {status}",
 } as const satisfies Record<keyof typeof en, string>;

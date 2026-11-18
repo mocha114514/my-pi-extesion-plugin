@@ -40,7 +40,8 @@
       "./retry-error-normalizer/index.ts",
       "./responses-OpenAI-offical-search/index.ts",
       "./tips/index.ts",
-      "./delete-guard/index.ts"
+      "./delete-guard/index.ts",
+      "./relay-mode/index.ts"
     ]
   }
 }

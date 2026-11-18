@@ -291,4 +291,13 @@ export const en = {
   "tips.immediateHint": "Saved session edits apply immediately; closing does not undo them.",
   "tips.navigationHint": "↑↓/Tab select · Click/Enter open · A add · Wheel/PgUp/PgDn scroll · Esc back/close",
   "tips.editorHint": "Enter newline · Ctrl+S save · Tab buttons · Esc cancel draft",
+  "plugin.relay-mode.name": "Relay Mode (Symbiotic Worker)",
+  "plugin.relay-mode.desc": "Turns the foreground TUI session into a user-facing relay/translator paired 1:1 with a full-capability symbiotic background worker",
+  "relay.status.starting": "Relay: starting...",
+  "relay.status.idle": "Relay: idle",
+  "relay.status.running": "Relay:",
+  "relay.status.retrying": "Relay: retrying #{attempt}",
+  "relay.status.compacting": "Relay: compacting",
+  "relay.status.waitingApproval": "Relay: awaiting approval",
+  "relay.status.abnormal": "Relay: {status}",
 } as const;

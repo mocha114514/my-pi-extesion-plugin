@@ -159,5 +159,12 @@
     "path": "./tips/index.ts",
     "desc": "AI 可写入的会话级提醒本：在有效压缩窗口 25%/50%/75% 及压缩成功后自动伴随注入，不触发新回合",
     "enabled": true
+  },
+  {
+    "id": "relay-mode",
+    "name": "传话模式 (Relay Mode)",
+    "path": "./relay-mode/index.ts",
+    "desc": "把前台会话作为用户传话/翻译入口，自动共生拉起全权限后台执行员工（独立上下文、心跳监测、上下文树按需查阅与删除审批转述）",
+    "enabled": false
   }
 ]
