@@ -60,6 +60,7 @@ export class RelayRpcClient {
 	private pending = new Map<string, PendingRequest>();
 	private listeners = new Set<(event: RpcEvent) => void>();
 	private exitListeners = new Set<(code: number | null) => void>();
+	private processExitListeners = new Set<() => void>();
 	private uiRequestHandler: RpcUIRequestHandler | undefined;
 	private seenUIRequests = new Set<string>();
 	private stderrTail: string[] = [];
@@ -85,6 +86,12 @@ export class RelayRpcClient {
 	onExit(listener: (code: number | null) => void): () => void {
 		this.exitListeners.add(listener);
 		return () => this.exitListeners.delete(listener);
+	}
+
+	/** Fires only when the underlying OS child process actually exits. */
+	onProcessExit(listener: () => void): () => void {
+		this.processExitListeners.add(listener);
+		return () => this.processExitListeners.delete(listener);
 	}
 
 	onUIRequest(handler: RpcUIRequestHandler): () => void {
@@ -133,6 +140,14 @@ export class RelayRpcClient {
 		});
 		proc.on("exit", () => {
 			this.processExited = true;
+			for (const listener of [...this.processExitListeners]) {
+				try {
+					listener();
+				} catch {
+					// Ignore listener errors.
+				}
+			}
+			this.processExitListeners.clear();
 		});
 		proc.on("close", (code) => {
 			this.processExited = true;
@@ -402,6 +417,11 @@ export class RelayRpcClient {
 			this.handleClose(null);
 			return;
 		}
+		const unixDescendants =
+			process.platform !== "win32" && proc.pid !== undefined
+				? this.collectUnixDescendants(proc.pid)
+				: undefined;
+
 		let responsive = false;
 		if (this.alive) {
 			responsive = await this.send({ type: "get_state" }, 1_000).then(
@@ -421,7 +441,10 @@ export class RelayRpcClient {
 		}
 
 		this.handleClose(null);
-		if (!this.isProcessRunning(proc)) return;
+		if (!this.isProcessRunning(proc)) {
+			if (unixDescendants) this.reapUnixSnapshot(unixDescendants);
+			return;
+		}
 		const remainingWaitMs = Math.max(250, deadline - Date.now());
 		await new Promise<void>((resolve) => {
 			let finished = false;
@@ -431,6 +454,7 @@ export class RelayRpcClient {
 				clearTimeout(timer);
 				proc.removeListener("close", done);
 				proc.removeListener("exit", done);
+				if (unixDescendants) this.reapUnixSnapshot(unixDescendants);
 				resolve();
 			};
 			const timer = setTimeout(() => {
@@ -484,13 +508,16 @@ export class RelayRpcClient {
 		this.handleClose(null);
 	}
 
-	private reapUnixProcessTree(rootPid: number): void {
-		const descendantPids = new Set<number>();
-		const descendantPgids = new Set<number>();
+	private collectUnixDescendants(rootPid: number): { pids: Set<number>; pgids: Set<number> } {
+		const pids = new Set<number>();
+		const pgids = new Set<number>();
+		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
+		if (!psBin) return { pids, pgids };
 		try {
-			const out = execFileSync("ps", ["-eo", "pid=,ppid=,pgid="], {
+			const out = execFileSync(psBin, ["-eo", "pid=,ppid=,pgid="], {
 				encoding: "utf-8",
 				timeout: 500,
+				env: { ...process.env, PATH: "/bin:/usr/bin" },
 			});
 			const byParent = new Map<number, Array<{ pid: number; pgid: number }>>();
 			for (const line of out.split("\n")) {
@@ -511,31 +538,40 @@ export class RelayRpcClient {
 			while (queue.length > 0) {
 				const cur = queue.shift()!;
 				for (const child of byParent.get(cur) ?? []) {
-					if (child.pid === process.pid || descendantPids.has(child.pid)) continue;
-					descendantPids.add(child.pid);
+					if (child.pid === process.pid || pids.has(child.pid)) continue;
+					pids.add(child.pid);
 					if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
-						descendantPgids.add(child.pgid);
+						pgids.add(child.pgid);
 					}
 					queue.push(child.pid);
 				}
 			}
 		} catch {
-			// Best effort descendant scan; always still signal -rootPid below.
+			// Best effort descendant scan only.
 		}
-		for (const pgid of descendantPgids) {
+		return { pids, pgids };
+	}
+
+	private reapUnixSnapshot(snapshot: { pids: Set<number>; pgids: Set<number> }): void {
+		for (const pgid of snapshot.pgids) {
 			try {
 				process.kill(-pgid, "SIGKILL");
 			} catch {
 				// Already gone.
 			}
 		}
-		for (const pid of descendantPids) {
+		for (const pid of snapshot.pids) {
 			try {
 				process.kill(pid, "SIGKILL");
 			} catch {
 				// Already gone.
 			}
 		}
+	}
+
+	private reapUnixProcessTree(rootPid: number): void {
+		const snapshot = this.collectUnixDescendants(rootPid);
+		this.reapUnixSnapshot(snapshot);
 		try {
 			process.kill(-rootPid, "SIGKILL");
 		} catch {

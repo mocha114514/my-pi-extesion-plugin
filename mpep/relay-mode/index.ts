@@ -28,6 +28,7 @@ import { buildWorkerSessionKey } from "./paths.ts";
 import { registerRelayTools } from "./tools.ts";
 import { updateRelayStatusBar } from "./widget.ts";
 import {
+	detectPiRuntimeCapabilities,
 	RELAY_COMPACT_PREFIX,
 	RELAY_WORKER_ENV,
 	RelayWorkerManager,
@@ -206,17 +207,21 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		flushTimer.unref?.();
 	};
 
+	const runtimeCaps = detectPiRuntimeCapabilities();
+	const WAKE_POLICY_RE = /^<relay-mode-wakeup-policy>\n[\s\S]*?\n<\/relay-mode-wakeup-policy>\n\n/;
+
 	const sendWakeup = (rawContent: string) => {
 		if (!activeInSession) return;
-		// Pi 0.85.1/1.5.2 sendMessage({ triggerTurn: true }) skips before_agent_start when idle
-		// (and 0.85.1 clears any prior systemPromptOverride at settle). Include the cached
-		// relay instructions on every idle wake-up so the foreground retains relay policy across
-		// wake-up turns and their tool calls.
-		const needsRelayInstructions =
+		// Pi 1.5.2 runs before_agent_start on idle custom wake-ups, so no inline
+		// policy copy is needed. Pi 0.85.1 skips before_agent_start on idle custom
+		// wake-ups, so attach a transient policy block that the `context` hook
+		// strips from superseded wake-up messages so copies never accumulate.
+		const needsLegacyPolicyFallback =
+			!runtimeCaps.runsBeforeAgentStartOnCustomWakeup &&
 			Boolean(currentConfig?.relayPrompt) &&
 			(!hasSeenPromptInSession || (currentCtx?.isIdle?.() ?? true));
-		const content = needsRelayInstructions && currentConfig?.relayPrompt
-			? `${currentConfig.relayPrompt}\n\n${rawContent}`
+		const content = needsLegacyPolicyFallback && currentConfig?.relayPrompt
+			? `<relay-mode-wakeup-policy>\n${currentConfig.relayPrompt}\n</relay-mode-wakeup-policy>\n\n${rawContent}`
 			: rawContent;
 		if (compactionInFlight || treeNavInFlight) {
 			heldNotices.push(content);
@@ -460,16 +465,45 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("context", (event) => {
-		// If a session previously recorded relay-mode reminders/notices and is later
-		// opened without active relay mode (e.g. headless print/RPC or disabled),
-		// strip stale relay directives so they do not misdirect the agent.
-		if (activeInSession) return;
-		const filtered = event.messages.filter((msg) => {
-			const rec = msg as unknown as { role?: unknown; customType?: unknown };
-			return !(rec.role === "custom" && (rec.customType === REMIND_TYPE || rec.customType === NOTICE_TYPE));
+		if (!activeInSession) {
+			// If a session previously recorded relay-mode reminders/notices and is later
+			// opened without active relay mode (e.g. headless print/RPC or disabled),
+			// strip stale relay directives so they do not misdirect the agent.
+			const filtered = event.messages.filter((msg) => {
+				const rec = msg as unknown as { role?: unknown; customType?: unknown };
+				return !(rec.role === "custom" && (rec.customType === REMIND_TYPE || rec.customType === NOTICE_TYPE));
+			});
+			if (filtered.length !== event.messages.length) {
+				return { messages: filtered };
+			}
+			return;
+		}
+		// Keep transient 0.85.1 wakeup policy blocks from accumulating in context:
+		// retain only on the latest notice if no subsequent user turn ran after it.
+		let lastNoticeIdx = -1;
+		for (let i = event.messages.length - 1; i >= 0; i--) {
+			const rec = event.messages[i] as unknown as { role?: unknown; customType?: unknown };
+			if (rec.role === "custom" && rec.customType === NOTICE_TYPE) {
+				lastNoticeIdx = i;
+				break;
+			}
+		}
+		const hasUserAfterLastNotice = lastNoticeIdx >= 0 && event.messages
+			.slice(lastNoticeIdx + 1)
+			.some((msg) => (msg as unknown as { role?: unknown }).role === "user");
+		let changed = false;
+		const stripped = event.messages.map((msg, idx) => {
+			const rec = msg as unknown as { role?: unknown; customType?: unknown; content?: unknown };
+			if (rec.role !== "custom" || rec.customType !== NOTICE_TYPE || typeof rec.content !== "string") {
+				return msg;
+			}
+			if (idx === lastNoticeIdx && !hasUserAfterLastNotice) return msg;
+			if (!WAKE_POLICY_RE.test(rec.content)) return msg;
+			changed = true;
+			return { ...msg, content: rec.content.replace(WAKE_POLICY_RE, "") } as typeof msg;
 		});
-		if (filtered.length !== event.messages.length) {
-			return { messages: filtered };
+		if (changed) {
+			return { messages: stripped };
 		}
 	});
 
