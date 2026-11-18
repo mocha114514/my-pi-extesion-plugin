@@ -39,6 +39,15 @@ export function registerSigintCleanup(callback: () => void): () => void {
 
 	if (!reg.listener) {
 		const handler = () => {
+			// If an external listener (e.g. host TUI or another extension's once())
+			// owns this SIGINT, keep MPEP state and SIGINT registration intact so we
+			// never tear down active workers while the host remains alive.
+			const hasExternalHandler = process.listeners("SIGINT").some(
+				(fn) => fn !== handler && !isSignalExitListener(fn),
+			);
+			if (hasExternalHandler) {
+				return;
+			}
 			reg.listener = undefined;
 			process.off("SIGINT", handler);
 			const snapshot = [...reg.callbacks];
@@ -50,10 +59,7 @@ export function registerSigintCleanup(callback: () => void): () => void {
 					// Cleanup must not prevent sibling handlers or signal re-raise.
 				}
 			}
-			const hasExternalHandler = process.listeners("SIGINT").some((fn) => !isSignalExitListener(fn));
-			if (!hasExternalHandler) {
-				process.kill(process.pid, "SIGINT");
-			}
+			process.kill(process.pid, "SIGINT");
 		};
 		reg.listener = handler;
 		// Prepend so MPEP runs before any earlier `process.once("SIGINT", ...)`

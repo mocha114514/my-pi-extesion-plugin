@@ -406,15 +406,15 @@ export class RelayRpcClient {
 		const deadline = Date.now() + totalBudgetMs;
 
 		// On Pi 0.85.1, stdin EOF calls dispose() without awaiting session.abort(),
-		// so wait for abort acknowledgement within the shared deadline before closing stdin.
+		// so wait for abort acknowledgement within the full shared deadline before closing stdin.
 		if (responsive && this.alive) {
-			const abortBudgetMs = Math.min(5_000, Math.max(500, deadline - Date.now()));
+			const abortBudgetMs = Math.max(500, deadline - Date.now());
 			await this.send({ type: "abort" }, abortBudgetMs).catch(() => undefined);
 		}
 
 		this.handleClose(null);
 		if (!this.isProcessRunning(proc)) return;
-		const remainingWaitMs = Math.max(500, deadline - Date.now());
+		const remainingWaitMs = Math.max(250, deadline - Date.now());
 		await new Promise<void>((resolve) => {
 			let finished = false;
 			const done = () => {

@@ -114,6 +114,7 @@ const THINKING_SUFFIXES = new Set(["off", "minimal", "low", "medium", "high", "x
 export interface ModelDescriptor {
 	provider: string;
 	id: string;
+	authenticated?: boolean;
 }
 
 interface OwnerLock {
@@ -179,13 +180,30 @@ function resolveExactCatalogTarget(
 	}
 
 	const fullMatches = availableModels.filter((m) => `${m.provider}/${m.id}`.toLowerCase() === baseLower);
+	const exactIdMatches = availableModels.filter((m) => m.id.toLowerCase() === baseLower);
 	if (fullMatches.length === 1 && fullMatches[0]) {
+		// Mirror Pi 0.85.1 auth-aware slash-ID resolution: if `provider/id` matches an
+		// unauthenticated provider while `exactIdMatches` has a single authenticated
+		// match (e.g. OpenRouter's `xiaomi/mimo-v2.5-pro`), Pi selects the latter.
+		if (fullMatches[0].authenticated === false) {
+			const authRawMatches = exactIdMatches.filter(
+				(m) => m.authenticated === true && `${m.provider}/${m.id}`.toLowerCase() !== baseLower,
+			);
+			if (authRawMatches.length === 1 && authRawMatches[0]) {
+				return { provider: authRawMatches[0].provider, modelArg: formatPinned(authRawMatches[0]) };
+			}
+		}
 		return { provider: fullMatches[0].provider, modelArg: formatPinned(fullMatches[0]) };
 	}
 
-	const exactIdMatches = availableModels.filter((m) => m.id.toLowerCase() === baseLower);
 	if (exactIdMatches.length === 1 && exactIdMatches[0]) {
 		return { provider: exactIdMatches[0].provider, modelArg: formatPinned(exactIdMatches[0]) };
+	}
+	if (exactIdMatches.length > 1) {
+		const authMatches = exactIdMatches.filter((m) => m.authenticated === true);
+		if (authMatches.length === 1 && authMatches[0]) {
+			return { provider: authMatches[0].provider, modelArg: formatPinned(authMatches[0]) };
+		}
 	}
 	return undefined;
 }
@@ -571,10 +589,51 @@ function hasResumableRebaseArtifacts(dir: string, sessionId: string): boolean {
 	return false;
 }
 
+function isValidCompleteJsonlFile(filePath: string, expectedSessionId: string): boolean {
+	try {
+		const header = readSessionHeader(filePath);
+		if (header?.id !== expectedSessionId) return false;
+		// Verify every line up to EOF parses as complete JSON so a truncated
+		// un-fsynced staging file is never promoted over a complete backup.
+		const stat = fs.statSync(filePath);
+		if (stat.size <= 0) return false;
+		const fd = fs.openSync(filePath, "r");
+		try {
+			const chunk = Buffer.allocUnsafe(64 * 1024);
+			let carry = "";
+			let seenLine = false;
+			while (true) {
+				const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+				if (n <= 0) break;
+				const text = carry + chunk.subarray(0, n).toString("utf-8");
+				const parts = text.split("\n");
+				carry = parts.pop() ?? "";
+				for (const line of parts) {
+					const trimmed = line.replace(/\r$/, "").trim();
+					if (!trimmed) continue;
+					JSON.parse(trimmed);
+					seenLine = true;
+				}
+			}
+			const tail = carry.replace(/\r$/, "").trim();
+			if (tail) {
+				JSON.parse(tail);
+				seenLine = true;
+			}
+			return seenLine;
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Recover interrupted rebase state ONLY while holding exclusive ownership.
- * Checks specifically for `targetSessionId` so an unrelated older session's
- * `.jsonl` never suppresses restoring the active session's transcript.
+ * Always prefers restoring a complete `*.rebased-*.bak` transcript over a
+ * potentially partial staged copy, and only promotes a staged copy when no
+ * backup exists and every JSONL line validates cleanly.
  */
 function recoverStaleRebaseBackups(dir: string, targetSessionId: string): void {
 	try {
@@ -584,42 +643,8 @@ function recoverStaleRebaseBackups(dir: string, targetSessionId: string): void {
 		);
 
 		if (!hasTargetJsonl) {
-			// 1. Prefer a complete staged copy matching targetSessionId if crash happened mid-swap.
-			const stagedCandidates: string[] = [];
-			for (const entry of entries) {
-				if (!entry.startsWith(".rebase-")) continue;
-				const subDir = path.join(dir, entry);
-				try {
-					for (const sub of fs.readdirSync(subDir)) {
-						if (!sub.endsWith(".jsonl")) continue;
-						const full = path.join(subDir, sub);
-						// Require a readable session header so a truncated staged copy never
-						// shadows a valid `.bak` transcript.
-						if (readSessionHeader(full)?.id === targetSessionId) {
-							stagedCandidates.push(full);
-						}
-					}
-				} catch {
-					// Ignore.
-				}
-			}
-			if (stagedCandidates.length > 0) {
-				stagedCandidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-				const chosen = stagedCandidates[0]!;
-				const dest = path.join(dir, path.basename(chosen));
-				if (!fs.existsSync(dest)) {
-					fs.renameSync(chosen, dest);
-				}
-			}
-		}
-
-		// 2. If still absent, restore the newest `.rebased-*.bak` belonging to targetSessionId.
-		const postStageEntries = fs.readdirSync(dir);
-		const targetRestored = postStageEntries.some(
-			(name) => name.endsWith(".jsonl") && fileMatchesSessionId(path.join(dir, name), targetSessionId),
-		);
-		if (!targetRestored) {
-			const backups = postStageEntries
+			// 1. Prefer restoring the newest complete `.rebased-*.bak` for targetSessionId.
+			const backups = entries
 				.filter((name) => /\.jsonl\.rebased-\d+\.bak$/.test(name))
 				.map((name) => path.join(dir, name))
 				.filter((full) => path.basename(full).includes(targetSessionId) || readSessionHeader(full)?.id === targetSessionId);
@@ -629,6 +654,32 @@ function recoverStaleRebaseBackups(dir: string, targetSessionId: string): void {
 				const restored = latest.replace(/\.rebased-\d+\.bak$/, "");
 				if (!fs.existsSync(restored)) {
 					fs.renameSync(latest, restored);
+				}
+			} else {
+				// 2. Only if no backup exists, promote a complete validated staged copy.
+				const stagedCandidates: string[] = [];
+				for (const entry of entries) {
+					if (!entry.startsWith(".rebase-")) continue;
+					const subDir = path.join(dir, entry);
+					try {
+						for (const sub of fs.readdirSync(subDir)) {
+							if (!sub.endsWith(".jsonl")) continue;
+							const full = path.join(subDir, sub);
+							if (isValidCompleteJsonlFile(full, targetSessionId)) {
+								stagedCandidates.push(full);
+							}
+						}
+					} catch {
+						// Ignore.
+					}
+				}
+				if (stagedCandidates.length > 0) {
+					stagedCandidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+					const chosen = stagedCandidates[0]!;
+					const dest = path.join(dir, path.basename(chosen));
+					if (!fs.existsSync(dest)) {
+						fs.renameSync(chosen, dest);
+					}
 				}
 			}
 		}
@@ -663,22 +714,46 @@ function findExistingSessionFile(dir: string, sessionId: string, allowRecovery =
 	}
 }
 
-/** Recover an orphaned worker session file if meta.json is missing or corrupt. */
+/** Recover an orphaned worker session file (including mid-rebase `.bak`/staged copies) if meta.json is missing or corrupt. */
 function discoverOrphanSession(dir: string): { sessionId: string; cwd?: string } | undefined {
 	try {
-		const files = fs.readdirSync(dir)
+		const entries = fs.readdirSync(dir);
+		const jsonlFiles = entries
 			.filter((name) => name.endsWith(".jsonl"))
 			.map((name) => path.join(dir, name));
-		if (files.length === 0) return undefined;
-		// Prefer the most recently modified transcript if multiple exist.
-		files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-		for (const file of files) {
+		jsonlFiles.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+		for (const file of jsonlFiles) {
 			const header = readSessionHeader(file);
 			if (header?.id) {
-				return {
-					sessionId: header.id,
-					cwd: header.cwd,
-				};
+				return { sessionId: header.id, cwd: header.cwd };
+			}
+		}
+
+		const backupFiles = entries
+			.filter((name) => /\.jsonl\.rebased-\d+\.bak$/.test(name))
+			.map((name) => path.join(dir, name));
+		backupFiles.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+		for (const file of backupFiles) {
+			const header = readSessionHeader(file);
+			if (header?.id) {
+				return { sessionId: header.id, cwd: header.cwd };
+			}
+		}
+
+		for (const entry of entries) {
+			if (!entry.startsWith(".rebase-")) continue;
+			const subDir = path.join(dir, entry);
+			try {
+				for (const sub of fs.readdirSync(subDir)) {
+					if (!sub.endsWith(".jsonl")) continue;
+					const full = path.join(subDir, sub);
+					const header = readSessionHeader(full);
+					if (header?.id && isValidCompleteJsonlFile(full, header.id)) {
+						return { sessionId: header.id, cwd: header.cwd };
+					}
+				}
+			} catch {
+				// Ignore unreadable staging subdir.
 			}
 		}
 	} catch {
@@ -876,7 +951,7 @@ export class RelayWorkerManager {
 		}
 	}
 
-	private linkPrepopulatedFile(targetPath: string, payload: string): "ok" | "exists" | "error" {
+	private linkStrictPrepopulatedFile(targetPath: string, payload: string): "ok" | "exists" | "no_hardlink" | "error" {
 		const tmp = `${targetPath}.${process.pid}.${this.ownerId}.tmp`;
 		try {
 			const fd = fs.openSync(tmp, "wx");
@@ -891,19 +966,7 @@ export class RelayWorkerManager {
 			} catch (err) {
 				const code = (err as NodeJS.ErrnoException).code;
 				if (code === "EEXIST") return "exists";
-				if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") {
-					try {
-						const tfd = fs.openSync(targetPath, "wx");
-						try {
-							fs.writeFileSync(tfd, payload, "utf-8");
-						} finally {
-							fs.closeSync(tfd);
-						}
-						return "ok";
-					} catch (wxErr) {
-						return (wxErr as NodeJS.ErrnoException).code === "EEXIST" ? "exists" : "error";
-					}
-				}
+				if (code === "EPERM" || code === "ENOTSUP" || code === "EXDEV") return "no_hardlink";
 				return "error";
 			}
 		} catch {
@@ -911,6 +974,26 @@ export class RelayWorkerManager {
 		} finally {
 			fs.rmSync(tmp, { force: true });
 		}
+	}
+
+	private exclusiveCreatePrepopulatedFile(targetPath: string, payload: string): "ok" | "exists" | "error" {
+		try {
+			const tfd = fs.openSync(targetPath, "wx");
+			try {
+				fs.writeFileSync(tfd, payload, "utf-8");
+			} finally {
+				fs.closeSync(tfd);
+			}
+			return "ok";
+		} catch (wxErr) {
+			return (wxErr as NodeJS.ErrnoException).code === "EEXIST" ? "exists" : "error";
+		}
+	}
+
+	private linkPrepopulatedFile(targetPath: string, payload: string): "ok" | "exists" | "error" {
+		const strict = this.linkStrictPrepopulatedFile(targetPath, payload);
+		if (strict !== "no_hardlink") return strict;
+		return this.exclusiveCreatePrepopulatedFile(targetPath, payload);
 	}
 
 	private releaseOwnedFile(targetPath: string): void {
@@ -924,28 +1007,10 @@ export class RelayWorkerManager {
 		}
 	}
 
-	private isAbandonedMarker(filePath: string, graceMs = 150): boolean {
-		try {
-			const stat = fs.statSync(filePath);
-			if (stat.isDirectory()) return true;
-			const raw = fs.readFileSync(filePath, "utf-8");
-			if (!raw.trim()) {
-				return Date.now() - stat.mtimeMs > graceMs;
-			}
-			try {
-				const parsed = JSON.parse(raw) as Partial<OwnerLock>;
-				return typeof parsed.pid !== "number" || !isPidAlive(parsed.pid);
-			} catch {
-				return Date.now() - stat.mtimeMs > graceMs;
-			}
-		} catch {
-			return false;
-		}
-	}
-
 	/**
 	 * Acquire a reclaim marker atomically via pre-populated `linkSync`, waiting
-	 * briefly on live contenders and reclaiming only abandoned/dead markers.
+	 * on live contenders and directory mutexes (`0bd7085`), and reclaiming ONLY
+	 * markers whose JSON explicitly proves a dead PID.
 	 */
 	private acquireMarkerExclusive(markerPath: string, payload: string): boolean {
 		for (let attempt = 0; attempt < 8; attempt++) {
@@ -956,43 +1021,42 @@ export class RelayWorkerManager {
 			try {
 				const stat = fs.statSync(markerPath);
 				if (stat.isDirectory()) {
-					fs.rmSync(markerPath, { recursive: true, force: true });
+					// Revision 0bd7085 holds `owner.lock.reclaim` via mkdirSync; never delete it.
+					this.sleepSync(25);
 					continue;
 				}
 				const raw = fs.readFileSync(markerPath, "utf-8");
-				if (raw.trim()) {
+				if (!raw.trim()) {
+					// Empty file may be a live legacy writer mid-write; wait and never delete unverified.
+					this.sleepSync(25);
+					continue;
+				}
+				let holder: Partial<OwnerLock>;
+				try {
+					holder = JSON.parse(raw) as Partial<OwnerLock>;
+				} catch {
+					this.sleepSync(25);
+					continue;
+				}
+				if (holder.ownerId === this.ownerId) return true;
+				if (typeof holder.pid !== "number" || (holder.pid !== process.pid && isPidAlive(holder.pid))) {
+					this.sleepSync(25);
+					continue;
+				}
+				// Proven dead PID holder: serialize cleanup via per-dead-owner suffix.
+				const holderTag = String(holder.ownerId ?? "dead").replace(/[^a-zA-Z0-9_-]/g, "_");
+				const guardPath = `${markerPath}.gc.${holderTag}`;
+				if (this.linkPrepopulatedFile(guardPath, payload) === "ok") {
 					try {
-						const holder = JSON.parse(raw) as Partial<OwnerLock>;
-						if (holder.ownerId === this.ownerId) return true;
-						if (typeof holder.pid === "number" && holder.pid !== process.pid && isPidAlive(holder.pid)) {
-							this.sleepSync(20);
-							continue;
-						}
-						// Dead PID holder: serialize cleanup via per-dead-owner suffix so two
-						// contenders never unlink a live successor's marker.
-						const holderTag = String(holder.ownerId ?? "dead").replace(/[^a-zA-Z0-9_-]/g, "_");
-						const guardPath = `${markerPath}.gc.${holderTag}`;
-						if (this.linkPrepopulatedFile(guardPath, payload) === "ok") {
-							try {
-								const recheck = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as Partial<OwnerLock>;
-								if (recheck.ownerId === holder.ownerId) {
-									fs.unlinkSync(markerPath);
-								}
-							} catch {
-								// Ignore if already gone.
-							} finally {
-								this.releaseOwnedFile(guardPath);
-							}
-							continue;
+						const recheck = JSON.parse(fs.readFileSync(markerPath, "utf-8")) as Partial<OwnerLock>;
+						if (recheck.ownerId === holder.ownerId) {
+							fs.unlinkSync(markerPath);
 						}
 					} catch {
-						if (Date.now() - stat.mtimeMs > 150) {
-							fs.rmSync(markerPath, { force: true });
-							continue;
-						}
+						// Ignore if already gone.
+					} finally {
+						this.releaseOwnedFile(guardPath);
 					}
-				} else if (Date.now() - stat.mtimeMs > 150) {
-					fs.rmSync(markerPath, { force: true });
 					continue;
 				}
 			} catch {
@@ -1017,30 +1081,32 @@ export class RelayWorkerManager {
 			if (status === "error") return { ok: false };
 
 			let existingOwnerId: string | undefined;
-			let deadTag = "corrupt";
-			let emptyOrCorrupt = false;
+			let deadTag: string | undefined;
 			try {
-				const stat = fs.statSync(this.legacyLockPath);
 				const raw = fs.readFileSync(this.legacyLockPath, "utf-8");
 				if (!raw.trim()) {
-					emptyOrCorrupt = true;
-					if (Date.now() - stat.mtimeMs <= 150) {
-						this.sleepSync(40);
-						continue;
-					}
-				} else {
-					const existing = JSON.parse(raw) as Partial<OwnerLock>;
-					if (existing.ownerId === this.ownerId) return { ok: true };
-					if (typeof existing.pid === "number" && existing.pid !== process.pid && isPidAlive(existing.pid)) {
-						return { ok: false, holderPid: existing.pid };
-					}
-					if (typeof existing.ownerId === "string" && existing.ownerId.trim()) {
-						existingOwnerId = existing.ownerId;
-						deadTag = existing.ownerId.replace(/[^a-zA-Z0-9_-]/g, "_");
-					}
+					// Revision 98838f7 creates `worker/owner.lock.json` via openSync("wx") before
+					// writing JSON; if it pauses, we cannot prove the writer is dead, so wait
+					// briefly and fail closed rather than unlinking a live owner's lock.
+					this.sleepSync(40);
+					continue;
 				}
+				const existing = JSON.parse(raw) as Partial<OwnerLock>;
+				if (existing.ownerId === this.ownerId) return { ok: true };
+				if (typeof existing.pid !== "number") {
+					this.sleepSync(40);
+					continue;
+				}
+				if (existing.pid !== process.pid && isPidAlive(existing.pid)) {
+					return { ok: false, holderPid: existing.pid };
+				}
+				existingOwnerId = typeof existing.ownerId === "string" && existing.ownerId.trim()
+					? existing.ownerId
+					: undefined;
+				deadTag = (existingOwnerId ?? `pid-${existing.pid}`).replace(/[^a-zA-Z0-9_-]/g, "_");
 			} catch {
-				emptyOrCorrupt = true;
+				this.sleepSync(40);
+				continue;
 			}
 
 			const reclaimLegacy = `${this.legacyLockPath}.reclaim.${deadTag}`;
@@ -1049,25 +1115,18 @@ export class RelayWorkerManager {
 				continue;
 			}
 			try {
-				if (emptyOrCorrupt) {
-					if (this.isAbandonedMarker(this.legacyLockPath, 150)) {
-						fs.rmSync(this.legacyLockPath, { force: true });
-					}
-				} else {
-					try {
-						const recheck = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
-						if (typeof recheck.pid === "number" && recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
-							return { ok: false, holderPid: recheck.pid };
-						}
-						if (existingOwnerId === undefined || recheck.ownerId === existingOwnerId) {
-							fs.unlinkSync(this.legacyLockPath);
-						}
-					} catch {
-						if (this.isAbandonedMarker(this.legacyLockPath, 150)) {
-							fs.rmSync(this.legacyLockPath, { force: true });
-						}
-					}
+				const recheck = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
+				if (typeof recheck.pid !== "number") {
+					return { ok: false };
 				}
+				if (recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
+					return { ok: false, holderPid: recheck.pid };
+				}
+				if (existingOwnerId === undefined || recheck.ownerId === existingOwnerId) {
+					fs.unlinkSync(this.legacyLockPath);
+				}
+			} catch {
+				// Leave unverified lock untouched; fail closed on retry/exhaustion.
 			} finally {
 				this.releaseOwnedFile(reclaimLegacy);
 			}
@@ -1082,18 +1141,12 @@ export class RelayWorkerManager {
 				const full = path.join(dir, entry);
 				try {
 					const stat = fs.statSync(full);
-					if (stat.isDirectory()) {
-						fs.rmSync(full, { recursive: true, force: true });
-						continue;
-					}
+					if (stat.isDirectory()) continue;
 					const raw = fs.readFileSync(full, "utf-8");
-					if (!raw.trim()) {
-						if (Date.now() - stat.mtimeMs > 150) fs.rmSync(full, { force: true });
-						continue;
-					}
+					if (!raw.trim()) continue;
 					const rec = JSON.parse(raw) as Partial<OwnerLock>;
 					const suffixId = entry.slice(`${lockBase}.reclaim.`.length);
-					const deadHolder = typeof rec.pid !== "number" || !isPidAlive(rec.pid);
+					const deadHolder = typeof rec.pid === "number" && !isPidAlive(rec.pid);
 					if (deadHolder || (currentOwnerId && suffixId !== currentOwnerId && Date.now() - stat.mtimeMs > 60_000)) {
 						fs.rmSync(full, { force: true });
 					}
@@ -1108,9 +1161,9 @@ export class RelayWorkerManager {
 
 	/**
 	 * Enforce a single live owner per persistent worker directory using atomic
-	 * pre-populated hard-link creation, shared compatibility with 5f774dc's
-	 * `owner.lock.reclaim` mutex, per-dead-owner reclaim markers released in
-	 * `finally`, and exclusive legacy `worker/owner.lock.json` acquisition.
+	 * pre-populated hard-link creation, shared `owner.lock.reclaim` mutex across
+	 * both stale takeovers and no-hard-link fallbacks, per-dead-owner reclaim
+	 * markers released in `finally`, and exclusive `worker/owner.lock.json`.
 	 */
 	private acquireOwnership(): { ok: true } | { ok: false; holderPid?: number } {
 		if (this.ownsDirectory) return { ok: true };
@@ -1127,10 +1180,10 @@ export class RelayWorkerManager {
 		const legacySharedReclaim = `${this.lockPath}.reclaim`;
 
 		for (let attempt = 0; attempt < 5; attempt++) {
-			const linkedDirect = this.linkPrepopulatedFile(this.lockPath, payload);
-			if (linkedDirect === "error") return { ok: false };
+			const strictLink = this.linkStrictPrepopulatedFile(this.lockPath, payload);
+			if (strictLink === "error") return { ok: false };
 
-			if (linkedDirect === "ok") {
+			if (strictLink === "ok") {
 				const legacyRes = this.acquireLegacyLockExclusive();
 				if (!legacyRes.ok) {
 					this.releaseOwnedFile(this.lockPath);
@@ -1138,6 +1191,31 @@ export class RelayWorkerManager {
 				}
 				this.ownsDirectory = true;
 				return { ok: true };
+			}
+
+			if (strictLink === "no_hardlink") {
+				// On filesystems without hard links, hold `owner.lock.reclaim` before
+				// creating `owner.lock` via `openSync("wx")` so a concurrent `5f774dc`
+				// reclaimer cannot overwrite our lock with `renameSync`.
+				if (!this.acquireMarkerExclusive(legacySharedReclaim, payload)) {
+					this.sleepSync(25);
+					continue;
+				}
+				try {
+					const fallbackCreate = this.exclusiveCreatePrepopulatedFile(this.lockPath, payload);
+					if (fallbackCreate === "error") return { ok: false };
+					if (fallbackCreate === "ok") {
+						const legacyRes = this.acquireLegacyLockExclusive();
+						if (!legacyRes.ok) {
+							this.releaseOwnedFile(this.lockPath);
+							return legacyRes;
+						}
+						this.ownsDirectory = true;
+						return { ok: true };
+					}
+				} finally {
+					this.releaseOwnedFile(legacySharedReclaim);
+				}
 			}
 
 			let existingRaw: string;
@@ -1148,9 +1226,13 @@ export class RelayWorkerManager {
 				continue;
 			}
 
-			let deadTag = "corrupt";
+			let deadTag: string | undefined;
 			let deadOwnerId: string | undefined;
 			try {
+				if (!existingRaw.trim()) {
+					this.sleepSync(40);
+					continue;
+				}
 				const existing = JSON.parse(existingRaw) as Partial<OwnerLock>;
 				if (existing.ownerId === this.ownerId) {
 					const legacyRes = this.acquireLegacyLockExclusive();
@@ -1158,18 +1240,20 @@ export class RelayWorkerManager {
 					this.ownsDirectory = true;
 					return { ok: true };
 				}
-				if (typeof existing.pid === "number" && existing.pid !== process.pid && isPidAlive(existing.pid)) {
+				if (typeof existing.pid !== "number") {
+					this.sleepSync(40);
+					continue;
+				}
+				if (existing.pid !== process.pid && isPidAlive(existing.pid)) {
 					return { ok: false, holderPid: existing.pid };
 				}
 				if (typeof existing.ownerId === "string" && existing.ownerId.trim()) {
 					deadOwnerId = existing.ownerId;
-					deadTag = existing.ownerId.replace(/[^a-zA-Z0-9_-]/g, "_");
 				}
+				deadTag = (deadOwnerId ?? `pid-${existing.pid}`).replace(/[^a-zA-Z0-9_-]/g, "_");
 			} catch {
-				if (!this.isAbandonedMarker(this.lockPath, 150)) {
-					this.sleepSync(40);
-					continue;
-				}
+				this.sleepSync(40);
+				continue;
 			}
 
 			// Acquire BOTH the 5f774dc-compatible `owner.lock.reclaim` marker AND
@@ -1190,11 +1274,14 @@ export class RelayWorkerManager {
 						const recheckRaw = fs.readFileSync(this.lockPath, "utf-8");
 						const recheck = JSON.parse(recheckRaw) as Partial<OwnerLock>;
 						recheckOwnerId = typeof recheck.ownerId === "string" ? recheck.ownerId : undefined;
-						if (typeof recheck.pid === "number" && recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
+						if (typeof recheck.pid !== "number") {
+							return { ok: false };
+						}
+						if (recheck.pid !== process.pid && isPidAlive(recheck.pid)) {
 							return { ok: false, holderPid: recheck.pid };
 						}
 					} catch {
-						// Still corrupt/unreadable.
+						return { ok: false };
 					}
 					if (deadOwnerId !== undefined && recheckOwnerId !== deadOwnerId) {
 						continue;

@@ -409,12 +409,12 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const availableModels: ModelDescriptor[] = (ctx.modelRegistry?.getAll?.() ?? []).map((m) => ({
 			provider: m.provider,
 			id: m.id,
+			authenticated: ctx.modelRegistry?.hasConfiguredAuth?.(m) ?? true,
 		}));
 
-		const verifyApiKeyForProvider = async (provider: string, apiKey: string): Promise<boolean> => {
+		const verifyApiKeyForProvider = async (provider: string, _apiKey: string): Promise<boolean> => {
 			try {
-				const resolvedKey = await ctx.modelRegistry?.getApiKeyForProvider?.(provider);
-				return resolvedKey === apiKey;
+				return ctx.modelRegistry?.getProviderAuthStatus?.(provider)?.source === "runtime";
 			} catch {
 				return false;
 			}
