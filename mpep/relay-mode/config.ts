@@ -218,6 +218,14 @@ export function loadRelayConfig(): RelayConfig {
 	}
 }
 
+/** Strip a leading UTF-8 BOM and YAML frontmatter fence when YAML parsing throws. */
+function stripFrontmatterFallback(raw: string): string {
+	const withoutBom = raw.replace(/^\uFEFF/, "");
+	const normalized = withoutBom.replace(/\r\n/g, "\n");
+	const match = normalized.match(/^---\n[\s\S]*?\n---(?:\n([\s\S]*))?$/);
+	return match ? (match[1] ?? "") : withoutBom;
+}
+
 export function parseRelayConfigText(raw: string, filePath: string, initialWarning?: string): RelayConfig {
 	let warning = initialWarning;
 	let frontmatter: RawFrontmatter = {};
@@ -229,6 +237,7 @@ export function parseRelayConfigText(raw: string, filePath: string, initialWarni
 		body = parsed.body;
 	} catch (error) {
 		warning = warning ?? `Invalid YAML frontmatter in ${filePath}: ${(error as Error).message}`;
+		body = stripFrontmatterFallback(raw);
 	}
 
 	const model = typeof frontmatter.model === "string" && frontmatter.model.trim()

@@ -144,18 +144,36 @@ interface CollapsedNode {
 	children: CollapsedNode[];
 }
 
-/** Collapse skipped nodes while preserving branching topology for visible nodes. */
+/**
+ * Collapse skipped nodes iteratively while preserving branching topology for
+ * visible nodes (immune to deep-session stack overflow).
+ */
 function collapseTree(nodes: TreeNodeLike[], leafId: string | null, includeTools: boolean): CollapsedNode[] {
-	const out: CollapsedNode[] = [];
-	for (const node of nodes) {
-		const visibleChildren = collapseTree(node.children ?? [], leafId, includeTools);
-		if (isIncludedInOutline(node, leafId, includeTools)) {
-			out.push({ node, children: visibleChildren });
+	const rootTarget: CollapsedNode[] = [];
+	const stack: Array<{ node: TreeNodeLike; target: CollapsedNode[]; childrenTarget: CollapsedNode[]; visited: boolean }> = [];
+	for (let i = nodes.length - 1; i >= 0; i--) {
+		const node = nodes[i]!;
+		stack.push({ node, target: rootTarget, childrenTarget: [], visited: false });
+	}
+
+	while (stack.length > 0) {
+		const frame = stack.pop()!;
+		if (!frame.visited) {
+			frame.visited = true;
+			stack.push(frame);
+			const children = frame.node.children ?? [];
+			for (let i = children.length - 1; i >= 0; i--) {
+				stack.push({ node: children[i]!, target: frame.childrenTarget, childrenTarget: [], visited: false });
+			}
+			continue;
+		}
+		if (isIncludedInOutline(frame.node, leafId, includeTools)) {
+			frame.target.push({ node: frame.node, children: frame.childrenTarget });
 		} else {
-			out.push(...visibleChildren);
+			frame.target.push(...frame.childrenTarget);
 		}
 	}
-	return out;
+	return rootTarget;
 }
 
 function summarizeEntryLine(node: TreeNodeLike, leafId: string | null): string {
@@ -216,7 +234,13 @@ function summarizeEntryLine(node: TreeNodeLike, leafId: string | null): string {
 	return `[${id}] ${role}${label}: ${preview || "(empty)"}${leafMark}`;
 }
 
-export function formatTreeIndex(tree: unknown[], leafId: string | null, includeTools = false): string {
+export function formatTreeIndex(
+	tree: unknown[],
+	leafId: string | null,
+	includeTools = false,
+	offset = 0,
+	limit = 200,
+): string {
 	if (!Array.isArray(tree) || tree.length === 0) {
 		return "Worker session tree is empty (no messages recorded yet).";
 	}
@@ -227,53 +251,75 @@ export function formatTreeIndex(tree: unknown[], leafId: string | null, includeT
 
 	const lines: string[] = [];
 	// Keep linear chains flush at the current indent; only indent when a parent
-	// actually forks into multiple sibling branches.
-	const renderNode = (
-		item: CollapsedNode,
-		prefix: string,
-		isLast: boolean,
-		isBranchChild: boolean,
-	) => {
-		const connector = isBranchChild ? (isLast ? "└─ " : "├─ ") : "";
-		lines.push(`${prefix}${connector}${summarizeEntryLine(item.node, leafId)}`);
-		const childPrefix = isBranchChild
-			? `${prefix}${isLast ? "   " : "│  "}`
-			: prefix;
-		const childCount = item.children.length;
+	// actually forks into multiple sibling branches. Iterative stack avoids recursion limits.
+	const renderStack: Array<{
+		item: CollapsedNode;
+		prefix: string;
+		isLast: boolean;
+		isBranchChild: boolean;
+	}> = [];
+	const rootsBranch = collapsed.length > 1;
+	for (let i = collapsed.length - 1; i >= 0; i--) {
+		renderStack.push({
+			item: collapsed[i]!,
+			prefix: "",
+			isLast: i === collapsed.length - 1,
+			isBranchChild: rootsBranch,
+		});
+	}
+
+	while (renderStack.length > 0) {
+		const frame = renderStack.pop()!;
+		const connector = frame.isBranchChild ? (frame.isLast ? "└─ " : "├─ ") : "";
+		lines.push(`${frame.prefix}${connector}${summarizeEntryLine(frame.item.node, leafId)}`);
+		const childPrefix = frame.isBranchChild
+			? `${frame.prefix}${frame.isLast ? "   " : "│  "}`
+			: frame.prefix;
+		const childCount = frame.item.children.length;
 		const childrenBranch = childCount > 1;
-		for (let i = 0; i < childCount; i++) {
-			renderNode(item.children[i]!, childPrefix, i === childCount - 1, childrenBranch);
+		for (let i = childCount - 1; i >= 0; i--) {
+			renderStack.push({
+				item: frame.item.children[i]!,
+				prefix: childPrefix,
+				isLast: i === childCount - 1,
+				isBranchChild: childrenBranch,
+			});
 		}
-	};
-
-	const rootCount = collapsed.length;
-	const rootsBranch = rootCount > 1;
-	for (let i = 0; i < rootCount; i++) {
-		renderNode(collapsed[i]!, "", i === rootCount - 1, rootsBranch);
 	}
 
-	const MAX_INDEX_LINES = 250;
-	if (lines.length > MAX_INDEX_LINES) {
-		const omitted = lines.length - MAX_INDEX_LINES;
-		const head = lines.slice(0, 40);
-		const tail = lines.slice(lines.length - (MAX_INDEX_LINES - 40));
-		return [
-			`Worker session tree (${lines.length} entries; showing first 40 and latest ${tail.length}, ${omitted} middle entries omitted):`,
-			...head,
-			`... (${omitted} middle entries omitted; inspect surrounding entryIds or toggle includeTools) ...`,
-			...tail,
-		].join("\n");
+	const safeLimit = Math.max(1, Math.min(500, Math.floor(limit)));
+	const safeOffset = Math.max(0, Math.min(lines.length, Math.floor(offset)));
+	if (safeOffset === 0 && lines.length <= safeLimit) {
+		return [`Worker session tree (${lines.length} entries):`, ...lines].join("\n");
 	}
 
-	return [`Worker session tree (${lines.length} entries):`, ...lines].join("\n");
+	const slice = lines.slice(safeOffset, safeOffset + safeLimit);
+	const nextOffset = safeOffset + slice.length;
+	const leafLine = lines.find((line) => line.includes("  <-- current"));
+	const header =
+		`Worker session tree (${lines.length} entries; showing ${safeOffset + 1}..${nextOffset}` +
+		`${leafId ? `, current leaf: ${leafId}` : ""}):`;
+	const footer = nextOffset < lines.length
+		? `--- [More tree entries available: call relay_status({ view: "tree", offset: ${nextOffset}, limit: ${safeLimit} })]`
+		: "--- [End of session tree]";
+
+	const includeLeafHint = leafLine && !slice.includes(leafLine)
+		? [`Current leaf node: ${leafLine.trim()}`]
+		: [];
+	return [header, ...includeLeafHint, ...slice, footer].join("\n");
 }
 
 function findNode(nodes: TreeNodeLike[], targetId: string): TreeNodeLike | undefined {
-	for (const node of nodes) {
+	const stack: TreeNodeLike[] = [];
+	for (let i = nodes.length - 1; i >= 0; i--) {
+		stack.push(nodes[i]!);
+	}
+	while (stack.length > 0) {
+		const node = stack.pop()!;
 		if (node.entry?.id === targetId) return node;
-		if (node.children?.length) {
-			const hit = findNode(node.children, targetId);
-			if (hit) return hit;
+		const children = node.children ?? [];
+		for (let i = children.length - 1; i >= 0; i--) {
+			stack.push(children[i]!);
 		}
 	}
 	return undefined;
@@ -398,25 +444,36 @@ function formatMessageForLatest(msg: Record<string, unknown>): string {
 	return `[${role.toUpperCase()}]\n${extractTextBlocks(msg.content) || singleLine(JSON.stringify(msg), 400)}`;
 }
 
+function isVisibleInLatest(msg: Record<string, unknown>): boolean {
+	const role = typeof msg.role === "string" ? msg.role : "";
+	if (role === "system") return false;
+	if (role === "custom" && msg.display === false) return false;
+	return true;
+}
+
 export function formatLatestTurns(messages: unknown[], limit = 2, maxChars = 12_000): string {
 	if (!Array.isArray(messages) || messages.length === 0) {
 		return "Worker has no conversation messages yet.";
 	}
 	const safeLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+	const visibleMessages = messages.filter(
+		(m): m is Record<string, unknown> => Boolean(m && typeof m === "object" && isVisibleInLatest(m as Record<string, unknown>)),
+	);
+	if (visibleMessages.length === 0) {
+		return "Worker has no visible conversation turns yet.";
+	}
 
 	// Split backward by user messages so each "turn" spans one user prompt and all its tool/assistant follow-ups.
 	const turnStarts: number[] = [];
-	for (let i = 0; i < messages.length; i++) {
-		const rec = messages[i] as Record<string, unknown> | undefined;
-		if (rec?.role === "user") turnStarts.push(i);
+	for (let i = 0; i < visibleMessages.length; i++) {
+		if (visibleMessages[i]?.role === "user") turnStarts.push(i);
 	}
 	const startIdx = turnStarts.length >= safeLimit
 		? turnStarts[turnStarts.length - safeLimit]!
 		: 0;
 
-	const slice = messages.slice(startIdx);
+	const slice = visibleMessages.slice(startIdx);
 	const formatted = slice
-		.filter((m): m is Record<string, unknown> => Boolean(m && typeof m === "object"))
 		.map(formatMessageForLatest)
 		.join("\n\n");
 

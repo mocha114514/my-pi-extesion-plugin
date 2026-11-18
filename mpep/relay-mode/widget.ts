@@ -12,6 +12,16 @@ import type { WorkerSnapshot } from "./worker.ts";
 
 const STATUS_KEY = "relay-mode";
 
+/** Strip ANSI escape codes and control chars so worker tool names/paths cannot spoof TUI styling. */
+function sanitizeTerminalText(text: string): string {
+	return text
+		.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+		.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+		.replace(/[\x00-\x1f\x7f\x80-\x9f]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 export function updateRelayStatusBar(ctx: ExtensionContext | undefined, snapshot: WorkerSnapshot | undefined): void {
 	if (!ctx?.hasUI || ctx.mode !== "tui") return;
 	if (!snapshot) {
@@ -33,7 +43,8 @@ export function updateRelayStatusBar(ctx: ExtensionContext | undefined, snapshot
 			badge = theme.fg("dim", t("relay.status.idle"));
 			break;
 		case "running": {
-			const tool = snapshot.activeTool ? ` ${snapshot.activeTool}` : "";
+			const cleanTool = snapshot.activeTool ? sanitizeTerminalText(snapshot.activeTool) : "";
+			const tool = cleanTool ? ` ${cleanTool}` : "";
 			badge = theme.fg("success", `${t("relay.status.running")}${tool}${elapsed}`);
 			break;
 		}

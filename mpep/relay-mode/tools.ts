@@ -29,7 +29,9 @@ function formatSnapshotSummary(worker: RelayWorkerManager): string {
 		`Model: ${s.model ?? "(inherited/default)"} | Thinking: ${s.thinking ?? "default"}`,
 	];
 
-	if (s.contextWindow && s.contextWindow > 0) {
+	if (s.contextTokens === null) {
+		lines.push(`Context Usage: unknown (post-compaction; updates after next turn) | Turns: ${s.turns}`);
+	} else if (s.contextWindow && s.contextWindow > 0) {
 		const pct = Math.round((s.contextTokens / s.contextWindow) * 100);
 		lines.push(`Context Usage: ${s.contextTokens.toLocaleString("en-US")} / ${s.contextWindow.toLocaleString("en-US")} (${pct}%) | Turns: ${s.turns}`);
 	} else {
@@ -50,6 +52,12 @@ function formatSnapshotSummary(worker: RelayWorkerManager): string {
 		lines.push(`Retry Attempt: #${s.retryAttempt}${s.retryReason ? ` (${s.retryReason})` : ""}`);
 	}
 	if (s.lastError) lines.push(`Last Error: ${s.lastError}`);
+	if (s.lastStderr) {
+		const clippedStderr = s.lastStderr.length > 1_200
+			? `...${s.lastStderr.slice(-1_200)}`
+			: s.lastStderr;
+		lines.push(`Worker Stderr Tail:\n${clippedStderr}`);
+	}
 
 	if (s.pendingApprovals.length > 0) {
 		lines.push(`Pending Deletion Approvals: ${s.pendingApprovals.length} (call relay_approval({ action: "list" }))`);
@@ -113,10 +121,10 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 			})),
 		}, { additionalProperties: false }),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, context) {
+		async execute(_toolCallId, params, signal, _onUpdate, context) {
 			const worker = requireWorker(host, context);
 			const mode = params.mode ?? "prompt";
-			const result = await worker.sendInstruction(params.message, mode);
+			const result = await worker.sendInstruction(params.message, mode, signal);
 			return {
 				content: [{ type: "text" as const, text: result }],
 				details: { mode, status: worker.getSnapshot().status },
@@ -154,9 +162,9 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 				Type.Literal("node"),
 			], { description: "Inspection view (default: summary)." })),
 			limit: Type.Optional(Type.Number({
-				description: "Number of recent user turns to include when view='latest' (default: 2, max: 20).",
+				description: "For view='latest': recent user turns (default 2, max 20). For view='tree': max outline lines per page (default 200, max 500).",
 				minimum: 1,
-				maximum: 20,
+				maximum: 500,
 			})),
 			includeTools: Type.Optional(Type.Boolean({
 				description: "Include individual toolResult entries in view='tree' (default: false).",
@@ -165,7 +173,7 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 				description: "Target entryId from view='tree', required when view='node'.",
 			})),
 			offset: Type.Optional(Type.Number({
-				description: "Character offset for paginating long entries in view='node' (default: 0).",
+				description: "Starting line offset for view='tree', or character offset for view='node' (default: 0).",
 				minimum: 0,
 			})),
 		}, { additionalProperties: false }),
@@ -190,7 +198,13 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 			}
 			if (view === "tree") {
 				const { tree, leafId } = await worker.fetchTree();
-				const text = formatTreeIndex(tree, leafId, params.includeTools === true);
+				const text = formatTreeIndex(
+					tree,
+					leafId,
+					params.includeTools === true,
+					params.offset ?? 0,
+					params.limit ?? 200,
+				);
 				return {
 					content: [{ type: "text" as const, text }],
 					details: { view, leafId },
@@ -234,9 +248,9 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 			]),
 		}, { additionalProperties: false }),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, context) {
+		async execute(_toolCallId, params, signal, _onUpdate, context) {
 			const worker = requireWorker(host, context);
-			const text = await worker.control(params.action);
+			const text = await worker.control(params.action, signal);
 			return {
 				content: [{ type: "text" as const, text }],
 				details: { action: params.action, status: worker.getSnapshot().status },

@@ -63,6 +63,7 @@ export class RelayRpcClient {
 	private uiRequestHandler: RpcUIRequestHandler | undefined;
 	private seenUIRequests = new Set<string>();
 	private stderrTail: string[] = [];
+	private processExited = false;
 
 	alive = false;
 	private readonly cwd: string;
@@ -107,6 +108,7 @@ export class RelayRpcClient {
 		});
 		this.proc = proc;
 		this.alive = true;
+		this.processExited = false;
 
 		proc.stdout?.on("data", (chunk: Buffer) => this.handleData(this.stdoutDecoder.write(chunk)));
 		proc.stderr?.on("data", (chunk: Buffer) => {
@@ -116,8 +118,17 @@ export class RelayRpcClient {
 		proc.stdin?.on("error", () => {
 			if (this.alive) this.handleClose(null);
 		});
-		proc.on("error", () => this.handleClose(null));
-		proc.on("close", (code) => this.handleClose(code));
+		proc.on("error", () => {
+			this.processExited = true;
+			this.handleClose(null);
+		});
+		proc.on("exit", () => {
+			this.processExited = true;
+		});
+		proc.on("close", (code) => {
+			this.processExited = true;
+			this.handleClose(code);
+		});
 
 		// Wait until the RPC loop answers before unreffing child streams so
 		// awaiting startup never looks idle to Node's event loop.
@@ -236,64 +247,89 @@ export class RelayRpcClient {
 		}
 	}
 
-	send(command: Record<string, unknown>): Promise<unknown> {
+	private isProcessRunning(proc: ChildProcess | null): proc is ChildProcess {
+		return Boolean(
+			proc &&
+			!this.processExited &&
+			proc.exitCode === null &&
+			proc.signalCode === null &&
+			!proc.killed,
+		);
+	}
+
+	send(command: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<unknown> {
 		const proc = this.proc;
 		if (!proc?.stdin || !this.alive) return Promise.reject(new Error("Worker RPC process is not running"));
+		if (signal?.aborted) return Promise.reject(new Error("Operation aborted."));
 		const id = `req-${++this.nextId}`;
 		return new Promise((resolve, reject) => {
-			this.pending.set(id, { resolve, reject });
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const onAbort = () => {
+				finish(() => reject(new Error("Operation aborted.")));
+			};
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+				this.pending.delete(id);
+				fn();
+			};
+			if (signal) {
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
+			if (timeoutMs && timeoutMs > 0) {
+				timer = setTimeout(() => {
+					finish(() => reject(new Error(`RPC command "${String(command.type ?? "unknown")}" timed out after ${timeoutMs}ms`)));
+				}, timeoutMs);
+			}
+			this.pending.set(id, {
+				resolve: (data) => finish(() => resolve(data)),
+				reject: (err) => finish(() => reject(err)),
+			});
 			try {
 				proc.stdin!.write(`${JSON.stringify({ id, ...command })}\n`, (error) => {
 					if (error) {
-						this.pending.delete(id);
-						reject(error);
+						finish(() => reject(error));
 					}
 				});
 			} catch (error) {
-				this.pending.delete(id);
-				reject(error instanceof Error ? error : new Error(String(error)));
+				finish(() => reject(error instanceof Error ? error : new Error(String(error))));
 			}
 		});
 	}
 
-	sendWithTimeout(command: Record<string, unknown>, ms: number): Promise<unknown> {
-		return new Promise((resolve, reject) => {
-			const timer = setTimeout(() => reject(new Error(`RPC command timed out after ${ms}ms`)), ms);
-			this.send(command).then(
-				(value) => {
-					clearTimeout(timer);
-					resolve(value);
-				},
-				(error: unknown) => {
-					clearTimeout(timer);
-					reject(error instanceof Error ? error : new Error(String(error)));
-				},
-			);
-		});
+	sendWithTimeout(command: Record<string, unknown>, ms: number, signal?: AbortSignal): Promise<unknown> {
+		return this.send(command, ms, signal);
 	}
 
-	prompt(message: string, streamingBehavior: "steer" | "followUp" = "followUp"): Promise<unknown> {
-		return this.send({ type: "prompt", message, streamingBehavior });
+	prompt(message: string, streamingBehavior: "steer" | "followUp" = "followUp", signal?: AbortSignal): Promise<unknown> {
+		return this.send({ type: "prompt", message, streamingBehavior }, undefined, signal);
 	}
 
-	steer(message: string): Promise<unknown> {
-		return this.send({ type: "steer", message });
+	steer(message: string, signal?: AbortSignal): Promise<unknown> {
+		return this.send({ type: "steer", message }, undefined, signal);
 	}
 
-	followUp(message: string): Promise<unknown> {
-		return this.send({ type: "follow_up", message });
+	followUp(message: string, signal?: AbortSignal): Promise<unknown> {
+		return this.send({ type: "follow_up", message }, undefined, signal);
 	}
 
 	abort(): Promise<unknown> {
-		return this.send({ type: "abort" }).catch(() => undefined);
+		return this.send({ type: "abort" }, 5_000);
 	}
 
 	abortRetry(): Promise<unknown> {
-		return this.send({ type: "abort_retry" }).catch(() => undefined);
+		return this.send({ type: "abort_retry" }, 5_000);
 	}
 
-	compact(customInstructions?: string): Promise<unknown> {
-		return this.send(customInstructions ? { type: "compact", customInstructions } : { type: "compact" });
+	compact(customInstructions?: string, signal?: AbortSignal): Promise<unknown> {
+		return this.send(
+			customInstructions ? { type: "compact", customInstructions } : { type: "compact" },
+			undefined,
+			signal,
+		);
 	}
 
 	getState(): Promise<Record<string, unknown>> {
@@ -319,10 +355,51 @@ export class RelayRpcClient {
 		return this.sendWithTimeout({ type: "get_session_stats" }, 10_000) as Promise<Record<string, unknown>>;
 	}
 
+	/**
+	 * Ask Pi's RPC server to flush and exit cleanly by closing stdin before
+	 * escalating to a tree kill if it does not exit within `timeoutMs`.
+	 */
+	async gracefulStop(timeoutMs = 1_500): Promise<void> {
+		const proc = this.proc;
+		this.exitListeners.clear();
+		if (!this.isProcessRunning(proc)) {
+			this.handleClose(null);
+			return;
+		}
+		if (this.alive) {
+			await this.send({ type: "abort" }, 1_000).catch(() => undefined);
+		}
+		this.handleClose(null);
+		if (!this.isProcessRunning(proc)) return;
+		await new Promise<void>((resolve) => {
+			let finished = false;
+			const done = () => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(timer);
+				proc.removeListener("close", done);
+				proc.removeListener("exit", done);
+				resolve();
+			};
+			const timer = setTimeout(() => {
+				this.killSync();
+				done();
+			}, timeoutMs);
+			proc.once("close", done);
+			proc.once("exit", done);
+			try {
+				proc.stdin?.end();
+			} catch {
+				this.killSync();
+				done();
+			}
+		});
+	}
+
 	kill(): void {
 		const proc = this.proc;
-		if (proc && proc.exitCode === null && !proc.killed) {
-			void this.abort();
+		if (this.isProcessRunning(proc)) {
+			void this.send({ type: "abort" }, 1_000).catch(() => undefined);
 			const pid = proc.pid;
 			try {
 				if (process.platform === "win32") {
@@ -333,7 +410,11 @@ export class RelayRpcClient {
 			} catch {
 				// Already gone.
 			}
+			const cancelTimer = () => clearTimeout(timer);
 			const timer = setTimeout(() => {
+				proc.removeListener("close", cancelTimer);
+				proc.removeListener("exit", cancelTimer);
+				if (!this.isProcessRunning(proc)) return;
 				try {
 					if (process.platform === "win32") {
 						if (pid !== undefined) taskkillTree(pid, true);
@@ -345,13 +426,15 @@ export class RelayRpcClient {
 				}
 			}, 1_500);
 			timer.unref?.();
+			proc.once("close", cancelTimer);
+			proc.once("exit", cancelTimer);
 		}
 		this.handleClose(null);
 	}
 
 	killSync(): void {
 		const proc = this.proc;
-		if (proc && proc.exitCode === null && !proc.killed) {
+		if (this.isProcessRunning(proc)) {
 			const pid = proc.pid;
 			try {
 				if (process.platform === "win32") {

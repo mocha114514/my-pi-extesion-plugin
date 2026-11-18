@@ -14,9 +14,29 @@
  */
 
 import { createHash } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { getCacheDir } from "../shared/paths.ts";
+
+/**
+ * Resolve a session file path into a stable filesystem-aware identity
+ * (handles un-flushed files via their parent dir and lowercases on Windows).
+ */
+function canonicalizeSessionFilePath(sessionFile: string): string {
+	const abs = resolve(sessionFile);
+	let canonical = abs;
+	try {
+		canonical = realpathSync.native?.(abs) ?? realpathSync(abs);
+	} catch {
+		try {
+			const realParent = realpathSync.native?.(dirname(abs)) ?? realpathSync(dirname(abs));
+			canonical = join(realParent, basename(abs));
+		} catch {
+			canonical = abs;
+		}
+	}
+	return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
 
 /**
  * Keep directory names filesystem-safe across platforms. Pure `[a-zA-Z0-9_-]`
@@ -25,9 +45,32 @@ import { getCacheDir } from "../shared/paths.ts";
  */
 export function sanitizeId(id: string): string {
 	const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, "_");
-	if (cleaned === id && cleaned.length > 0) return id;
+	if (cleaned === id && id.length > 0) return id;
 	const suffix = createHash("sha256").update(id).digest("hex").slice(0, 6);
 	return `${cleaned || "session"}-${suffix}`;
+}
+
+/**
+ * Derive an isolated cache directory key for the owning foreground session.
+ * - Persistent sessions hash the canonical `.jsonl` path so two projects using
+ *   the same custom `--session-id` never share or overwrite each other's worker,
+ *   and Windows path-casing variants always map to the same worker.
+ * - Ephemeral (`--no-session`) sessions receive a unique per-instance key so
+ *   closing one ephemeral run can never delete another session's saved worker.
+ */
+export function buildWorkerSessionKey(
+	sessionId: string,
+	sessionFile: string | undefined,
+	ephemeralToken?: string,
+): string {
+	const base = sanitizeId(sessionId);
+	if (sessionFile && sessionFile.trim()) {
+		const canonical = canonicalizeSessionFilePath(sessionFile.trim());
+		const fileHash = createHash("sha256").update(canonical).digest("hex").slice(0, 8);
+		return `${base}-${fileHash}`;
+	}
+	const token = ephemeralToken ? sanitizeId(ephemeralToken) : String(process.pid);
+	return `ephemeral-${base}-${token}`;
 }
 
 export function relayModeRoot(): string {
