@@ -56,7 +56,9 @@ export function registerSigintCleanup(callback: () => void): () => void {
 			}
 		};
 		reg.listener = handler;
-		process.on("SIGINT", handler);
+		// Prepend so MPEP runs before any earlier `process.once("SIGINT", ...)`
+		// listener is popped and invoked by Node's EventEmitter.
+		process.prependListener("SIGINT", handler);
 	}
 
 	return () => {

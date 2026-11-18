@@ -401,14 +401,20 @@ export class RelayRpcClient {
 				() => true,
 				() => false,
 			);
-			if (responsive && this.alive) {
-				// Request abort without blocking the responsiveness probe on tool teardown time.
-				void this.send({ type: "abort" }, 1_000).catch(() => undefined);
-			}
 		}
-		const waitMs = responsive ? responsiveTimeoutMs : unresponsiveTimeoutMs;
+		const totalBudgetMs = responsive ? responsiveTimeoutMs : unresponsiveTimeoutMs;
+		const deadline = Date.now() + totalBudgetMs;
+
+		// On Pi 0.85.1, stdin EOF calls dispose() without awaiting session.abort(),
+		// so wait for abort acknowledgement within the shared deadline before closing stdin.
+		if (responsive && this.alive) {
+			const abortBudgetMs = Math.min(5_000, Math.max(500, deadline - Date.now()));
+			await this.send({ type: "abort" }, abortBudgetMs).catch(() => undefined);
+		}
+
 		this.handleClose(null);
 		if (!this.isProcessRunning(proc)) return;
+		const remainingWaitMs = Math.max(500, deadline - Date.now());
 		await new Promise<void>((resolve) => {
 			let finished = false;
 			const done = () => {
@@ -422,7 +428,7 @@ export class RelayRpcClient {
 			const timer = setTimeout(() => {
 				this.killSync();
 				done();
-			}, waitMs);
+			}, remainingWaitMs);
 			proc.once("close", done);
 			proc.once("exit", done);
 			try {
