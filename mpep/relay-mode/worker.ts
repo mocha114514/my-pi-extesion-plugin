@@ -18,7 +18,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -190,7 +192,11 @@ function canonicalizeFsPath(targetPath: string): string {
 			}
 		}
 	}
-	return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+	// Preserve directory casing (Windows NTFS supports per-directory case
+	// sensitivity); normalize only Windows drive-letter casing.
+	return process.platform === "win32"
+		? canonical.replace(/^[A-Z]:/, (d) => d.toLowerCase())
+		: canonical;
 }
 
 function splitThinkingSuffix(spec: string): { base: string; suffix?: string } {
@@ -297,14 +303,34 @@ function normalizeWindowsShellPath(filePath: string): string {
 }
 
 function isSamePath(a: string, b: string): boolean {
-	const pa = path.resolve(a);
-	const pb = path.resolve(b);
-	return process.platform === "win32" ? pa.toLowerCase() === pb.toLowerCase() : pa === pb;
+	try {
+		const sa = fs.statSync(a, { bigint: true });
+		const sb = fs.statSync(b, { bigint: true });
+		if (sa.dev === sb.dev && sa.ino !== 0n && sa.ino === sb.ino) return true;
+	} catch {
+		// Fall back to canonical path comparison if one path does not exist.
+	}
+	return canonicalizeFsPath(a) === canonicalizeFsPath(b);
 }
 
 function resolveCliExtensionSource(source: string, launchCwd: string): string {
-	if (/^(?:npm|git|https?|ssh|builtin):/i.test(source)) return source;
-	const normalized = normalizeWindowsShellPath(source);
+	const trimmed = source.trim();
+	// Mirror Pi's `isLocalPath` + `resolvePath` rules (`utils/paths.ts`) so
+	// explicit `-e` flags resolve to the exact same target the foreground loaded.
+	if (/^(?:npm|git|github|https?|ssh|builtin):/i.test(trimmed)) return source;
+	let normalized = normalizeWindowsShellPath(trimmed);
+	const home = homedir();
+	if (normalized === "~") return home;
+	if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
+		return path.join(home, normalized.slice(2));
+	}
+	if (/^file:\/\//i.test(normalized)) {
+		try {
+			return fileURLToPath(normalized);
+		} catch {
+			return source;
+		}
+	}
 	if (path.isAbsolute(normalized)) return path.resolve(normalized);
 	if (/^\.{1,2}(?:[\\/]|$)/.test(normalized)) return path.resolve(launchCwd, normalized);
 	const candidate = path.resolve(launchCwd, normalized);
@@ -735,14 +761,18 @@ function isCompletedRebaseStage(
 	}
 }
 
-function fsyncDirectoryBestEffort(dirPath: string): void {
-	if (process.platform === "win32") return;
+function fsyncDirectoryBestEffort(dirPath: string): boolean {
+	if (process.platform === "win32") return true;
 	let dirFd: number | undefined;
 	try {
 		dirFd = fs.openSync(dirPath, "r");
 		fs.fsyncSync(dirFd);
-	} catch {
-		// Ignore platforms/filesystems that forbid directory fsync.
+		return true;
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		// Only treat unsupported directory sync errors as benign; propagate real
+		// writeback failures (EIO/ENOSPC/EDQUOT) as `false` so backups stay intact.
+		return code === "EINVAL" || code === "ENOTSUP" || code === "EBADF" || code === "EROFS" || code === "EACCES" || code === "EISDIR";
 	} finally {
 		if (dirFd !== undefined) {
 			const toClose = dirFd;
@@ -796,16 +826,12 @@ function recoverStaleRebaseBackups(
 			return { file: topMatches[0] };
 		}
 
-		let validTopFile: string | undefined;
-		let validTopEntryCount = 0;
+		const validTopCandidates: Array<{ path: string; entryCount: number }> = [];
 		const damagedTopFiles: string[] = [];
 		for (const f of topMatches) {
 			const check = validateJsonlFile(f, targetSessionId);
 			if (check.valid) {
-				if (!validTopFile) {
-					validTopFile = f;
-					validTopEntryCount = check.entryCount;
-				}
+				validTopCandidates.push({ path: f, entryCount: check.entryCount });
 			} else {
 				damagedTopFiles.push(f);
 			}
@@ -827,13 +853,15 @@ function recoverStaleRebaseBackups(
 			}
 		}
 
-		// If a live top-level file has fewer entries than a preserved rebase backup
-		// (e.g., truncated on a valid JSONL line boundary before durable publish),
-		// treat it as damaged so recovery restores the fuller backup.
-		if (validTopFile && validBackup && validTopEntryCount < validBackup.entryCount) {
-			damagedTopFiles.push(validTopFile);
-			validTopFile = undefined;
-			validTopEntryCount = 0;
+		// Check ALL validated live files (newest first) against any preserved backup
+		// before concluding no live transcript satisfies it.
+		let validTopFile: string | undefined;
+		for (const cand of validTopCandidates) {
+			if (!validBackup || cand.entryCount >= validBackup.entryCount) {
+				validTopFile = cand.path;
+				break;
+			}
+			damagedTopFiles.push(cand.path);
 		}
 
 		if (!validTopFile) {
@@ -1778,6 +1806,9 @@ export class RelayWorkerManager {
 						}
 					}
 					fs.rmSync(tmp, { force: true });
+					// Keep the provenance-bearing main lock intact if rollback write failed
+					// so the next owner can still read `migratedFromOwnerId`.
+					return;
 				}
 			}
 			this.releaseOwnedFile(this.lockPath);
@@ -1882,11 +1913,11 @@ export class RelayWorkerManager {
 			this.meta.sessionId = forked.getSessionId();
 			this.meta.cwd = this.cwd;
 			this.writeMeta(this.meta);
-			fsyncDirectoryBestEffort(this.dir);
+			const dirSynced = fsyncDirectoryBestEffort(this.dir);
 			// Only delete the original backup when the replacement is verified lossless
 			// (no source entries skipped by forkFrom) and synced to storage.
 			const lossless = sourceCheck.valid && stagedCheck.entryCount >= sourceCheck.entryCount;
-			if (lossless) {
+			if (lossless && dirSynced) {
 				fs.rmSync(backupFile, { force: true });
 			}
 			return {
@@ -1917,24 +1948,27 @@ export class RelayWorkerManager {
 		if (this.startupPromise) return this.startupPromise;
 
 		const gen = this.generation;
-		this.startupPromise = this.spawnProcess(gen).finally(() => {
-			this.startupPromise = undefined;
+		const promise = this.spawnProcess(gen).then(() => undefined).finally(() => {
+			if (this.startupPromise === promise) {
+				this.startupPromise = undefined;
+			}
 		});
-		return this.startupPromise;
+		this.startupPromise = promise;
+		return promise;
 	}
 
-	private async spawnProcess(expectedGen = this.generation, throwOnRefusal = false): Promise<void> {
-		if (this.disposed || expectedGen !== this.generation) return;
+	private async spawnProcess(expectedGen = this.generation, throwOnFailure = false): Promise<boolean> {
+		if (this.disposed || expectedGen !== this.generation) return false;
 		const stopped = await this.cleanupClient(false);
 		if (!stopped) {
 			const msg = "Previous worker process is still alive after stop timeout; refusing to spawn a second writer.";
 			this.meta.lastError = msg;
 			this.setStatus("error");
-			if (throwOnRefusal) throw new Error(msg);
+			if (throwOnFailure) throw new Error(msg);
 			this.hooks.onWakeup(`[Relay worker shutdown conflict] ${msg}`);
-			return;
+			return false;
 		}
-		if (this.disposed || expectedGen !== this.generation) return;
+		if (this.disposed || expectedGen !== this.generation) return false;
 
 		const lock = this.acquireOwnership();
 		if (!lock.ok) {
@@ -1942,9 +1976,9 @@ export class RelayWorkerManager {
 			const msg = `Another active Pi session${holderDesc} already owns this worker session directory; refusing concurrent start to protect session history.`;
 			this.meta.lastError = msg;
 			this.setStatus("error");
-			if (throwOnRefusal) throw new Error(msg);
+			if (throwOnFailure) throw new Error(msg);
 			this.hooks.onWakeup(`[Relay worker ownership conflict] ${msg}`);
-			return;
+			return false;
 		}
 		if (!lock.continuousOwnership) {
 			this.meta = this.loadOrInitMeta().meta;
@@ -1962,14 +1996,16 @@ export class RelayWorkerManager {
 
 		const sessionLookup = findExistingSessionFile(this.dir, this.meta.sessionId, true);
 		if (sessionLookup.recoveryBlocked) {
-			this.meta.lastError = sessionLookup.reason ?? "Preserved recoverable worker transcript artifacts on disk.";
+			const msg = sessionLookup.reason ?? "Preserved recoverable worker transcript artifacts on disk.";
+			this.meta.lastError = msg;
 			this.writeMeta(this.meta);
 			this.setStatus("error");
+			if (throwOnFailure) throw new Error(msg);
 			this.hooks.onWakeup(
-				`[Relay worker recovery blocked] ${this.meta.lastError} ` +
+				`[Relay worker recovery blocked] ${msg} ` +
 				`Inspect ${this.dir} to salvage history or run relay_control({ action: "reset" }) to explicitly start fresh.`,
 			);
-			return;
+			return false;
 		}
 		let existingFile = sessionLookup.file;
 		let sessionMatchesCwd = true;
@@ -1983,8 +2019,9 @@ export class RelayWorkerManager {
 				this.meta.lastError = `Failed to align worker session cwd: ${msg}`;
 				this.writeMeta(this.meta);
 				this.setStatus("error");
+				if (throwOnFailure) throw new Error(this.meta.lastError);
 				this.hooks.onWakeup(`[Relay worker cwd alignment failed] ${this.meta.lastError}`);
-				return;
+				return false;
 			}
 		}
 		// Never forward foreground project trust unless the worker session's actual cwd matches `this.cwd`.
@@ -2004,7 +2041,7 @@ export class RelayWorkerManager {
 		if (inherited.apiKeyCandidate && this.verifyApiKeyForProvider) {
 			const candidate = inherited.apiKeyCandidate;
 			const ok = await this.verifyApiKeyForProvider(candidate.provider, candidate.apiKey).catch(() => false);
-			if (this.disposed || expectedGen !== this.generation) return;
+			if (this.disposed || expectedGen !== this.generation) return false;
 			if (ok) {
 				inherited = buildInheritedCliArgs(
 					this.launchCwd,
@@ -2061,24 +2098,28 @@ export class RelayWorkerManager {
 			if (this.disposed || expectedGen !== this.generation || this.client !== client) {
 				if (this.startingClient === client) this.startingClient = undefined;
 				await client.gracefulStop().catch(() => client.killSync());
-				return;
+				return false;
 			}
 			this.startingClient = undefined;
 			await this.refreshStateFromRpc(client);
 			if (this.disposed || expectedGen !== this.generation || this.client !== client) {
 				await client.gracefulStop().catch(() => client.killSync());
-				return;
+				return false;
 			}
 			if (!client.alive || this.status === "crashed") {
-				return;
+				if (throwOnFailure) {
+					throw new Error(this.meta.lastError || "Worker exited during startup.");
+				}
+				return false;
 			}
 			this.setStatus("idle");
 			this.startHeartbeatMonitor();
+			return true;
 		} catch (error) {
 			if (this.startingClient === client) this.startingClient = undefined;
 			if (this.disposed || expectedGen !== this.generation || this.client !== client) {
 				await client.gracefulStop().catch(() => client.killSync());
-				return;
+				return false;
 			}
 			const rawStderr = client.stderrText().trim();
 			if (rawStderr) this.lastStderr = rawStderr;
@@ -2086,10 +2127,14 @@ export class RelayWorkerManager {
 			this.meta.lastError = msg;
 			this.writeMeta(this.meta);
 			this.setStatus("crashed");
+			if (throwOnFailure) {
+				throw new Error(msg);
+			}
 			this.hooks.onWakeup(
 				`[Relay worker startup failed] The background worker failed to start: ${msg}. ` +
 				`Inspect via relay_status or retry via relay_control({ action: "restart" }).`,
 			);
+			return false;
 		}
 	}
 
@@ -2595,17 +2640,24 @@ export class RelayWorkerManager {
 		return client;
 	}
 
+	private isClientConfirmedDead(client: RelayRpcClient): boolean {
+		// Honor an observed exit event from the owned child handle so OS PID
+		// reassignment cannot masquerade as a still-running worker.
+		if (client.hasExited()) return true;
+		const pid = client.pid();
+		return pid === undefined || !isPidAlive(pid);
+	}
+
 	private cleanupClientSync(): boolean {
 		const client = this.clearTimersAndDetach() ?? this.retiringClient;
 		if (!client) return true;
 		this.retiringClient = client;
-		const pid = client.pid();
 		try {
 			client.killSync();
 		} catch {
 			// Already terminated.
 		}
-		const dead = pid === undefined || !isPidAlive(pid);
+		const dead = this.isClientConfirmedDead(client);
 		if (dead) {
 			this.retiringClient = undefined;
 			this.updateLockWorkerPid(undefined);
@@ -2631,13 +2683,12 @@ export class RelayWorkerManager {
 		if (!client) return true;
 		this.retiringClient = client;
 		const stopPromise = (async (): Promise<boolean> => {
-			const pid = client.pid();
 			try {
 				await client.gracefulStop(gracefulTimeoutMs);
 			} catch {
 				client.killSync();
 			}
-			const confirmedDead = pid === undefined || !isPidAlive(pid);
+			const confirmedDead = this.isClientConfirmedDead(client);
 			if (confirmedDead) {
 				if (this.retiringClient === client) {
 					this.retiringClient = undefined;
@@ -2837,7 +2888,7 @@ export class RelayWorkerManager {
 				updatedAt: Date.now(),
 			};
 			this.writeMeta(this.meta);
-			await this.spawnProcess(gen);
+			await this.spawnProcess(gen, true);
 			this.assertActive(gen, signal);
 			return `Worker history reset; started fresh session ${this.meta.sessionId} (status: ${this.status}).`;
 		}
@@ -3017,18 +3068,63 @@ export class RelayWorkerManager {
 		void this.disposeAsync();
 	}
 
+	private spawnDetachedEphemeralReaper(workerPid: number, hadOwnership: boolean): void {
+		// Hand off owner-verified ephemeral cleanup to a detached helper process
+		// when the foreground TUI is about to call process.exit(0) while the
+		// killed worker OS process has not yet drained.
+		const script = [
+			'const fs = require("node:fs");',
+			'const [pidStr, ownerId, lockPath, legacyPath, dirPath, sessionDir, removeDir] = process.argv.slice(1);',
+			'const pid = Number(pidStr);',
+			'const alive = () => { try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === "EPERM"; } };',
+			'const ownerMatches = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")).ownerId === ownerId; } catch { return true; } };',
+			'let tries = 0;',
+			'const tick = () => {',
+			'  if (alive() && tries++ < 240) { setTimeout(tick, 250); return; }',
+			'  if (!ownerMatches(lockPath) || !ownerMatches(legacyPath)) return;',
+			'  if (removeDir === "1") { try { fs.rmSync(dirPath, { recursive: true, force: true }); } catch {} }',
+			'  try { if (ownerMatches(lockPath)) fs.rmSync(lockPath, { force: true }); } catch {}',
+			'  try { if (ownerMatches(legacyPath)) fs.rmSync(legacyPath, { force: true }); } catch {}',
+			'  if (removeDir === "1") { try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch {} }',
+			'};',
+			'tick();',
+		].join(" ");
+		try {
+			const helper = spawn(
+				process.execPath,
+				[
+					"-e",
+					script,
+					String(workerPid),
+					this.ownerId,
+					this.lockPath,
+					this.legacyLockPath,
+					this.dir,
+					mainSessionDir(this.storageKey),
+					hadOwnership ? "1" : "0",
+				],
+				{
+					detached: true,
+					stdio: "ignore",
+				},
+			);
+			helper.unref();
+		} catch {
+			// Best effort fallback; deferred in-process finalizer still covers reload/switch.
+		}
+	}
+
 	private scheduleDeferredDisposalFinalizer(hadOwnership: boolean): void {
 		if (this.deferredFinalizerStarted) return;
 		this.deferredFinalizerStarted = true;
 		const retiring = this.retiringClient;
-		const pid = retiring?.pid();
 		let finished = false;
 		let pollTimer: ReturnType<typeof setInterval> | undefined;
 		let detachExit: (() => void) | undefined;
 
 		const tryFinalize = () => {
 			if (finished) return;
-			if (pid !== undefined && isPidAlive(pid)) return;
+			if (retiring && !this.isClientConfirmedDead(retiring)) return;
 			finished = true;
 			if (pollTimer) {
 				clearInterval(pollTimer);
@@ -3071,10 +3167,21 @@ export class RelayWorkerManager {
 			this.generation += 1;
 		}
 		const hadOwnership = this.ownsDirectory;
-		const stopped = await this.cleanupClient(false, 15_000);
+		let stopped = await this.cleanupClient(false, 15_000);
+		if (!stopped && this.ephemeral && this.retiringClient) {
+			// Give a brief post-kill settle window for --no-session before quitting.
+			await new Promise((resolve) => setTimeout(resolve, 250));
+			stopped = this.isClientConfirmedDead(this.retiringClient);
+			if (stopped) {
+				this.retiringClient = undefined;
+				this.updateLockWorkerPid(undefined);
+			}
+		}
 		if (!stopped) {
-			// Keep lock files pointing at the still-live workerPid until it exits,
-			// then release our locks (and ephemeral temp dir) once it dies.
+			const pid = this.retiringClient?.pid();
+			if (this.ephemeral && pid !== undefined && this.retiringClient && !this.retiringClient.hasExited()) {
+				this.spawnDetachedEphemeralReaper(pid, hadOwnership);
+			}
 			this.scheduleDeferredDisposalFinalizer(hadOwnership);
 			return;
 		}

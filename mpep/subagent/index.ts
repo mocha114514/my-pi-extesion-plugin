@@ -710,6 +710,12 @@ export default function (pi: ExtensionAPI): void {
 				instance.abortInitiated = false;
 				agentConfig = discoverAgents().find((a) => a.name === instance!.meta.agent);
 				if (!instance.client || !instance.client.alive) {
+					if (instance.client && !instance.client.hasConfirmedExit()) {
+						instance.client.killSync();
+						if (!instance.client.hasConfirmedExit()) {
+							throw new Error(`Previous subagent process for "${instance.meta.id}" has not exited; refusing concurrent respawn.`);
+						}
+					}
 					if (!agentConfig) throw new Error(`Agent definition "${instance.meta.agent}" no longer exists; cannot respawn.`);
 					// Reserve synchronously BEFORE the async startup: pi executes tool
 					// calls in parallel, and two continuations of one instance must not

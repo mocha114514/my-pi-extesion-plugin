@@ -109,6 +109,11 @@ export class RelayRpcClient {
 		return this.proc?.pid;
 	}
 
+	hasExited(): boolean {
+		const proc = this.proc;
+		return this.processExited || !proc || proc.exitCode !== null || proc.signalCode !== null;
+	}
+
 	async start(onSpawn?: (pid: number) => void): Promise<void> {
 		const invocation = getPiInvocation(this.args);
 		const proc = spawn(invocation.command, invocation.args, {
@@ -406,8 +411,15 @@ export class RelayRpcClient {
 	 */
 	gracefulStop(responsiveTimeoutMs = 15_000, unresponsiveTimeoutMs = 2_000): Promise<void> {
 		if (this.stopPromise) return this.stopPromise;
-		this.stopPromise = this.performGracefulStop(responsiveTimeoutMs, unresponsiveTimeoutMs);
-		return this.stopPromise;
+		const promise = this.performGracefulStop(responsiveTimeoutMs, unresponsiveTimeoutMs).finally(() => {
+			// Cache only while in-flight so a retry can re-attempt stop if the child
+			// timed out without actually exiting.
+			if (this.stopPromise === promise) {
+				this.stopPromise = undefined;
+			}
+		});
+		this.stopPromise = promise;
+		return promise;
 	}
 
 	private async performGracefulStop(responsiveTimeoutMs: number, unresponsiveTimeoutMs: number): Promise<void> {
@@ -544,10 +556,11 @@ export class RelayRpcClient {
 
 	private collectUnixDescendants(
 		rootPid: number,
-	): { pids: Map<number, string>; pgids: Map<number, Set<number>> } {
+	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } {
 		const pids = new Map<number, string>();
 		const pgids = new Map<number, Set<number>>();
 		const rows = this.readUnixProcessTable();
+		const rootStartId = rows.find((r) => r.pid === rootPid)?.startId;
 		const byParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
 		for (const row of rows) {
 			let list = byParent.get(row.ppid);
@@ -574,13 +587,13 @@ export class RelayRpcClient {
 				queue.push(child.pid);
 			}
 		}
-		return { pids, pgids };
+		return { rootPid, rootStartId, pids, pgids };
 	}
 
 	private mergeUnixSnapshots(
-		a?: { pids: Map<number, string>; pgids: Map<number, Set<number>> },
-		b?: { pids: Map<number, string>; pgids: Map<number, Set<number>> },
-	): { pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
+		a?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
+		b?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
+	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
 		if (!a) return b;
 		if (!b) return a;
 		const pids = new Map(a.pids);
@@ -592,14 +605,19 @@ export class RelayRpcClient {
 			for (const p of set) target.add(p);
 			pgids.set(pgid, target);
 		}
-		return { pids, pgids };
+		return { rootPid: a.rootPid, rootStartId: b.rootStartId ?? a.rootStartId, pids, pgids };
 	}
 
-	private reapUnixSnapshot(snapshot: { pids: Map<number, string>; pgids: Map<number, Set<number>> }): void {
-		if (snapshot.pids.size === 0 && snapshot.pgids.size === 0) return;
+	private reapUnixSnapshot(snapshot: {
+		rootPid: number;
+		rootStartId?: string;
+		pids: Map<number, string>;
+		pgids: Map<number, Set<number>>;
+	}): void {
+		if (!snapshot.rootStartId && snapshot.pids.size === 0 && snapshot.pgids.size === 0) return;
 		// Re-verify process start times before signaling so recycled PIDs/PGIDs
-		// are never killed by mistake, and expand verified survivors to any new
-		// children they spawned after the snapshot was taken.
+		// are never killed by mistake, and expand verified survivors (including
+		// the verified root worker itself!) to any new children spawned after the scan.
 		const liveRows = this.readUnixProcessTable();
 		if (liveRows.length === 0) return;
 		const liveByPid = new Map<number, { ppid: number; pgid: number; startId: string }>();
@@ -623,11 +641,16 @@ export class RelayRpcClient {
 			}
 		}
 
-		// Seed verified survivor set with snapshotted PIDs whose startId matches,
-		// then walk live children spawned by those verified survivors.
+		// Seed verified survivor set with snapshotted PIDs AND the verified root PID.
 		const verifiedSurvivors = new Map<number, string>();
 		const verifiedPgids = new Set<number>();
 		const queue: number[] = [];
+		if (snapshot.rootStartId) {
+			const liveRoot = liveByPid.get(snapshot.rootPid);
+			if (liveRoot && liveRoot.startId === snapshot.rootStartId) {
+				queue.push(snapshot.rootPid);
+			}
+		}
 		for (const [pid, expectedStart] of snapshot.pids) {
 			const live = liveByPid.get(pid);
 			if (live && live.startId === expectedStart) {

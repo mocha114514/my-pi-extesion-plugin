@@ -208,7 +208,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	const runtimeCaps = detectPiRuntimeCapabilities();
-	const LEGACY_WAKE_POLICY_RE = /^<relay-mode-wakeup-policy>\n[\s\S]*?\n<\/relay-mode-wakeup-policy>\n\n/;
+	const LEGACY_WAKE_POLICY_RE = /^(?:<relay-mode-wakeup-policy>\n[\s\S]*?\n<\/relay-mode-wakeup-policy>\n\n)+/;
 
 	const sendWakeup = (rawContent: string) => {
 		if (!activeInSession) return;

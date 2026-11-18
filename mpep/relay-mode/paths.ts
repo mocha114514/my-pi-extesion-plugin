@@ -35,7 +35,11 @@ function canonicalizeSessionFilePath(sessionFile: string): string {
 			canonical = abs;
 		}
 	}
-	return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+	// Preserve directory/file casing (NTFS supports per-directory case sensitivity),
+	// normalizing only Windows drive letter case.
+	return process.platform === "win32"
+		? canonical.replace(/^[A-Z]:/, (d) => d.toLowerCase())
+		: canonical;
 }
 
 /**

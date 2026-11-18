@@ -364,12 +364,151 @@ export class RpcSubprocess {
 		return this.readUnixProcessTable().find((r) => r.pid === pid)?.startId;
 	}
 
+	private collectUnixTreeSnapshot(rootPid: number): { rootPid: number; rootStartId?: string; members: Map<number, string>; pgids: Set<number> } | null {
+		const initialRows = this.readUnixProcessTable();
+		if (initialRows.length === 0) return null;
+		const rootRow = initialRows.find((r) => r.pid === rootPid);
+		if (!rootRow) return null;
+		// Abort if ps proves the OS recycled rootPid since spawn.
+		if (this.rootStartId && rootRow.startId !== this.rootStartId) {
+			return { rootPid, rootStartId: undefined, members: new Map(), pgids: new Set() };
+		}
+		const byParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
+		for (const row of initialRows) {
+			let list = byParent.get(row.ppid);
+			if (!list) {
+				list = [];
+				byParent.set(row.ppid, list);
+			}
+			list.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
+		}
+		const members = new Map<number, string>();
+		const pgids = new Set<number>();
+		const queue = [rootPid];
+		members.set(rootPid, rootRow.startId);
+		pgids.add(rootPid);
+		// Also include any existing members of the child's process group.
+		for (const row of initialRows) {
+			if (row.pgid === rootPid && row.pid !== process.pid && !members.has(row.pid)) {
+				members.set(row.pid, row.startId);
+				queue.push(row.pid);
+			}
+		}
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			for (const child of byParent.get(cur) ?? []) {
+				if (child.pid === process.pid || members.has(child.pid)) continue;
+				members.set(child.pid, child.startId);
+				if (child.pgid > 0 && child.pgid !== process.pid) {
+					pgids.add(child.pgid);
+				}
+				queue.push(child.pid);
+			}
+		}
+		return { rootPid, rootStartId: rootRow.startId, members, pgids };
+	}
+
+	private reapVerifiedUnixSnapshot(
+		snapshot: { rootPid: number; rootStartId?: string; members: Map<number, string>; pgids: Set<number> },
+	): void {
+		if (snapshot.members.size === 0) return;
+		const verifyRows = this.readUnixProcessTable();
+		if (verifyRows.length === 0) return;
+		const liveByPid = new Map<number, { pgid: number; startId: string }>();
+		const liveByParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
+		const liveByPgid = new Map<number, number[]>();
+		for (const row of verifyRows) {
+			liveByPid.set(row.pid, { pgid: row.pgid, startId: row.startId });
+			let children = liveByParent.get(row.ppid);
+			if (!children) {
+				children = [];
+				liveByParent.set(row.ppid, children);
+			}
+			children.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
+			if (row.pgid > 0) {
+				let list = liveByPgid.get(row.pgid);
+				if (!list) {
+					list = [];
+					liveByPgid.set(row.pgid, list);
+				}
+				list.push(row.pid);
+			}
+		}
+
+		// Expand from all identity-verified survivors (including rootPid and group
+		// members) to catch newly forked children before checking PGIDs.
+		const verified = new Map<number, string>();
+		const verifiedPgids = new Set<number>(snapshot.pgids);
+		const queue: number[] = [];
+		for (const [pid, expectedStart] of snapshot.members) {
+			const live = liveByPid.get(pid);
+			if (live && live.startId === expectedStart) {
+				verified.set(pid, live.startId);
+				queue.push(pid);
+			}
+		}
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			for (const child of liveByParent.get(cur) ?? []) {
+				if (child.pid === process.pid || verified.has(child.pid)) continue;
+				verified.set(child.pid, child.startId);
+				if (child.pgid > 0 && child.pgid !== process.pid) {
+					verifiedPgids.add(child.pgid);
+				}
+				queue.push(child.pid);
+			}
+		}
+
+		for (const pgid of verifiedPgids) {
+			const members = liveByPgid.get(pgid) ?? [];
+			if (members.length === 0) continue;
+			const allVerified = members.every((m) => {
+				const expected = verified.get(m);
+				const live = liveByPid.get(m);
+				return Boolean(expected && live && live.startId === expected);
+			});
+			if (allVerified) {
+				try {
+					process.kill(-pgid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		}
+		for (const [pid, expectedStart] of verified) {
+			const live = liveByPid.get(pid);
+			if (!live || live.startId !== expectedStart) continue;
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+	}
+
+	hasConfirmedExit(): boolean {
+		const proc = this.proc;
+		if (this.exited || !proc || proc.exitCode !== null || proc.signalCode !== null) return true;
+		const pid = proc.pid;
+		if (pid === undefined) return true;
+		try {
+			process.kill(pid, 0);
+			return false;
+		} catch (err) {
+			return (err as NodeJS.ErrnoException).code !== "EPERM";
+		}
+	}
+
 	kill(): void {
 		const proc = this.proc;
 		if (this.isLiveChildProc(proc)) {
 			void this.abort();
 			const pid = proc.pid;
 			const capturedRootStartId = this.rootStartId;
+			const unixSnapshot =
+				process.platform !== "win32" && pid !== undefined
+					? this.collectUnixTreeSnapshot(pid)
+					: null;
 			try {
 				if (process.platform === "win32") {
 					if (pid !== undefined) taskkillTree(pid, false);
@@ -386,7 +525,9 @@ export class RpcSubprocess {
 					if (process.platform === "win32") {
 						if (pid !== undefined) taskkillTree(pid, true);
 					} else if (pid !== undefined) {
-						if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
+						if (unixSnapshot) {
+							this.reapVerifiedUnixSnapshot(unixSnapshot);
+						} else if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
 							process.kill(-pid, "SIGKILL");
 						}
 					}
@@ -405,85 +546,24 @@ export class RpcSubprocess {
 	 * exit). Blocks briefly; only ever called at teardown.
 	 */
 	private reapUnixDescendants(rootPid: number): void {
-		const initialRows = this.readUnixProcessTable();
-		const rootRow = initialRows.find((r) => r.pid === rootPid);
-		// Abort if the root PID already exited or was recycled since spawn.
-		if (!rootRow || (this.rootStartId && rootRow.startId !== this.rootStartId)) {
+		const snapshot = this.collectUnixTreeSnapshot(rootPid);
+		if (snapshot === null) {
+			// Process-table lookup unavailable or missed an active child handle: fall
+			// back to killing the owned child group/PID directly.
+			if (this.isLiveChildProc(this.proc)) {
+				try {
+					process.kill(-rootPid, "SIGKILL");
+				} catch {
+					try {
+						process.kill(rootPid, "SIGKILL");
+					} catch {
+						// Already gone.
+					}
+				}
+			}
 			return;
 		}
-		const byParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
-		for (const row of initialRows) {
-			let list = byParent.get(row.ppid);
-			if (!list) {
-				list = [];
-				byParent.set(row.ppid, list);
-			}
-			list.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
-		}
-		const pids = new Map<number, string>();
-		const pgids = new Set<number>();
-		const queue = [rootPid];
-		while (queue.length > 0) {
-			const cur = queue.shift()!;
-			for (const child of byParent.get(cur) ?? []) {
-				if (child.pid === process.pid || pids.has(child.pid)) continue;
-				pids.set(child.pid, child.startId);
-				if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
-					pgids.add(child.pgid);
-				}
-				queue.push(child.pid);
-			}
-		}
-
-		// Re-verify process start times right before signaling so recycled PIDs
-		// are never signalled.
-		const verifyRows = this.readUnixProcessTable();
-		const liveByPid = new Map<number, { pgid: number; startId: string }>();
-		const liveByPgid = new Map<number, number[]>();
-		for (const row of verifyRows) {
-			liveByPid.set(row.pid, { pgid: row.pgid, startId: row.startId });
-			if (row.pgid > 0) {
-				let list = liveByPgid.get(row.pgid);
-				if (!list) {
-					list = [];
-					liveByPgid.set(row.pgid, list);
-				}
-				list.push(row.pid);
-			}
-		}
-		for (const pgid of pgids) {
-			const members = liveByPgid.get(pgid) ?? [];
-			if (members.length === 0) continue;
-			const allVerified = members.every((m) => {
-				const expected = pids.get(m);
-				const live = liveByPid.get(m);
-				return Boolean(expected && live && live.startId === expected);
-			});
-			if (allVerified) {
-				try {
-					process.kill(-pgid, "SIGKILL");
-				} catch {
-					// Already gone.
-				}
-			}
-		}
-		for (const [pid, expectedStart] of pids) {
-			const live = liveByPid.get(pid);
-			if (!live || live.startId !== expectedStart) continue;
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {
-				// Already gone.
-			}
-		}
-		const liveRoot = liveByPid.get(rootPid);
-		if (liveRoot && (!this.rootStartId || liveRoot.startId === this.rootStartId)) {
-			try {
-				process.kill(-rootPid, "SIGKILL");
-			} catch {
-				// Already gone.
-			}
-		}
+		this.reapVerifiedUnixSnapshot(snapshot);
 	}
 
 	killSync(): void {
