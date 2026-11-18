@@ -438,7 +438,8 @@ export default function (pi: ExtensionAPI): void {
 					report("subagent running");
 				} else if (event.type === "tool_execution_update" || event.type === "turn_start" ||
 					event.type === "turn_end" || event.type === "auto_retry_start" ||
-					event.type === "auto_retry_end" || event.type === "auto_compaction_start" ||
+					event.type === "auto_retry_end" || event.type === "compaction_start" ||
+					event.type === "compaction_end" || event.type === "auto_compaction_start" ||
 					event.type === "auto_compaction_end") {
 					touchActivity();
 				} else if (event.type === "tool_execution_end") {
