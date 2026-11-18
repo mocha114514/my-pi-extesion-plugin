@@ -388,19 +388,21 @@ export default function (pi: ExtensionAPI): void {
 			let sawAgentEnd = false;
 			let idleStreak = 0;
 			let failStreak = 0;
-			let probes = 0;
-			const resetWatchdog = () => {
+			let lastActivityAt = Date.now();
+			const SILENCE_TIMEOUT_MS = 600_000;
+			const touchActivity = () => {
+				lastActivityAt = Date.now();
 				idleStreak = 0;
 				failStreak = 0;
-				probes = 0;
 			};
+			const hasTimedOutSilently = () => Date.now() - lastActivityAt >= SILENCE_TIMEOUT_MS;
 			const approvalRun = deleteApprovals.openRun({
 				instanceId: instance.meta.id,
 				agent: instance.meta.agent,
 				client,
 				isCurrent: () => pool?.get(instance.meta.id) === instance && instance.client === client &&
 					instance.meta.status === "running" && !instance.abortInitiated,
-				onPending: resetWatchdog,
+				onPending: touchActivity,
 			});
 			const pushToolItem = (text: string) => {
 				currentTextItem = "";
@@ -421,6 +423,7 @@ export default function (pi: ExtensionAPI): void {
 
 			const offEvent = client.onEvent((event) => {
 				if (event.type === "message_update") {
+					touchActivity();
 					const delta = (event.assistantMessageEvent as { type?: string; delta?: string } | undefined);
 					if (delta?.type === "text_delta" && typeof delta.delta === "string") {
 						currentTextItem += delta.delta;
@@ -430,13 +433,24 @@ export default function (pi: ExtensionAPI): void {
 						report("subagent running");
 					}
 				} else if (event.type === "tool_execution_start") {
+					touchActivity();
 					pushToolItem(formatToolCallItem(String(event.toolName ?? "?"), (event.args ?? {}) as Record<string, unknown>));
 					report("subagent running");
-				} else if (event.type === "tool_execution_end" && event.isError) {
-					instance.displayItems.push({ type: "toolResult", text: String(event.toolName ?? ""), isError: true });
+				} else if (event.type === "tool_execution_update" || event.type === "turn_start" ||
+					event.type === "turn_end" || event.type === "auto_retry_start" ||
+					event.type === "auto_retry_end" || event.type === "auto_compaction_start" ||
+					event.type === "auto_compaction_end") {
+					touchActivity();
+				} else if (event.type === "tool_execution_end") {
+					touchActivity();
+					if (event.isError) {
+						instance.displayItems.push({ type: "toolResult", text: String(event.toolName ?? ""), isError: true });
+					}
 				} else if (event.type === "agent_start") {
+					touchActivity();
 					sawRunStart = true;
 				} else if (event.type === "agent_end") {
+					touchActivity();
 					// NOT the finish line: retries and compaction continuations (e.g.
 					// the injected compact-forewarn) resume the child after agent_end.
 					// Accumulate usage per segment; the run truly ends at agent_settled.
@@ -451,6 +465,7 @@ export default function (pi: ExtensionAPI): void {
 					instance.usage.cost += segment.cost;
 					instance.usage.contextTokens = segment.contextTokens;
 				} else if (event.type === "agent_settled") {
+					touchActivity();
 					void confirmIdle();
 				}
 			});
@@ -462,11 +477,11 @@ export default function (pi: ExtensionAPI): void {
 			// poll loop is armed the moment the prompt is accepted: probe live state
 			// until the child is durably idle, then deliver. The no-run watchdog
 			// (20 idle probes without agent_start ~ 10s) frees command-only prompts;
-			// the probe cap guarantees delivery even if the child wedges, EXCEPT
-			// while awaiting an intentional, unbounded supervisor approval.
+			// a 600s heartbeat-silence timeout (refreshed on any live activity or
+			// pending approval) retires hung children without capping active runs.
 			const waitForApproval = () => {
 				if (!approvalRun.hasPending()) return false;
-				resetWatchdog();
+				touchActivity();
 				pollActive = false;
 				confirmIdle();
 				return true;
@@ -492,11 +507,17 @@ export default function (pi: ExtensionAPI): void {
 							failStreak = 0;
 							const busy = state.isStreaming || state.isCompacting || (state.pendingMessageCount ?? 0) > 0;
 							idleStreak = busy ? 0 : idleStreak + 1;
-							probes += 1;
 							const delivered = (sawAgentEnd && idleStreak >= 2) || (!sawRunStart && idleStreak >= 20);
-							if (!delivered && probes < 1200) {
-								pollActive = false;
-								confirmIdle();
+							if (!delivered) {
+								if (!hasTimedOutSilently()) {
+									pollActive = false;
+									confirmIdle();
+									return;
+								}
+								done = true;
+								cleanup();
+								client.killSync();
+								reject(new Error("subagent produced no activity for 600s (silent timeout)"));
 								return;
 							}
 						} catch {
@@ -508,8 +529,7 @@ export default function (pi: ExtensionAPI): void {
 							pollActive = false;
 							if (!client.alive) return;
 							failStreak += 1;
-							probes += 1;
-							if (failStreak < 3 && probes < 1200) {
+							if (failStreak < 3 && !hasTimedOutSilently()) {
 								confirmIdle();
 								return;
 							}
