@@ -86,6 +86,8 @@ export class RpcSubprocess {
 	private uiRequestHandler: RpcUIRequestHandler | undefined;
 	private seenUIRequests = new Set<string>();
 	private stderrTail: string[] = [];
+	private exited = false;
+	private rootStartId: string | undefined;
 	private readonly cwd: string;
 	private readonly args: string[];
 	private readonly env: Record<string, string> | undefined;
@@ -134,6 +136,10 @@ export class RpcSubprocess {
 		});
 		this.proc = proc;
 		this.alive = true;
+		this.exited = false;
+		if (process.platform !== "win32" && proc.pid !== undefined) {
+			this.rootStartId = this.readUnixStartId(proc.pid);
+		}
 
 		proc.stdout?.on("data", (chunk: Buffer) => this.handleData(this.stdoutDecoder.write(chunk)));
 		proc.stderr?.on("data", (chunk: Buffer) => {
@@ -145,8 +151,17 @@ export class RpcSubprocess {
 		proc.stdin?.on("error", () => {
 			if (this.alive) this.handleClose(null);
 		});
-		proc.on("error", () => this.handleClose(null));
-		proc.on("close", (code) => this.handleClose(code));
+		proc.on("exit", () => {
+			this.exited = true;
+		});
+		proc.on("error", () => {
+			this.exited = true;
+			this.handleClose(null);
+		});
+		proc.on("close", (code) => {
+			this.exited = true;
+			this.handleClose(code);
+		});
 
 		// The child must not hold the parent's event loop open: in print mode the
 		// main process exits right after the run even when an instance is kept
@@ -315,16 +330,53 @@ export class RpcSubprocess {
 	 * on a short fuse. Pending requests reject immediately via handleClose;
 	 * the escalation only concerns reaping the OS processes.
 	 */
+	private isLiveChildProc(proc: ChildProcess | null): proc is ChildProcess {
+		return Boolean(proc && !this.exited && proc.exitCode === null && proc.signalCode === null && !proc.killed);
+	}
+
+	private readUnixProcessTable(): Array<{ pid: number; ppid: number; pgid: number; startId: string }> {
+		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
+		if (!psBin) return [];
+		try {
+			const out = execFileSync(psBin, ["-eo", "pid=,ppid=,pgid=,lstart="], {
+				encoding: "utf-8",
+				timeout: 500,
+				env: { ...process.env, PATH: "/bin:/usr/bin" },
+			});
+			const rows: Array<{ pid: number; ppid: number; pgid: number; startId: string }> = [];
+			for (const line of out.split("\n")) {
+				const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+				if (!m) continue;
+				const pid = Number(m[1]);
+				const ppid = Number(m[2]);
+				const pgid = Number(m[3]);
+				const startId = m[4]!.trim();
+				if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || !startId) continue;
+				rows.push({ pid, ppid, pgid: Number.isInteger(pgid) && pgid > 0 ? pgid : 0, startId });
+			}
+			return rows;
+		} catch {
+			return [];
+		}
+	}
+
+	private readUnixStartId(pid: number): string | undefined {
+		return this.readUnixProcessTable().find((r) => r.pid === pid)?.startId;
+	}
+
 	kill(): void {
 		const proc = this.proc;
-		if (proc && proc.exitCode === null && !proc.killed) {
+		if (this.isLiveChildProc(proc)) {
 			void this.abort();
 			const pid = proc.pid;
+			const capturedRootStartId = this.rootStartId;
 			try {
 				if (process.platform === "win32") {
 					if (pid !== undefined) taskkillTree(pid, false);
 				} else if (pid !== undefined) {
-					process.kill(-pid, "SIGTERM"); // own process group (detached spawn)
+					if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
+						process.kill(-pid, "SIGTERM"); // own process group (detached spawn)
+					}
 				}
 			} catch {
 				// Already gone.
@@ -334,7 +386,9 @@ export class RpcSubprocess {
 					if (process.platform === "win32") {
 						if (pid !== undefined) taskkillTree(pid, true);
 					} else if (pid !== undefined) {
-						process.kill(-pid, "SIGKILL");
+						if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
+							process.kill(-pid, "SIGKILL");
+						}
 					}
 				} catch {
 					// Already gone.
@@ -351,77 +405,96 @@ export class RpcSubprocess {
 	 * exit). Blocks briefly; only ever called at teardown.
 	 */
 	private reapUnixDescendants(rootPid: number): void {
-		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
-		if (psBin) {
-			try {
-				const out = execFileSync(psBin, ["-eo", "pid=,ppid=,pgid="], {
-					encoding: "utf-8",
-					timeout: 500,
-					env: { ...process.env, PATH: "/bin:/usr/bin" },
-				});
-				const byParent = new Map<number, Array<{ pid: number; pgid: number }>>();
-				for (const line of out.split("\n")) {
-					const parts = line.trim().split(/\s+/);
-					if (parts.length < 3) continue;
-					const p = Number(parts[0]);
-					const pp = Number(parts[1]);
-					const pg = Number(parts[2]);
-					if (!Number.isInteger(p) || p <= 0 || !Number.isInteger(pp)) continue;
-					let list = byParent.get(pp);
-					if (!list) {
-						list = [];
-						byParent.set(pp, list);
-					}
-					list.push({ pid: p, pgid: Number.isInteger(pg) && pg > 0 ? pg : 0 });
+		const initialRows = this.readUnixProcessTable();
+		const rootRow = initialRows.find((r) => r.pid === rootPid);
+		// Abort if the root PID already exited or was recycled since spawn.
+		if (!rootRow || (this.rootStartId && rootRow.startId !== this.rootStartId)) {
+			return;
+		}
+		const byParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
+		for (const row of initialRows) {
+			let list = byParent.get(row.ppid);
+			if (!list) {
+				list = [];
+				byParent.set(row.ppid, list);
+			}
+			list.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
+		}
+		const pids = new Map<number, string>();
+		const pgids = new Set<number>();
+		const queue = [rootPid];
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			for (const child of byParent.get(cur) ?? []) {
+				if (child.pid === process.pid || pids.has(child.pid)) continue;
+				pids.set(child.pid, child.startId);
+				if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
+					pgids.add(child.pgid);
 				}
-				const pids = new Set<number>();
-				const pgids = new Set<number>();
-				const queue = [rootPid];
-				while (queue.length > 0) {
-					const cur = queue.shift()!;
-					for (const child of byParent.get(cur) ?? []) {
-						if (child.pid === process.pid || pids.has(child.pid)) continue;
-						pids.add(child.pid);
-						if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
-							pgids.add(child.pgid);
-						}
-						queue.push(child.pid);
-					}
-				}
-				for (const pgid of pgids) {
-					try {
-						process.kill(-pgid, "SIGKILL");
-					} catch {
-						// Already gone.
-					}
-				}
-				for (const pid of pids) {
-					try {
-						process.kill(pid, "SIGKILL");
-					} catch {
-						// Already gone.
-					}
-				}
-			} catch {
-				// Best effort descendant scan.
+				queue.push(child.pid);
 			}
 		}
-		try {
-			process.kill(-rootPid, "SIGKILL");
-		} catch {
-			// Already gone.
+
+		// Re-verify process start times right before signaling so recycled PIDs
+		// are never signalled.
+		const verifyRows = this.readUnixProcessTable();
+		const liveByPid = new Map<number, { pgid: number; startId: string }>();
+		const liveByPgid = new Map<number, number[]>();
+		for (const row of verifyRows) {
+			liveByPid.set(row.pid, { pgid: row.pgid, startId: row.startId });
+			if (row.pgid > 0) {
+				let list = liveByPgid.get(row.pgid);
+				if (!list) {
+					list = [];
+					liveByPgid.set(row.pgid, list);
+				}
+				list.push(row.pid);
+			}
+		}
+		for (const pgid of pgids) {
+			const members = liveByPgid.get(pgid) ?? [];
+			if (members.length === 0) continue;
+			const allVerified = members.every((m) => {
+				const expected = pids.get(m);
+				const live = liveByPid.get(m);
+				return Boolean(expected && live && live.startId === expected);
+			});
+			if (allVerified) {
+				try {
+					process.kill(-pgid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+		}
+		for (const [pid, expectedStart] of pids) {
+			const live = liveByPid.get(pid);
+			if (!live || live.startId !== expectedStart) continue;
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
+		}
+		const liveRoot = liveByPid.get(rootPid);
+		if (liveRoot && (!this.rootStartId || liveRoot.startId === this.rootStartId)) {
+			try {
+				process.kill(-rootPid, "SIGKILL");
+			} catch {
+				// Already gone.
+			}
 		}
 	}
 
 	killSync(): void {
 		const proc = this.proc;
-		if (proc && proc.exitCode === null && !proc.killed) {
+		if (this.isLiveChildProc(proc)) {
 			const pid = proc.pid;
 			try {
 				if (process.platform === "win32") {
 					if (pid !== undefined) {
 						const root = process.env.SystemRoot || "C:\\Windows";
-						spawnSync(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], { stdio: "ignore" });
+						spawnSync(path.join(root, "System32", "taskkill.exe"), ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", timeout: 3_000 });
 					}
 				} else if (pid !== undefined) {
 					this.reapUnixDescendants(pid);

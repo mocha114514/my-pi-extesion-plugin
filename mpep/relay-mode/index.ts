@@ -208,6 +208,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	const runtimeCaps = detectPiRuntimeCapabilities();
+	const LEGACY_WAKE_POLICY_RE = /^<relay-mode-wakeup-policy>\n[\s\S]*?\n<\/relay-mode-wakeup-policy>\n\n/;
 
 	const sendWakeup = (rawContent: string) => {
 		if (!activeInSession) return;
@@ -466,14 +467,28 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			}
 			return;
 		}
+		// Strip any legacy inline `<relay-mode-wakeup-policy>` blocks persisted by
+		// older revisions before optionally appending the current request-only policy.
+		let changed = false;
+		const cleaned = event.messages.map((msg) => {
+			const rec = msg as unknown as { role?: unknown; customType?: unknown; content?: unknown };
+			if (rec.role !== "custom" || rec.customType !== NOTICE_TYPE || typeof rec.content !== "string") {
+				return msg;
+			}
+			if (!LEGACY_WAKE_POLICY_RE.test(rec.content)) return msg;
+			changed = true;
+			return { ...msg, content: rec.content.replace(LEGACY_WAKE_POLICY_RE, "") } as typeof msg;
+		});
+		const baseMessages = changed ? cleaned : event.messages;
+
 		// On Pi 0.85.1, idle custom-message wake-up runs skip `before_agent_start`
-		// and clear prior system-prompt overrides at settle. Inject a request-only
-		// policy message for any run where `before_agent_start` did not execute,
-		// keeping persisted transcripts and compaction free of duplicated copies.
+		// and clear prior system-prompt overrides at `agent_settled`. Inject a
+		// request-only policy message for any run where `before_agent_start` did not
+		// execute, keeping persisted transcripts and compaction free of duplicated copies.
 		if (!runtimeCaps.runsBeforeAgentStartOnCustomWakeup && !promptHookActiveForRun && currentConfig?.relayPrompt) {
 			return {
 				messages: [
-					...event.messages,
+					...baseMessages,
 					{
 						role: "custom",
 						customType: NOTICE_TYPE,
@@ -483,6 +498,9 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 					} as typeof event.messages[number],
 				],
 			};
+		}
+		if (changed) {
+			return { messages: baseMessages };
 		}
 	});
 
@@ -503,7 +521,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("agent_end", () => {
+	pi.on("agent_settled", () => {
 		promptHookActiveForRun = false;
 	});
 

@@ -598,13 +598,21 @@ export class RelayRpcClient {
 	private reapUnixSnapshot(snapshot: { pids: Map<number, string>; pgids: Map<number, Set<number>> }): void {
 		if (snapshot.pids.size === 0 && snapshot.pgids.size === 0) return;
 		// Re-verify process start times before signaling so recycled PIDs/PGIDs
-		// are never killed by mistake.
+		// are never killed by mistake, and expand verified survivors to any new
+		// children they spawned after the snapshot was taken.
 		const liveRows = this.readUnixProcessTable();
 		if (liveRows.length === 0) return;
-		const liveByPid = new Map<number, { pgid: number; startId: string }>();
+		const liveByPid = new Map<number, { ppid: number; pgid: number; startId: string }>();
+		const liveByParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
 		const liveByPgid = new Map<number, number[]>();
 		for (const row of liveRows) {
-			liveByPid.set(row.pid, { pgid: row.pgid, startId: row.startId });
+			liveByPid.set(row.pid, { ppid: row.ppid, pgid: row.pgid, startId: row.startId });
+			let children = liveByParent.get(row.ppid);
+			if (!children) {
+				children = [];
+				liveByParent.set(row.ppid, children);
+			}
+			children.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
 			if (row.pgid > 0) {
 				let list = liveByPgid.get(row.pgid);
 				if (!list) {
@@ -615,11 +623,38 @@ export class RelayRpcClient {
 			}
 		}
 
+		// Seed verified survivor set with snapshotted PIDs whose startId matches,
+		// then walk live children spawned by those verified survivors.
+		const verifiedSurvivors = new Map<number, string>();
+		const verifiedPgids = new Set<number>();
+		const queue: number[] = [];
+		for (const [pid, expectedStart] of snapshot.pids) {
+			const live = liveByPid.get(pid);
+			if (live && live.startId === expectedStart) {
+				verifiedSurvivors.set(pid, live.startId);
+				queue.push(pid);
+			}
+		}
+		while (queue.length > 0) {
+			const cur = queue.shift()!;
+			for (const child of liveByParent.get(cur) ?? []) {
+				if (child.pid === process.pid || verifiedSurvivors.has(child.pid)) continue;
+				verifiedSurvivors.set(child.pid, child.startId);
+				if (child.pgid > 0 && child.pgid !== process.pid) {
+					verifiedPgids.add(child.pgid);
+				}
+				queue.push(child.pid);
+			}
+		}
 		for (const [pgid] of snapshot.pgids) {
+			verifiedPgids.add(pgid);
+		}
+
+		for (const pgid of verifiedPgids) {
 			const currentMembers = liveByPgid.get(pgid) ?? [];
 			if (currentMembers.length === 0) continue;
 			const allVerified = currentMembers.every((memberPid) => {
-				const expectedStart = snapshot.pids.get(memberPid);
+				const expectedStart = verifiedSurvivors.get(memberPid);
 				const live = liveByPid.get(memberPid);
 				return Boolean(expectedStart && live && live.startId === expectedStart);
 			});
@@ -631,7 +666,7 @@ export class RelayRpcClient {
 				}
 			}
 		}
-		for (const [pid, expectedStart] of snapshot.pids) {
+		for (const [pid, expectedStart] of verifiedSurvivors) {
 			const live = liveByPid.get(pid);
 			if (!live || live.startId !== expectedStart) continue;
 			try {
