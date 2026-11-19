@@ -525,7 +525,11 @@ export class RpcSubprocess {
 				} else if (pid !== undefined) {
 					const liveStartId = capturedRootStartId ? this.readUnixStartId(pid) : undefined;
 					if (!capturedRootStartId || liveStartId === undefined || liveStartId === capturedRootStartId) {
-						process.kill(-pid, "SIGTERM"); // own process group (detached spawn)
+						// When `ps` is unavailable (`unixSnapshot === null`), we cannot
+						// verify descendant identities after the leader exits; force-kill
+						// the process group immediately while Node still confirms `proc`
+						// owns `pid`, so surviving helpers cannot escape escalation.
+						process.kill(-pid, unixSnapshot === null ? "SIGKILL" : "SIGTERM");
 					}
 				}
 			} catch {

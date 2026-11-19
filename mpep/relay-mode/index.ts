@@ -39,7 +39,86 @@ import {
 
 const LAUNCH_CWD = process.cwd();
 const SLOT = Symbol.for("mpep.relay-mode.dispose.v1");
-const installations = globalThis as unknown as Record<symbol, (() => void) | undefined>;
+const RETIRING_SLOT = Symbol.for("mpep.relay-mode.retiring.v1");
+const WORKER_APIS_SLOT = Symbol.for("mpep.relay-mode.worker-apis.v1");
+
+interface SharedLifecycleState {
+	active: RelayWorkerManager | undefined;
+	retiring: Set<RelayWorkerManager>;
+	exitHookAttached: boolean;
+	unregisterSigint: (() => void) | undefined;
+}
+
+const globals = globalThis as unknown as Record<symbol, unknown>;
+const installations = globals as Record<symbol, (() => void) | undefined>;
+const registeredWorkerApis = (globals[WORKER_APIS_SLOT] ??= new WeakSet<object>()) as WeakSet<object>;
+
+function getSharedLifecycle(): SharedLifecycleState {
+	let state = globals[RETIRING_SLOT] as SharedLifecycleState | undefined;
+	if (!state) {
+		state = {
+			active: undefined,
+			retiring: new Set<RelayWorkerManager>(),
+			exitHookAttached: false,
+			unregisterSigint: undefined,
+		};
+		globals[RETIRING_SLOT] = state;
+	}
+	return state;
+}
+
+function maybeDetachGlobalSignalHandlers(): void {
+	const state = getSharedLifecycle();
+	if (state.active || state.retiring.size > 0 || !state.exitHookAttached) return;
+	state.exitHookAttached = false;
+	process.off("exit", disposeAllGlobalWorkersSync);
+	state.unregisterSigint?.();
+	state.unregisterSigint = undefined;
+}
+
+function trackGlobalRetiringWorker(target: RelayWorkerManager): void {
+	const state = getSharedLifecycle();
+	if (target.isCleanupCompleted()) {
+		state.retiring.delete(target);
+		maybeDetachGlobalSignalHandlers();
+		return;
+	}
+	state.retiring.add(target);
+	attachGlobalSignalHandlers();
+	target.onCleanupComplete(() => {
+		state.retiring.delete(target);
+		maybeDetachGlobalSignalHandlers();
+	});
+}
+
+function disposeAllGlobalWorkersSync(): void {
+	const state = getSharedLifecycle();
+	const targets = new Set<RelayWorkerManager>(state.retiring);
+	if (state.active) {
+		targets.add(state.active);
+		state.active = undefined;
+	}
+	for (const target of targets) {
+		target.dispose(true);
+		if (target.isCleanupCompleted()) {
+			state.retiring.delete(target);
+		} else {
+			// Retain surviving workers across `/reload` until confirmed dead and
+			// unlocked so process exit/SIGINT can still run final teardown.
+			trackGlobalRetiringWorker(target);
+		}
+	}
+	maybeDetachGlobalSignalHandlers();
+}
+
+function attachGlobalSignalHandlers(): void {
+	const state = getSharedLifecycle();
+	if (state.exitHookAttached) return;
+	state.exitHookAttached = true;
+	process.on("exit", disposeAllGlobalWorkersSync);
+	state.unregisterSigint = registerSigintCleanup(disposeAllGlobalWorkersSync);
+}
+
 const COMPACT_PENDING_SLOT = Symbol.for("mpep.compact-forewarn.pending");
 const DEFAULT_RESERVE_TOKENS = 16_384;
 const REMIND_TYPE = "mpep-relay-remind";
@@ -139,12 +218,14 @@ function buildPeriodicReminderMessage(remindPrompt: string, reason: string, issu
 
 export default function relayModeExtension(pi: ExtensionAPI): void {
 	if (process.env[RELAY_WORKER_ENV] === "1") {
-		const trustedCwd = process.env[RELAY_TRUSTED_CWD_ENV]?.trim();
-		if (trustedCwd) {
+		if (registeredWorkerApis.has(pi as unknown as object)) return;
+		registeredWorkerApis.add(pi as unknown as object);
+		const trustedCwd = process.env[RELAY_TRUSTED_CWD_ENV];
+		if (trustedCwd && trustedCwd.length > 0) {
 			// Scope inherited foreground project trust strictly to the exact
-			// foreground cwd rather than using a process-wide `--approve`, so
-			// switching sessions into an untrusted directory inside the worker
-			// still honors that destination's trust decision.
+			// foreground cwd (preserving trailing whitespace on POSIX) rather than
+			// passing a process-wide `--approve`, so switching sessions into an
+			// untrusted directory inside the worker still honors its trust decision.
 			pi.on("project_trust", (event) => {
 				if (event.cwd && isSamePath(event.cwd, trustedCwd)) {
 					return { trusted: "yes", remember: false };
@@ -198,7 +279,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	let currentCtx: ExtensionContext | undefined;
 	let currentConfig: RelayConfig | undefined;
 	let worker: RelayWorkerManager | undefined;
-	const retiringWorkers = new Set<RelayWorkerManager>();
 	let milestones: number[] = [];
 	const firedMilestones = new Set<number>();
 	let pendingResumeNotice: string | undefined;
@@ -298,25 +378,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		);
 	};
 
-	let exitHookAttached = false;
-	let unregisterSigint: (() => void) | undefined;
-	const onExitSync = () => {
-		disposeWorkerSync();
-	};
-	const attachSignalHandlers = () => {
-		if (exitHookAttached) return;
-		exitHookAttached = true;
-		process.on("exit", onExitSync);
-		unregisterSigint = registerSigintCleanup(disposeWorkerSync);
-	};
-	const detachSignalHandlers = () => {
-		if (!exitHookAttached) return;
-		exitHookAttached = false;
-		process.off("exit", onExitSync);
-		unregisterSigint?.();
-		unregisterSigint = undefined;
-	};
-
 	let sessionStartSeq = 0;
 
 	const clearPendingUiAndTimers = () => {
@@ -331,35 +392,21 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		heldNotices.length = 0;
 	};
 
-	const maybeDetachSignalHandlers = () => {
-		if (!worker && retiringWorkers.size === 0) {
-			detachSignalHandlers();
-		}
-	};
-
-	const trackRetiringWorker = (old: RelayWorkerManager) => {
-		if (old.isCleanupCompleted()) {
-			maybeDetachSignalHandlers();
-			return;
-		}
-		retiringWorkers.add(old);
-		old.onCleanupComplete(() => {
-			retiringWorkers.delete(old);
-			maybeDetachSignalHandlers();
-		});
-	};
-
 	const disposeWorkerSync = () => {
 		clearPendingUiAndTimers();
-		detachSignalHandlers();
 		const active = worker;
 		worker = undefined;
-		const targets = new Set<RelayWorkerManager>(retiringWorkers);
-		if (active) targets.add(active);
-		retiringWorkers.clear();
-		for (const target of targets) {
-			target.dispose(true);
+		const shared = getSharedLifecycle();
+		if (active && shared.active === active) {
+			shared.active = undefined;
 		}
+		if (active) {
+			active.dispose(true);
+			if (!active.isCleanupCompleted()) {
+				trackGlobalRetiringWorker(active);
+			}
+		}
+		disposeAllGlobalWorkersSync();
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
@@ -368,11 +415,15 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		clearPendingUiAndTimers();
 		const old = worker;
 		worker = undefined;
+		const shared = getSharedLifecycle();
+		if (old && shared.active === old) {
+			shared.active = undefined;
+		}
 		if (old) {
-			trackRetiringWorker(old);
+			trackGlobalRetiringWorker(old);
 			await old.disposeAsync();
 		}
-		maybeDetachSignalHandlers();
+		maybeDetachGlobalSignalHandlers();
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
@@ -386,6 +437,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const prev = worker;
 		clearPendingUiAndTimers();
 		worker = undefined;
+		const shared = getSharedLifecycle();
+		if (prev && shared.active === prev) {
+			shared.active = undefined;
+		}
 		updateRelayStatusBar(ctx, undefined);
 
 		currentCtx = ctx;
@@ -394,11 +449,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		treeNavInFlight = false;
 
 		if (prev) {
-			trackRetiringWorker(prev);
+			trackGlobalRetiringWorker(prev);
 			await prev.disposeAsync();
 			if (seq !== sessionStartSeq) return;
 		}
-		maybeDetachSignalHandlers();
+		maybeDetachGlobalSignalHandlers();
 
 		if (!ctx.hasUI || ctx.mode !== "tui") {
 			activeInSession = false;
@@ -488,7 +543,8 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			sessionFile,
 		);
 		worker = instance;
-		attachSignalHandlers();
+		getSharedLifecycle().active = instance;
+		attachGlobalSignalHandlers();
 		updateRelayStatusBar(ctx, instance.getSnapshot());
 		void instance.start();
 

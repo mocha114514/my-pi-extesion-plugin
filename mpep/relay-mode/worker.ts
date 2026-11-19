@@ -318,6 +318,11 @@ function normalizeWindowsShellPath(filePath: string): string {
 	return `${match[1]!.toUpperCase()}:\\${suffix}`;
 }
 
+function isPathInsideDir(targetPath: string, baseDir: string): boolean {
+	const rel = path.relative(canonicalizeFsPath(baseDir), canonicalizeFsPath(targetPath));
+	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 export function isSamePath(a: string, b: string): boolean {
 	try {
 		const sa = fs.statSync(a, { bigint: true });
@@ -384,9 +389,15 @@ export function buildInheritedCliArgs(
 	inheritModelId: string | undefined,
 	availableModels: readonly ModelDescriptor[],
 	verifiedApiKeyProvider?: string,
-): { args: string[]; modelPinnedByArgs: boolean; apiKeyCandidate?: { provider: string; apiKey: string } } {
+): {
+	args: string[];
+	trailingFlags: string[];
+	modelPinnedByArgs: boolean;
+	apiKeyCandidate?: { provider: string; apiKey: string };
+} {
 	const argv = process.argv.slice(2);
 	const args: string[] = [];
+	const trailingFlags: string[] = [];
 	let cliTrust: "--approve" | "--no-approve" | undefined;
 	let noExtensions = false;
 	const extensions: string[] = [];
@@ -413,6 +424,35 @@ export function buildInheritedCliArgs(
 		"--append-system-prompt",
 		"--name",
 		"-n",
+		"--session",
+		"--session-id",
+		"--fork",
+		"--session-dir",
+		"--thinking",
+		"--export",
+		"--theme",
+		"--use-theme",
+		"--tui-mode",
+	]);
+
+	// Built-in value-taking long flags that fall through to Pi's `unknownFlags`
+	// ONLY when they appear bare at the very end of `argv`. Keep them in
+	// `trailingFlags` so appended worker flags (`--model`, `--thinking`, `-e`)
+	// never get consumed as their value.
+	const BUILTIN_VALUE_LONG_FLAGS = new Set([
+		"--tools",
+		"--exclude-tools",
+		"--extension",
+		"--skill",
+		"--prompt-template",
+		"--api-key",
+		"--provider",
+		"--model",
+		"--models",
+		"--mode",
+		"--system-prompt",
+		"--append-system-prompt",
+		"--name",
 		"--session",
 		"--session-id",
 		"--fork",
@@ -487,12 +527,18 @@ export function buildInheritedCliArgs(
 		} else if (BUILTIN_NO_ARG_FLAGS.has(arg)) {
 			continue;
 		} else if (BUILTIN_VALUE_SKIP_FLAGS.has(arg)) {
-			if (i + 1 < argv.length) i++;
+			if (i + 1 < argv.length) {
+				i++;
+			} else if (arg.startsWith("--") && BUILTIN_VALUE_LONG_FLAGS.has(arg)) {
+				trailingFlags.push(arg);
+			}
 		} else if (arg.startsWith("--")) {
 			// Forward extension-registered flags (including `--extension=...`, `--skill=...`,
 			// `--ssh`, `--plan`) identically to Pi's parseArgs.
 			if (arg.includes("=")) {
 				args.push(arg);
+			} else if (BUILTIN_VALUE_LONG_FLAGS.has(arg) && i === argv.length - 1) {
+				trailingFlags.push(arg);
 			} else {
 				args.push(arg);
 				const next = argv[i + 1];
@@ -519,7 +565,17 @@ export function buildInheritedCliArgs(
 
 	// Whenever CLI extension flags override default discovery, explicitly ensure
 	// delete-guard, turn-notify, and relay-mode's worker helper load cleanly.
+	// Also explicitly load relay-mode's worker helper whenever scoped interactive
+	// trust (`projectTrusted === true` without `--approve`) is needed, so even
+	// project-local MPEP installations participate in Pi's pre-trust bootstrap.
 	const mpepRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+	const rmEntry = path.join(mpepRoot, "relay-mode", "index.ts");
+	const rmDir = path.join(mpepRoot, "relay-mode");
+	const needsExplicitRelayHelper =
+		noExtensions ||
+		extensions.length > 0 ||
+		(projectTrusted === true && !args.includes("--approve"));
+
 	if (noExtensions || extensions.length > 0) {
 		if (isPluginEnabled("delete-guard")) {
 			const dgEntry = path.join(mpepRoot, "delete-guard", "index.ts");
@@ -535,8 +591,8 @@ export function buildInheritedCliArgs(
 				args.push("-e", tnEntry);
 			}
 		}
-		const rmEntry = path.join(mpepRoot, "relay-mode", "index.ts");
-		const rmDir = path.join(mpepRoot, "relay-mode");
+	}
+	if (needsExplicitRelayHelper) {
 		if (!extensions.some((ext) => path.isAbsolute(ext) && (isSamePath(ext, rmEntry) || isSamePath(ext, rmDir)))) {
 			args.push("-e", rmEntry);
 		}
@@ -576,7 +632,7 @@ export function buildInheritedCliArgs(
 		}
 	}
 
-	return { args, modelPinnedByArgs, apiKeyCandidate };
+	return { args, trailingFlags, modelPinnedByArgs, apiKeyCandidate };
 }
 
 function formatToolCallSummary(toolName: string, args: Record<string, unknown>): string {
@@ -842,8 +898,15 @@ export function recoverStaleRebaseBackups(
 		);
 		const topMatches = findMatchingTopLevelJsonls(dir, targetSessionId);
 
-		// Fast path ONLY for a single unambiguous transcript with no staging or backup competition.
-		if (!hasStaging && !hasMatchingBackups && topMatches.length === 1) {
+		// Fast path ONLY for a single unambiguous transcript whose first-line
+		// session header ID actually matches targetSessionId, with no staging
+		// or backup competition.
+		if (
+			!hasStaging &&
+			!hasMatchingBackups &&
+			topMatches.length === 1 &&
+			readSessionHeader(topMatches[0]!)?.id === targetSessionId
+		) {
 			return { file: topMatches[0] };
 		}
 
@@ -973,9 +1036,9 @@ export function recoverStaleRebaseBackups(
 			}
 		}
 
-		// Prune `.rebase-*` ONLY when it holds no non-empty transcript for ANY
-		// other session (protecting against stale `meta.json` disagreeing with
-		// the only staged transcript), and when `!validTopFile` preserve every
+		// Prune `.rebase-*` ONLY when every non-empty `.jsonl` inside it has a
+		// verified session header matching `targetSessionId` (never trusting
+		// filename substrings alone), and when `!validTopFile` preserve every
 		// non-empty staged/backup transcript artifact on disk.
 		let hasSalvageableArtifacts = false;
 		for (const name of fs.readdirSync(dir)) {
@@ -987,8 +1050,8 @@ export function recoverStaleRebaseBackups(
 						if (!sub.endsWith(".jsonl")) continue;
 						const full = path.join(subDir, sub);
 						if (fs.statSync(full).size === 0) continue;
-						const matchesTarget = fileMatchesSessionId(full, targetSessionId);
-						if (!validTopFile || !matchesTarget) {
+						const headerMatchesTarget = readSessionHeader(full)?.id === targetSessionId;
+						if (!validTopFile || !headerMatchesTarget) {
 							keepDir = true;
 							if (!validTopFile) hasSalvageableArtifacts = true;
 							break;
@@ -1171,6 +1234,7 @@ export class RelayWorkerManager {
 	private hasTrackedLockAttempt = false;
 	private migrationBlocked = false;
 	private migrationBlockedHolderPid: number | undefined;
+	private externalSessionWarnedFor: string | undefined;
 	private sessionIdentityConflict: string | undefined;
 
 	readonly isResumedSession: boolean;
@@ -1328,7 +1392,15 @@ export class RelayWorkerManager {
 			this.migrationBlockedHolderPid = undefined;
 			return true;
 		} catch {
-			// Non-fatal unless blocked by live owner; release legacy lock below.
+			// If legacy directory still exists and target has not been created
+			// (e.g. transient Windows AV/index lock during renameSync), keep
+			// migration blocked so we do not create a fresh empty target dir
+			// and strand legacy history; acquireOwnership() will retry.
+			if (fs.existsSync(legacySession) && !fs.existsSync(targetSession)) {
+				this.migrationBlocked = true;
+				this.migrationBlockedHolderPid = undefined;
+				return false;
+			}
 			return true;
 		} finally {
 			if (!migrated) {
@@ -1336,6 +1408,48 @@ export class RelayWorkerManager {
 				this.releaseOwnedFile(legacyLock);
 			}
 		}
+	}
+
+	/** Read-only check verifying existing worker directory does not belong to another foreground session. */
+	private checkExistingSessionIdentityConflict(): string | undefined {
+		const metaPath = path.join(this.dir, META_FILE);
+		try {
+			const parsed = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Partial<WorkerMeta>;
+			if (typeof parsed.sessionId === "string" && parsed.sessionId.trim()) {
+				const parsedMainFile =
+					typeof parsed.mainSessionFile === "string" && parsed.mainSessionFile.trim()
+						? parsed.mainSessionFile
+						: undefined;
+				if (
+					parsedMainFile &&
+					this.mainSessionFile &&
+					canonicalizeFsPath(parsedMainFile) !== canonicalizeFsPath(this.mainSessionFile)
+				) {
+					return `Existing worker directory belongs to a different foreground session file (${parsedMainFile}); refusing to overwrite its history.`;
+				}
+				if (
+					!parsedMainFile &&
+					!this.ephemeral &&
+					this.mainSessionFile &&
+					(this.hasWindowsCaseCollision(this.mainSessionFile) || this.hasWindowsCaseCollision(this.cwd))
+				) {
+					return "Existing legacy worker directory lacks foreground session file identity while case-distinct Windows paths exist; refusing ambiguous reuse.";
+				}
+				return undefined;
+			}
+		} catch {
+			// Fall through to orphan transcript ambiguity check.
+		}
+		const orphan = discoverOrphanSession(this.dir);
+		if (
+			orphan &&
+			!this.ephemeral &&
+			this.mainSessionFile &&
+			(this.hasWindowsCaseCollision(this.mainSessionFile) || this.hasWindowsCaseCollision(this.cwd))
+		) {
+			return "Existing orphaned worker transcript lacks foreground session file identity while case-distinct Windows paths exist; refusing ambiguous reuse.";
+		}
+		return undefined;
 	}
 
 	private loadOrInitMeta(): { meta: WorkerMeta; resumed: boolean } {
@@ -1355,6 +1469,7 @@ export class RelayWorkerManager {
 			};
 		}
 		fs.mkdirSync(this.dir, { recursive: true });
+		this.sessionIdentityConflict = this.checkExistingSessionIdentityConflict();
 		const metaPath = path.join(this.dir, META_FILE);
 		try {
 			const parsed = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Partial<WorkerMeta>;
@@ -1368,21 +1483,6 @@ export class RelayWorkerManager {
 					typeof parsed.mainSessionFile === "string" && parsed.mainSessionFile.trim()
 						? parsed.mainSessionFile
 						: undefined;
-				if (parsedMainFile && this.mainSessionFile &&
-					canonicalizeFsPath(parsedMainFile) !== canonicalizeFsPath(this.mainSessionFile)) {
-					this.sessionIdentityConflict =
-						`Existing worker directory belongs to a different foreground session file (${parsedMainFile}); refusing to overwrite its history.`;
-				} else if (
-					!parsedMainFile &&
-					!this.ephemeral &&
-					this.mainSessionFile &&
-					(this.hasWindowsCaseCollision(this.mainSessionFile) || this.hasWindowsCaseCollision(this.cwd))
-				) {
-					// Legacy worker metadata without `mainSessionFile` is ambiguous when
-					// case-distinct Windows paths exist along the full ancestor chain.
-					this.sessionIdentityConflict =
-						"Existing legacy worker directory lacks foreground session file identity while case-distinct Windows paths exist; refusing ambiguous reuse.";
-				}
 				const savedCwd = typeof parsed.cwd === "string" ? parsed.cwd : this.cwd;
 				// Follow foreground cwd if Pi resumed into a replacement directory after the old one vanished.
 				const effectiveCwd = savedCwd !== this.cwd ? this.cwd : savedCwd;
@@ -1406,13 +1506,13 @@ export class RelayWorkerManager {
 			const meta: WorkerMeta = {
 				sessionId: orphan.sessionId,
 				cwd: this.cwd,
-				mainSessionFile: this.mainSessionFile,
+				mainSessionFile: this.sessionIdentityConflict ? undefined : this.mainSessionFile,
 				model: this.config.model ?? this.inheritModel,
 				thinking: this.config.thinking ?? this.inheritThinking,
 				createdAt: Date.now(),
 				updatedAt: Date.now(),
 			};
-			return { meta, resumed: true };
+			return { meta, resumed: !this.sessionIdentityConflict };
 		}
 		const meta: WorkerMeta = {
 			sessionId: randomUUID(),
@@ -2264,6 +2364,7 @@ export class RelayWorkerManager {
 		}
 		if (this.sessionIdentityConflict) {
 			const msg = this.sessionIdentityConflict;
+			this.releaseOwnership();
 			this.meta.lastError = msg;
 			this.setStatus("error");
 			if (throwOnFailure) throw new Error(msg);
@@ -2356,6 +2457,7 @@ export class RelayWorkerManager {
 		this.meta.thinking = thinking;
 		if (model && !inherited.modelPinnedByArgs) args.push("--model", model);
 		if (thinking) args.push("--thinking", thinking);
+		if (inherited.trailingFlags.length > 0) args.push(...inherited.trailingFlags);
 		this.writeMeta(this.meta);
 
 		const caps = detectPiRuntimeCapabilities();
@@ -2441,6 +2543,25 @@ export class RelayWorkerManager {
 		try {
 			const state = await client.getState();
 			if (this.client !== client) return;
+			const reportedSessionId =
+				typeof state.sessionId === "string" && state.sessionId.trim() ? state.sessionId.trim() : undefined;
+			const reportedSessionFile =
+				typeof state.sessionFile === "string" && state.sessionFile.trim() ? state.sessionFile.trim() : undefined;
+			if (reportedSessionFile && !isPathInsideDir(reportedSessionFile, this.dir)) {
+				const warningKey = `${reportedSessionId ?? ""}:${reportedSessionFile}`;
+				const msg =
+					`Worker switched to an external session outside its isolated directory (${reportedSessionFile}); ` +
+					`restart will return to the isolated relay session.`;
+				this.meta.lastError = msg;
+				if (this.externalSessionWarnedFor !== warningKey) {
+					this.externalSessionWarnedFor = warningKey;
+					this.hooks.onWakeup(`[Relay worker session drift] ${msg}`);
+				}
+			} else if (reportedSessionId && reportedSessionId !== this.meta.sessionId) {
+				this.externalSessionWarnedFor = undefined;
+				this.meta.sessionId = reportedSessionId;
+				this.writeMeta(this.meta);
+			}
 			const modelObj = state.model as { provider?: unknown; id?: unknown; contextWindow?: unknown } | undefined;
 			if (modelObj && typeof modelObj.provider === "string" && typeof modelObj.id === "string") {
 				this.meta.model = `${modelObj.provider}/${modelObj.id}`;
@@ -2567,6 +2688,16 @@ export class RelayWorkerManager {
 				this.activeTools.set(callKey, summary);
 				this.pushActivity({ type: "toolCall", text: summary });
 				this.hooks.onStateChange();
+				// Refresh Unix process-tree snapshot shortly after tool spawn so
+				// detached Bash subtrees can still be verified and reaped if the
+				// worker exits unexpectedly.
+				client.refreshUnixSnapshotAsync();
+				const snapTimer = setTimeout(() => {
+					if (this.client === client && !this.disposed) {
+						client.refreshUnixSnapshotAsync();
+					}
+				}, 100);
+				snapTimer.unref?.();
 				break;
 			}
 			case "tool_execution_update": {
@@ -2675,12 +2806,21 @@ export class RelayWorkerManager {
 				this.setStatus("waiting_approval");
 			} else if (busy) {
 				this.setStatus("running");
+			} else if (this.sawAgentEnd) {
+				// A run finished before/during compaction and its settle confirmation
+				// waited out retries; re-arm settle confirmation instead of dropping
+				// the completion wakeup.
+				this.scheduleSettleConfirm(client, 0);
 			} else if (this.status === "compacting") {
 				this.setStatus("idle");
 			}
 		} catch {
-			if (!this.disposed && this.client === client && this.status === "compacting") {
-				this.setStatus(this.pendingApprovals.size > 0 ? "waiting_approval" : "running");
+			if (!this.disposed && this.client === client) {
+				if (this.sawAgentEnd) {
+					this.scheduleSettleConfirm(client, 0);
+				} else if (this.status === "compacting") {
+					this.setStatus(this.pendingApprovals.size > 0 ? "waiting_approval" : "running");
+				}
 			}
 		}
 	}
@@ -2910,6 +3050,7 @@ export class RelayWorkerManager {
 		const now = Date.now();
 		if (now - this.lastProbeAt >= RPC_PROBE_INTERVAL_MS) {
 			this.lastProbeAt = now;
+			this.client.refreshUnixSnapshotAsync();
 			try {
 				await this.client.getState();
 				this.probeFailStreak = 0;
@@ -3180,7 +3321,7 @@ export class RelayWorkerManager {
 				: "";
 
 			if (disposition === "handled") {
-				return `Worker handled the message as an extension command (check relay_status if it started a background turn).${noticesSuffix}`;
+				return `Handled by a worker extension (check relay_status if it started a background turn).${noticesSuffix}`;
 			}
 			if (disposition === "queued") {
 				return mode === "steer"
@@ -3214,10 +3355,15 @@ export class RelayWorkerManager {
 			try {
 				await client.abort();
 			} catch (error) {
+				const errMsg = error instanceof Error ? error.message : String(error);
+				// Preserve `abortRequested = true` when the abort RPC merely timed out
+				// while the worker is still unwinding a slow tool/extension, so
+				// subsequent `agent_settled` still reports aborted rather than completed.
+				if (/timed out/i.test(errMsg) && client.alive) {
+					return "Abort signal was dispatched, but the worker is still unwinding its current operation (timed out waiting for acknowledgement); inspect relay_status to confirm when it settles.";
+				}
 				this.abortRequested = false;
-				throw new Error(
-					`Failed to deliver abort signal to worker: ${error instanceof Error ? error.message : String(error)}`,
-				);
+				throw new Error(`Failed to deliver abort signal to worker: ${errMsg}`);
 			}
 			return "Abort signal sent to the worker; its session context will remain intact.";
 		}
@@ -3249,6 +3395,12 @@ export class RelayWorkerManager {
 					throw new Error(
 						`Another active Pi session${holderDesc} owns this worker directory; refusing reset.`,
 					);
+				}
+				const identityConflict = this.checkExistingSessionIdentityConflict();
+				if (identityConflict) {
+					this.sessionIdentityConflict = identityConflict;
+					this.releaseOwnership();
+					throw new Error(identityConflict);
 				}
 				const stopped = await this.cleanupClient(false);
 				this.assertActive(gen, signal);
@@ -3502,7 +3654,7 @@ export class RelayWorkerManager {
 
 	dispose(sync = false): void {
 		if (sync) {
-			if (this.syncDisposed || this.cleanupCompleted) return;
+			if (this.cleanupCompleted) return;
 			this.syncDisposed = true;
 			this.disposed = true;
 			this.generation += 1;
@@ -3515,6 +3667,10 @@ export class RelayWorkerManager {
 						this.spawnDetachedEphemeralReaper(pid, hadOwnership);
 					}
 				}
+				// Schedule deferred in-process lock/dir finalizer so `/reload`
+				// retains tracking until a stubborn worker actually exits, while
+				// still allowing a later final process-exit `dispose(true)` retry.
+				this.scheduleDeferredDisposalFinalizer(hadOwnership);
 				return;
 			}
 			const verifiedOwned = hadOwnership && this.verifyCurrentOwnership().ok;

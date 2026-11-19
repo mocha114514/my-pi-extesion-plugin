@@ -7,7 +7,7 @@
  * EPIPE safety, UI request retention, and Windows/Unix process-tree cleanup.
  */
 
-import { type ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
@@ -77,6 +77,10 @@ export class RelayRpcClient {
 	private stderrTail: string[] = [];
 	private processExited = false;
 	private stopPromise: Promise<void> | undefined;
+	private lastUnixSnapshot:
+		| { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> }
+		| undefined;
+	private snapshotRefreshInFlight = false;
 
 	alive = false;
 	private readonly cwd: string;
@@ -141,6 +145,7 @@ export class RelayRpcClient {
 		this.proc = proc;
 		if (typeof proc.pid === "number") {
 			onSpawn?.(proc.pid);
+			this.refreshUnixSnapshotAsync();
 		}
 		this.alive = true;
 		this.processExited = false;
@@ -165,6 +170,11 @@ export class RelayRpcClient {
 		});
 		proc.on("exit", (code) => {
 			this.processExited = true;
+			if (process.platform !== "win32" && this.lastUnixSnapshot) {
+				// Reap any verified detached descendants (e.g. Bash tool process groups)
+				// that survived an unexpected worker crash or external termination.
+				this.reapUnixSnapshot(this.lastUnixSnapshot);
+			}
 			for (const listener of [...this.processExitListeners]) {
 				try {
 					listener();
@@ -480,6 +490,9 @@ export class RelayRpcClient {
 		const proc = this.proc;
 		this.exitListeners.clear();
 		if (!this.isProcessRunning(proc)) {
+			if (process.platform !== "win32" && this.lastUnixSnapshot) {
+				this.reapUnixSnapshot(this.lastUnixSnapshot);
+			}
 			this.handleClose(null);
 			return;
 		}
@@ -487,6 +500,9 @@ export class RelayRpcClient {
 			process.platform !== "win32" && proc.pid !== undefined
 				? this.collectUnixDescendants(proc.pid)
 				: undefined;
+		if (preAbortSnapshot) {
+			this.lastUnixSnapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, preAbortSnapshot);
+		}
 
 		let responsive = false;
 		if (this.alive) {
@@ -512,7 +528,13 @@ export class RelayRpcClient {
 			process.platform !== "win32" && proc.pid !== undefined && this.isProcessRunning(proc)
 				? this.collectUnixDescendants(proc.pid)
 				: undefined;
-		const mergedSnapshot = this.mergeUnixSnapshots(preAbortSnapshot, postAbortSnapshot);
+		const mergedSnapshot = this.mergeUnixSnapshots(
+			this.mergeUnixSnapshots(this.lastUnixSnapshot, preAbortSnapshot),
+			postAbortSnapshot,
+		);
+		if (mergedSnapshot) {
+			this.lastUnixSnapshot = mergedSnapshot;
+		}
 
 		this.handleClose(null);
 		if (!this.isProcessRunning(proc)) {
@@ -582,6 +604,51 @@ export class RelayRpcClient {
 		this.handleClose(null);
 	}
 
+	/**
+	 * Non-blocking Unix process-tree snapshot refresh so detached tool subtrees
+	 * (e.g. Bash commands) can still be verified and reaped if the worker exits
+	 * unexpectedly before `gracefulStop()` runs.
+	 */
+	refreshUnixSnapshotAsync(): void {
+		if (process.platform === "win32" || this.snapshotRefreshInFlight) return;
+		const proc = this.proc;
+		if (!this.isProcessRunning(proc) || proc.pid === undefined) return;
+		const rootPid = proc.pid;
+		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
+		if (!psBin) return;
+		this.snapshotRefreshInFlight = true;
+		execFile(
+			psBin,
+			["-eo", "pid=,ppid=,pgid=,lstart="],
+			{ encoding: "utf-8", timeout: 500, env: { ...process.env, PATH: "/bin:/usr/bin" } },
+			(err, stdout) => {
+				this.snapshotRefreshInFlight = false;
+				if (err || typeof stdout !== "string" || this.proc !== proc) return;
+				const rows = this.parseUnixProcessTable(stdout);
+				if (rows.length === 0) return;
+				const snap = this.buildUnixDescendantsSnapshot(rootPid, rows);
+				if (snap.rootStartId || snap.pids.size > 0 || snap.pgids.size > 0) {
+					this.lastUnixSnapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, snap);
+				}
+			},
+		);
+	}
+
+	private parseUnixProcessTable(out: string): Array<{ pid: number; ppid: number; pgid: number; startId: string }> {
+		const rows: Array<{ pid: number; ppid: number; pgid: number; startId: string }> = [];
+		for (const line of out.split("\n")) {
+			const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+			if (!m) continue;
+			const pid = Number(m[1]);
+			const ppid = Number(m[2]);
+			const pgid = Number(m[3]);
+			const startId = m[4]!.trim();
+			if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || !startId) continue;
+			rows.push({ pid, ppid, pgid: Number.isInteger(pgid) && pgid > 0 ? pgid : 0, startId });
+		}
+		return rows;
+	}
+
 	private readUnixProcessTable(): Array<{ pid: number; ppid: number; pgid: number; startId: string }> {
 		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
 		if (!psBin) return [];
@@ -591,18 +658,7 @@ export class RelayRpcClient {
 				timeout: 500,
 				env: { ...process.env, PATH: "/bin:/usr/bin" },
 			});
-			const rows: Array<{ pid: number; ppid: number; pgid: number; startId: string }> = [];
-			for (const line of out.split("\n")) {
-				const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
-				if (!m) continue;
-				const pid = Number(m[1]);
-				const ppid = Number(m[2]);
-				const pgid = Number(m[3]);
-				const startId = m[4]!.trim();
-				if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid) || !startId) continue;
-				rows.push({ pid, ppid, pgid: Number.isInteger(pgid) && pgid > 0 ? pgid : 0, startId });
-			}
-			return rows;
+			return this.parseUnixProcessTable(out);
 		} catch {
 			return [];
 		}
@@ -611,9 +667,15 @@ export class RelayRpcClient {
 	private collectUnixDescendants(
 		rootPid: number,
 	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } {
+		return this.buildUnixDescendantsSnapshot(rootPid, this.readUnixProcessTable());
+	}
+
+	private buildUnixDescendantsSnapshot(
+		rootPid: number,
+		rows: Array<{ pid: number; ppid: number; pgid: number; startId: string }>,
+	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } {
 		const pids = new Map<number, string>();
 		const pgids = new Map<number, Set<number>>();
-		const rows = this.readUnixProcessTable();
 		const rootRow = rows.find((r) => r.pid === rootPid);
 		const rootStartId = rootRow?.startId;
 		const ownPgid = rows.find((r) => r.pid === process.pid)?.pgid;
@@ -790,8 +852,11 @@ export class RelayRpcClient {
 	}
 
 	private reapUnixProcessTree(rootPid: number): void {
-		const snapshot = this.collectUnixDescendants(rootPid);
-		this.reapUnixSnapshot(snapshot);
+		const snapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, this.collectUnixDescendants(rootPid));
+		if (snapshot) {
+			this.lastUnixSnapshot = snapshot;
+			this.reapUnixSnapshot(snapshot);
+		}
 		try {
 			process.kill(-rootPid, "SIGKILL");
 		} catch {
@@ -822,6 +887,8 @@ export class RelayRpcClient {
 			} catch {
 				// Already gone.
 			}
+		} else if (process.platform !== "win32" && this.lastUnixSnapshot) {
+			this.reapUnixSnapshot(this.lastUnixSnapshot);
 		}
 		this.handleClose(null);
 	}
