@@ -564,7 +564,11 @@ export class RelayWorkerManager {
 		}
 	}
 
-	private async refreshStateFromRpc(client: RelayRpcClient): Promise<void> {
+	private async refreshStateFromRpc(
+		client: RelayRpcClient,
+		options?: { includeStats?: boolean },
+	): Promise<void> {
+		const includeStats = options?.includeStats !== false;
 		try {
 			const state = await client.getState();
 			if (this.client !== client) return;
@@ -608,6 +612,7 @@ export class RelayWorkerManager {
 			if (typeof state.thinkingLevel === "string") {
 				this.meta.thinking = state.thinkingLevel;
 			}
+			if (!includeStats) return;
 			const stats = await client.getSessionStats();
 			if (this.client !== client) return;
 			const contextUsage = stats.contextUsage as { tokens?: unknown; contextWindow?: unknown } | undefined;
@@ -1328,11 +1333,12 @@ export class RelayWorkerManager {
 			if (disposition === "handled" || (disposition === undefined && commandName !== undefined)) {
 				// Extension slash commands (e.g. ctx.newSession()) can switch the worker's
 				// active session without starting an agent turn on both Pi 1.5.2 (`handled`)
-				// and Pi 0.85.1 (omitted disposition); refresh meta promptly so a subsequent
-				// toggle-off or restart resumes the updated session.
+				// and Pi 0.85.1 (omitted disposition); refresh only session state (skipping
+				// turn stats so an in-flight streaming turn is not double-counted when
+				// `turn_end` later fires).
 				if (this.client === client && client.alive) {
 					await Promise.race([
-						this.refreshStateFromRpc(client),
+						this.refreshStateFromRpc(client, { includeStats: false }),
 						new Promise<void>((resolve) => setTimeout(resolve, 1_500)),
 					]);
 				}

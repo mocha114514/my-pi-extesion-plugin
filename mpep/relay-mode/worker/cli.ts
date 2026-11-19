@@ -20,6 +20,8 @@ export interface PiRuntimeCapabilities {
 	hasSettleCredentialWrites: boolean;
 	runsBeforeAgentStartOnCustomWakeup: boolean;
 	supportsBuiltinResourcePrefix: boolean;
+	supportsToolExposure: boolean;
+	supportsOverlayHandleDone: boolean;
 }
 
 function findPiCoreFile(entryPath: string, fileName: string): string | undefined {
@@ -52,6 +54,8 @@ export function detectPiRuntimeCapabilities(): PiRuntimeCapabilities {
 				hasSettleCredentialWrites: true,
 				runsBeforeAgentStartOnCustomWakeup: true,
 				supportsBuiltinResourcePrefix: true,
+				supportsToolExposure: true,
+				supportsOverlayHandleDone: true,
 			};
 		}
 		const realEntry = fs.realpathSync.native?.(entry) ?? fs.realpathSync(entry);
@@ -60,20 +64,28 @@ export function detectPiRuntimeCapabilities(): PiRuntimeCapabilities {
 		const hasSettleCredentialWrites = runtimePath
 			? fs.readFileSync(runtimePath, "utf-8").includes("settleCredentialWrites")
 			: true;
-		const runsBeforeAgentStartOnCustomWakeup = sessionPath
-			? fs.readFileSync(sessionPath, "utf-8").includes('messageType: "custom"')
+		const sessionContent = sessionPath ? fs.readFileSync(sessionPath, "utf-8") : undefined;
+		const runsBeforeAgentStartOnCustomWakeup = sessionContent
+			? sessionContent.includes('messageType: "custom"')
 			: true;
-		// Pi 1.5.2 introduced `builtin:` in `isLocalPath`; Pi 0.85.1 does not treat it as non-local.
+		const supportsToolExposure = sessionContent
+			? sessionContent.includes("_getToolExposure")
+			: true;
+		// Pi 1.5.2 introduced `builtin:` in `isLocalPath` and handle-owned custom overlay done().
 		return {
 			hasSettleCredentialWrites,
 			runsBeforeAgentStartOnCustomWakeup,
 			supportsBuiltinResourcePrefix: hasSettleCredentialWrites,
+			supportsToolExposure,
+			supportsOverlayHandleDone: hasSettleCredentialWrites,
 		};
 	} catch {
 		return {
 			hasSettleCredentialWrites: true,
 			runsBeforeAgentStartOnCustomWakeup: true,
 			supportsBuiltinResourcePrefix: true,
+			supportsToolExposure: true,
+			supportsOverlayHandleDone: true,
 		};
 	}
 }

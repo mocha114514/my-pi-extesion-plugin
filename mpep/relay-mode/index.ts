@@ -33,6 +33,7 @@ import { registerRelayTools } from "./tools.ts";
 import { createRelayBorderBadge, updateRelayStatusBar, type RelayBorderBadgeHandle } from "./widget.ts";
 import {
 	cleanupPreservedEphemeralWorkerDir,
+	detectPiRuntimeCapabilities,
 	isSamePath,
 	RELAY_COMPACT_PREFIX,
 	RELAY_TRUSTED_CWD_ENV,
@@ -187,14 +188,20 @@ export function resolveInitialRelayEnabled(
 	return sessionState !== undefined ? sessionState : defaultEnabled;
 }
 
-function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): boolean | undefined {
+interface SessionRelayStateLookup {
+	value: boolean | undefined;
+	needsPersistence: boolean;
+}
+
+function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): SessionRelayStateLookup {
 	// If an earlier write for this exact session failed in this process (e.g.
-	// read-only session store), honor the in-process fallback across `/reload`
-	// so the user's toggle or initial session lock cannot silently flip back.
+	// temporarily read-only session store), honor the in-process fallback across
+	// `/reload` AND mark `needsPersistence: true` so session_start retries saving
+	// it once storage becomes writable again.
 	if (sessionId) {
 		const fallback = getSharedLifecycle().sessionStateFallback.get(sessionId);
 		if (typeof fallback === "boolean") {
-			return fallback;
+			return { value: fallback, needsPersistence: true };
 		}
 	}
 	try {
@@ -208,14 +215,14 @@ function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): boole
 			if (entry?.type === "custom" && entry.customType === SESSION_STATE_ENTRY) {
 				const data = entry.data as Partial<SessionRelayStateEntry> | undefined;
 				if (typeof data?.enabled === "boolean") {
-					return data.enabled;
+					return { value: data.enabled, needsPersistence: false };
 				}
 			}
 		}
 	} catch {
 		// Fall back to long-term preference if session entries cannot be inspected.
 	}
-	return undefined;
+	return { value: undefined, needsPersistence: true };
 }
 
 function detectModelOverridesSupport(): boolean {
@@ -522,13 +529,32 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		heldNotices.length = 0;
 	};
 
-	const relayTools = registerRelayTools(pi, {
-		isActive: () => activeInSession,
-		getWorker: () => worker,
-	});
+	const runtimeCaps = detectPiRuntimeCapabilities();
+	const relayTools = registerRelayTools(
+		pi,
+		{
+			isActive: () => activeInSession,
+			getWorker: () => worker,
+		},
+		{ supportsToolExposure: runtimeCaps.supportsToolExposure },
+	);
+
+	// Re-registering tools on Pi >= 1.5 runs `refreshTools()`, which reactivates
+	// any allowlisted (`--tools`) non-relay tools that were previously disabled.
+	// Capture the pre-toggle non-relay set and prune only unintended revivals so
+	// ordinary sessions without `--tools` still avoid calling `setActiveTools()`.
+	const setExposurePreservingNonRelayTools = (next: "hidden" | "direct") => {
+		const beforeNonRelay = new Set(pi.getActiveTools().filter((name) => !RELAY_TOOL_NAMES.has(name)));
+		relayTools.setExposure(next);
+		const after = pi.getActiveTools();
+		const revivedNonRelay = after.some((name) => !RELAY_TOOL_NAMES.has(name) && !beforeNonRelay.has(name));
+		if (revivedNonRelay) {
+			pi.setActiveTools(after.filter((name) => RELAY_TOOL_NAMES.has(name) || beforeNonRelay.has(name)));
+		}
+	};
 
 	const hideRelayTools = () => {
-		relayTools.setExposure("hidden");
+		setExposurePreservingNonRelayTools("hidden");
 		const active = pi.getActiveTools();
 		const filtered = active.filter((name) => !RELAY_TOOL_NAMES.has(name));
 		if (filtered.length !== active.length) {
@@ -541,7 +567,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			hideRelayTools();
 			return;
 		}
-		relayTools.setExposure("direct");
+		setExposurePreservingNonRelayTools("direct");
 		const active = pi.getActiveTools();
 		const missing = [...RELAY_TOOL_NAMES].filter((name) => !active.includes(name));
 		if (missing.length > 0) {
@@ -687,8 +713,9 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 		// Expose relay tools as `direct` (Pi >= 1.5 activates newly exposed tools
 		// via refreshTools while respecting --tools/--exclude-tools and preserving
-		// pending MCP tools; Pi 0.85.1 activates them via setActiveTools below).
-		relayTools.setExposure("direct");
+		// pending MCP tools and disabled unrelated tools; Pi 0.85.1 activates them
+		// via setActiveTools below).
+		setExposurePreservingNonRelayTools("direct");
 		const activeTools = pi.getActiveTools();
 		const missingRelayTools = [...RELAY_TOOL_NAMES].filter((name) => !activeTools.includes(name));
 		if (missingRelayTools.length > 0) {
@@ -942,12 +969,34 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 
 		// Fallback when border widget has not captured a TUI instance yet:
-		// call ONLY `done()` once (never `handle.hide()` + `done()`, which pops two
-		// overlays on Pi 0.85.1).
+		// - On Pi >= 1.5, `done()` closes the overlay by its own handle.
+		// - On Pi 0.85.1, `done()` unconditionally pops the stack top (which can
+		//   remove another overlay above relay), so close strictly via our owned
+		//   `OverlayHandle.hide()` once attached instead of calling `done()`.
 		let fallbackDone: (() => void) | undefined;
-		const closeFallback = () => {
-			const done = fallbackDone;
+		let fallbackHandle: OverlayHandle | undefined;
+		let fallbackClosed = false;
+		const cleanupFallbackState = () => {
+			if (closeActivePanel === closeFallback) closeActivePanel = undefined;
 			fallbackDone = undefined;
+			fallbackHandle = undefined;
+			panelOpen = false;
+			const tuiToRender = panelTui;
+			panelTui = undefined;
+			borderBadge?.sync();
+			tuiToRender?.requestRender();
+		};
+		const closeFallback = () => {
+			if (fallbackClosed) return;
+			fallbackClosed = true;
+			if (!runtimeCaps.supportsOverlayHandleDone && fallbackHandle) {
+				const handle = fallbackHandle;
+				cleanupFallbackState();
+				handle.hide();
+				return;
+			}
+			const done = fallbackDone;
+			cleanupFallbackState();
 			done?.();
 		};
 		closeActivePanel = closeFallback;
@@ -966,14 +1015,17 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				{
 					overlay: true,
 					overlayOptions,
+					onHandle: (handle) => {
+						if (fallbackClosed) {
+							handle.hide();
+							return;
+						}
+						fallbackHandle = handle;
+					},
 				},
 			);
 		} finally {
-			if (closeActivePanel === closeFallback) closeActivePanel = undefined;
-			fallbackDone = undefined;
-			panelOpen = false;
-			panelTui = undefined;
-			borderBadge?.sync();
+			cleanupFallbackState();
 		}
 	};
 
@@ -1071,14 +1123,15 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			},
 		});
 
-		const sessionOverride = readSessionRelayState(ctx, incomingSessionId);
+		const sessionLookup = readSessionRelayState(ctx, incomingSessionId);
 		const defaultEnabled = loadRelayPreferences().defaultEnabled;
-		const shouldEnable = resolveInitialRelayEnabled(sessionOverride, defaultEnabled);
+		const shouldEnable = resolveInitialRelayEnabled(sessionLookup.value, defaultEnabled);
 
 		if (!shouldEnable) {
-			// Record the session's initial inherited state so changing the long-term
-			// default later and running `/reload` never alters this open session.
-			if (sessionOverride === undefined) {
+			// Record the session's initial inherited state (or retry a previously
+			// failed save once storage recovers) so changing the long-term default
+			// later and running `/reload` never alters this open session.
+			if (sessionLookup.needsPersistence) {
 				tryAppendSessionState(false, true);
 			}
 			hideRelayTools();
@@ -1087,8 +1140,8 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 
 		const tSeq = ++toggleSeq;
-		const activated = await activateSessionRelay(ctx, seq, tSeq, sessionOverride === undefined);
-		if (!activated && sessionOverride === undefined && seq === sessionStartSeq) {
+		const activated = await activateSessionRelay(ctx, seq, tSeq, sessionLookup.needsPersistence);
+		if (!activated && sessionLookup.needsPersistence && seq === sessionStartSeq) {
 			tryAppendSessionState(false, true);
 		}
 	});
@@ -1189,10 +1242,9 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("agent_end", () => {
-		promptHookActiveForRun = false;
-	});
-
+	// Reset only at the logical run settlement boundary (`agent_settled`), NOT
+	// on inner `agent_end`, because retries / continuations reuse the active
+	// system prompt override without re-running `before_agent_start`.
 	pi.on("agent_settled", () => {
 		promptHookActiveForRun = false;
 	});

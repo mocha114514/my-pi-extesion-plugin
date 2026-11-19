@@ -102,17 +102,33 @@ export function finalizeWorkerDirectoryOwnership(
 }
 
 /**
+ * Errno-aware absence check: returns `true` ONLY when the filesystem explicitly
+ * reports `ENOENT` or `ENOTDIR`. Access/I/O errors (such as `EACCES` on a
+ * temporarily untraversable parent directory) return `false` so callers retain
+ * retry tracking instead of mistaking an inaccessible transcript for deleted.
+ */
+function isPathConfirmedAbsent(targetPath: string): boolean {
+	try {
+		fs.lstatSync(targetPath);
+		return false;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		return code === "ENOENT" || code === "ENOTDIR";
+	}
+}
+
+/**
  * Safely remove a preserved `--no-session` ephemeral worker directory on final
  * session shutdown/exit after verifying exclusive lock ownership.
  *
- * Returns `true` if the directory is gone (or never existed) and `false` if
- * ownership could not yet be acquired (for example, a retiring worker is still
- * releasing its lock) so callers can retain the key and retry later.
+ * Returns `true` if the worker directory is confirmed absent (`ENOENT`/`ENOTDIR`)
+ * and `false` if ownership could not yet be acquired or an access/I/O error
+ * prevents confirming deletion so callers can retain the key and retry later.
  */
 export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd: string): boolean {
 	const sessionRoot = path.resolve(launchCwd, mainSessionDir(storageKey));
 	const dir = path.resolve(launchCwd, workerDir(storageKey));
-	if (!fs.existsSync(dir)) {
+	if (isPathConfirmedAbsent(dir)) {
 		try {
 			fs.rmdirSync(sessionRoot);
 		} catch {
@@ -125,11 +141,11 @@ export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd
 	if (!acquired.ok) return false;
 	try {
 		finalizeWorkerDirectoryOwnership(lock, dir, sessionRoot, true, true);
-		// Treat removal of the owned `worker/` directory as success even if a
-		// non-empty parent directory intentionally remains on disk.
-		return !fs.existsSync(dir);
+		// Treat confirmed removal of the owned `worker/` directory as success even
+		// if a non-empty parent directory intentionally remains on disk.
+		return isPathConfirmedAbsent(dir);
 	} catch {
 		lock.releaseOwnership();
-		return !fs.existsSync(dir);
+		return isPathConfirmedAbsent(dir);
 	}
 }

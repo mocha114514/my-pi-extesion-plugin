@@ -80,6 +80,7 @@ export class RelayRpcClient {
 	private lastUnixSnapshot:
 		| { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> }
 		| undefined;
+	private unixSnapshotVersion = 0;
 	private rootStartId: string | undefined;
 	private snapshotRefreshInFlight = false;
 
@@ -146,6 +147,7 @@ export class RelayRpcClient {
 		this.proc = proc;
 		this.rootStartId = undefined;
 		this.lastUnixSnapshot = undefined;
+		this.unixSnapshotVersion += 1;
 		if (typeof proc.pid === "number") {
 			onSpawn?.(proc.pid);
 			this.refreshUnixSnapshotAsync();
@@ -508,6 +510,7 @@ export class RelayRpcClient {
 				this.rootStartId = preAbortSnapshot.rootStartId;
 			}
 			this.lastUnixSnapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, preAbortSnapshot);
+			this.unixSnapshotVersion += 1;
 		}
 
 		let responsive = false;
@@ -621,6 +624,7 @@ export class RelayRpcClient {
 		if (!this.isProcessRunning(proc) || proc.pid === undefined) return;
 		const rootPid = proc.pid;
 		const expectedRootStartId = this.rootStartId;
+		const startedVersion = this.unixSnapshotVersion;
 		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
 		if (!psBin) return;
 		this.snapshotRefreshInFlight = true;
@@ -646,9 +650,14 @@ export class RelayRpcClient {
 					if (!stillLive) return;
 					this.rootStartId = snap.rootStartId;
 				}
-				const merged = this.mergeUnixSnapshots(this.lastUnixSnapshot, snap, rows);
+				// Prune exited historical PIDs ONLY when no newer snapshot was installed
+				// while this async scan was in flight; otherwise union verified identities
+				// without pruning descendants discovered by the newer snapshot.
+				const pruneRows = this.unixSnapshotVersion === startedVersion ? rows : undefined;
+				const merged = this.mergeUnixSnapshots(this.lastUnixSnapshot, snap, pruneRows);
 				if (merged && (merged.rootStartId || merged.pids.size > 0 || merged.pgids.size > 0)) {
 					this.lastUnixSnapshot = merged;
+					this.unixSnapshotVersion += 1;
 				}
 				// If the worker exited while this verified scan was in flight, reap
 				// any surviving verified descendants that `proc.on("exit")` missed.

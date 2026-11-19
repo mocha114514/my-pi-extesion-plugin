@@ -74,27 +74,35 @@ export class RelayModePanel implements Component {
 					case "tui.select.confirm":
 						return matchesKey(data, Key.enter);
 					case "tui.select.cancel":
-						return matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"));
+						return matchesKey(data, Key.escape);
 				}
 			}
 		};
+		// Dispatch configured host keybindings and dedicated close shortcuts
+		// BEFORE optional literal aliases (`j`, `k`, `q`) so remapping e.g.
+		// Up->`j` / Down->`k` or Cancel works as configured.
 		if (
 			matches("tui.select.cancel") ||
-			matchesKey(data, Key.alt("r")) ||
-			data === "q" ||
-			data === "Q"
+			matchesKey(data, Key.ctrl("c")) ||
+			matchesKey(data, Key.alt("r"))
 		) {
 			this.close();
+		} else if (matches("tui.select.up")) {
+			this.selectedIndex = (this.selectedIndex + OPTION_COUNT - 1) % OPTION_COUNT;
+		} else if (matches("tui.select.down")) {
+			this.selectedIndex = (this.selectedIndex + 1) % OPTION_COUNT;
+		} else if (matches("tui.select.confirm") || matchesKey(data, Key.space) || data === "\n") {
+			this.activate();
 		} else if (matchesKey(data, Key.home)) {
 			this.selectedIndex = 0;
 		} else if (matchesKey(data, Key.end)) {
 			this.selectedIndex = OPTION_COUNT - 1;
-		} else if (matches("tui.select.up") || data === "k") {
+		} else if (data === "q" || data === "Q") {
+			this.close();
+		} else if (data === "k") {
 			this.selectedIndex = (this.selectedIndex + OPTION_COUNT - 1) % OPTION_COUNT;
-		} else if (matches("tui.select.down") || data === "j") {
+		} else if (data === "j") {
 			this.selectedIndex = (this.selectedIndex + 1) % OPTION_COUNT;
-		} else if (matches("tui.select.confirm") || matchesKey(data, Key.space) || data === "\n") {
-			this.activate();
 		}
 	}
 

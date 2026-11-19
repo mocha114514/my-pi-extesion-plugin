@@ -108,16 +108,32 @@ export interface RelayToolsController {
 	setExposure(exposure: "hidden" | "direct"): void;
 }
 
-export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): RelayToolsController {
+export interface RegisterRelayToolsOptions {
+	/**
+	 * Whether the host Pi runtime supports `ToolDefinition.exposure` (Pi >= 1.5).
+	 * On Pi 0.85.1, re-calling `pi.registerTool()` triggers `refreshTools()`
+	 * which can reactivate unrelated disabled allowlisted tools, so exposure
+	 * switching is a no-op there and visibility is managed solely via active tools.
+	 */
+	supportsToolExposure?: boolean;
+}
+
+export function registerRelayTools(
+	pi: ExtensionAPI,
+	host: RelayToolsHost,
+	options?: RegisterRelayToolsOptions,
+): RelayToolsController {
+	const supportsToolExposure = options?.supportsToolExposure !== false;
 	const definitions: Array<Parameters<ExtensionAPI["registerTool"]>[0]> = [];
 	let currentExposure: "hidden" | "direct" = "hidden";
 
 	const registerRelayTool: ExtensionAPI["registerTool"] = (definition) => {
 		definitions.push(definition as Parameters<ExtensionAPI["registerTool"]>[0]);
-		pi.registerTool({
-			...definition,
-			exposure: currentExposure,
-		} as typeof definition);
+		pi.registerTool(
+			(supportsToolExposure
+				? { ...definition, exposure: currentExposure }
+				: definition) as typeof definition,
+		);
 	};
 
 	registerRelayTool({
@@ -331,7 +347,7 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): Rela
 
 	return {
 		setExposure(next: "hidden" | "direct") {
-			if (next === currentExposure) return;
+			if (!supportsToolExposure || next === currentExposure) return;
 			currentExposure = next;
 			for (const definition of definitions) {
 				pi.registerTool({
