@@ -51,11 +51,23 @@ interface SessionStateFallbackRecord {
 	enabled: boolean;
 	/**
 	 * True on Pi 0.85.1 where a failed `appendEntry()` advances the in-memory
-	 * `leafId` without rolling it back. Retrying `appendEntry()` onto that
-	 * unsaved leaf after `/reload` would persist a child whose parent does not
+	 * `leafId` without rolling it back. Retrying `appendEntry()` onto a branch
+	 * containing that unsaved leaf would persist a child whose parent does not
 	 * exist on disk and disconnect the saved conversation.
 	 */
 	unsafeLegacyLeaf: boolean;
+	/**
+	 * Specific unsaved in-memory entry IDs created by failed appends on Pi 0.85.1.
+	 * If the user later navigates (`/tree`) back to a persisted ancestor or
+	 * sibling branch that does not contain any of these IDs, writing is safe again.
+	 */
+	failedEntryIds?: string[];
+	/**
+	 * True when a failed legacy append could not capture a specific unsaved leaf
+	 * ID (e.g. migrated from an older bare-boolean fallback record), conservatively
+	 * blocking retries for this session on Pi 0.85.1.
+	 */
+	unsafeSessionWide?: boolean;
 }
 
 interface SharedLifecycleState {
@@ -63,7 +75,8 @@ interface SharedLifecycleState {
 	retiring: Set<RelayWorkerManager>;
 	preservedEphemeralKeys: Set<string>;
 	ephemeralTokens: Map<string, string>;
-	sessionStateFallback: Map<string, SessionStateFallbackRecord>;
+	sessionStateFallback: Map<string, SessionStateFallbackRecord | boolean>;
+	preservedPendingToolsBySession: Map<string, Set<string>>;
 	activeEphemeralKey: string | undefined;
 	exitListener: (() => void) | undefined;
 	unregisterSigint: (() => void) | undefined;
@@ -81,7 +94,8 @@ function getSharedLifecycle(): SharedLifecycleState {
 			retiring: new Set<RelayWorkerManager>(),
 			preservedEphemeralKeys: new Set<string>(),
 			ephemeralTokens: new Map<string, string>(),
-			sessionStateFallback: new Map<string, SessionStateFallbackRecord>(),
+			sessionStateFallback: new Map<string, SessionStateFallbackRecord | boolean>(),
+			preservedPendingToolsBySession: new Map<string, Set<string>>(),
 			activeEphemeralKey: undefined,
 			exitListener: undefined,
 			unregisterSigint: undefined,
@@ -90,7 +104,8 @@ function getSharedLifecycle(): SharedLifecycleState {
 	} else {
 		if (!state.preservedEphemeralKeys) state.preservedEphemeralKeys = new Set<string>();
 		if (!state.ephemeralTokens) state.ephemeralTokens = new Map<string, string>();
-		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, SessionStateFallbackRecord>();
+		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, SessionStateFallbackRecord | boolean>();
+		if (!state.preservedPendingToolsBySession) state.preservedPendingToolsBySession = new Map<string, Set<string>>();
 	}
 	return state;
 }
@@ -204,24 +219,85 @@ interface SessionRelayStateLookup {
 	needsPersistence: boolean;
 }
 
-function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): SessionRelayStateLookup {
+/**
+ * Normalize a process-global session-state fallback entry (including legacy bare
+ * booleans retained across a live `/reload` upgrade from an earlier build) into
+ * the structured `SessionStateFallbackRecord` matching the host Pi's rollback
+ * semantics.
+ */
+function getNormalizedSessionFallback(
+	sessionId: string | undefined,
+	hostRollsBackFailedAppend: boolean,
+): SessionStateFallbackRecord | undefined {
+	if (!sessionId) return undefined;
+	const map = getSharedLifecycle().sessionStateFallback;
+	const raw = map.get(sessionId);
+	if (raw === undefined) return undefined;
+	if (typeof raw === "boolean") {
+		const migrated: SessionStateFallbackRecord = {
+			enabled: raw,
+			unsafeLegacyLeaf: !hostRollsBackFailedAppend,
+			unsafeSessionWide: !hostRollsBackFailedAppend,
+		};
+		map.set(sessionId, migrated);
+		return migrated;
+	}
+	if (raw && typeof raw.enabled === "boolean") {
+		return raw;
+	}
+	return undefined;
+}
+
+/**
+ * Determine whether appending to the current branch on Pi 0.85.1 would attach
+ * a child to an unsaved in-memory entry created by an earlier failed append.
+ * Navigating (`/tree`) back to a persisted ancestor or sibling branch clears
+ * the hazard for that branch so subsequent writes succeed safely.
+ */
+function isCurrentBranchUnsafeLegacy(
+	record: SessionStateFallbackRecord | undefined,
+	ctx: ExtensionContext | undefined,
+): boolean {
+	if (!record?.unsafeLegacyLeaf) return false;
+	if (record.unsafeSessionWide || !record.failedEntryIds || record.failedEntryIds.length === 0) {
+		return true;
+	}
+	if (!ctx) return true;
+	try {
+		const failedSet = new Set(record.failedEntryIds);
+		const branch = ctx.sessionManager.getBranch?.() ?? [];
+		for (const entry of branch) {
+			const id = (entry as { id?: unknown } | undefined)?.id;
+			if (typeof id === "string" && failedSet.has(id)) {
+				return true;
+			}
+		}
+		const leafId = ctx.sessionManager.getLeafId?.();
+		if (typeof leafId === "string" && failedSet.has(leafId)) {
+			return true;
+		}
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+function readSessionRelayState(
+	ctx: ExtensionContext,
+	sessionId: string | undefined,
+	hostRollsBackFailedAppend: boolean,
+): SessionRelayStateLookup {
 	// If an earlier write for this exact session failed in this process:
+	// - Migrate any legacy bare-boolean record first so both reads and writes
+	//   observe the same normalized semantics after a live `/reload` upgrade.
 	// - On Pi >= 1.5 (`unsafeLegacyLeaf: false`), SessionManager rolled back the
 	//   in-memory leaf, so retrying `appendEntry()` once storage recovers is safe.
-	// - On Pi 0.85.1 (`unsafeLegacyLeaf: true`), the failed append left the
-	//   in-memory leaf pointing to an unsaved entry; do NOT retry onto that
-	//   unsaved parent or the transcript branch will disconnect on disk.
-	if (sessionId) {
-		const rawFallback = getSharedLifecycle().sessionStateFallback.get(sessionId) as
-			| SessionStateFallbackRecord
-			| boolean
-			| undefined;
-		if (typeof rawFallback === "boolean") {
-			return { value: rawFallback, needsPersistence: false };
-		}
-		if (rawFallback && typeof rawFallback.enabled === "boolean") {
-			return { value: rawFallback.enabled, needsPersistence: !rawFallback.unsafeLegacyLeaf };
-		}
+	// - On Pi 0.85.1 (`unsafeLegacyLeaf: true`), allow retrying ONLY when the
+	//   current branch no longer contains the unsaved failed entry (e.g. after `/tree`).
+	const fallback = getNormalizedSessionFallback(sessionId, hostRollsBackFailedAppend);
+	if (fallback) {
+		const blockedOnBranch = isCurrentBranchUnsafeLegacy(fallback, ctx);
+		return { value: fallback.enabled, needsPersistence: !blockedOnBranch };
 	}
 	try {
 		// Read session entries in append order (rather than only the active tree
@@ -245,12 +321,16 @@ function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): Sessi
 }
 
 /**
- * Inspect the current branch's recorded system-message tool diffs to identify
- * any restored non-relay tools that are not yet registered (e.g. MCP servers
- * still reconnecting), so pruning a revived allowlisted tool on Pi 1.5.2 can
- * re-activate those pending tools once they finish registering.
+ * Replay the current branch's recorded system-message tool deltas (matching Pi's
+ * `transcript.ts` order: `toolsRemoved` before `toolsAdded` so schema/description
+ * updates to the same tool name retain the tool) and return restored non-relay
+ * tools that are not yet active (including both still-unregistered MCP tools and
+ * registered-but-`hidden` disabled MCP tools awaiting reconnection).
  */
-function findPendingBranchTools(ctx: ExtensionContext | undefined, pi: ExtensionAPI): string[] {
+function findPendingBranchTools(
+	ctx: ExtensionContext | undefined,
+	activeNonRelay: ReadonlySet<string>,
+): string[] {
 	if (!ctx) return [];
 	try {
 		const branch = ctx.sessionManager.getBranch?.() ?? [];
@@ -265,22 +345,20 @@ function findPendingBranchTools(ctx: ExtensionContext | undefined, pi: Extension
 				};
 			};
 			if (entry?.type !== "message" || entry.message?.role !== "system") continue;
-			for (const tool of entry.message.toolsAdded ?? []) {
-				if (typeof tool?.name === "string" && !RELAY_TOOL_NAMES.has(tool.name)) {
-					restored.add(tool.name);
-				}
-			}
+			// Apply removals BEFORE additions to match Pi's transcript replay semantics.
 			for (const tool of entry.message.toolsRemoved ?? []) {
 				if (typeof tool?.name === "string") {
 					restored.delete(tool.name);
 				}
 			}
+			for (const tool of entry.message.toolsAdded ?? []) {
+				if (typeof tool?.name === "string" && !RELAY_TOOL_NAMES.has(tool.name)) {
+					restored.add(tool.name);
+				}
+			}
 		}
 		if (restored.size === 0) return [];
-		const registered = new Set(
-			(pi.getAllTools?.() ?? []).map((tool) => tool.name),
-		);
-		return [...restored].filter((name) => !registered.has(name));
+		return [...restored].filter((name) => !activeNonRelay.has(name));
 	} catch {
 		return [];
 	}
@@ -476,6 +554,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	let closeActivePanel: (() => void) | undefined;
 	let sessionToggleInFlight = false;
 	let toggleSeq = 0;
+	let transcriptLoadoutRestored = false;
 	const preservedPendingTools = new Set<string>();
 	let retiringDisposalPromise: Promise<void> | undefined;
 	let currentSessionId: string | undefined;
@@ -608,36 +687,44 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	// Capture the pre-toggle non-relay set and prune only unintended revivals so
 	// ordinary sessions without `--tools` still avoid calling `setActiveTools()`.
 	// When pruning IS needed on shipped Pi 1.5.2 (which clears `_pendingToolNames`
-	// on any removal), capture still-unregistered restored branch tools so we can
-	// re-activate them additively once their servers finish connecting.
+	// on any removal), capture still-pending restored branch tools ONLY when Pi
+	// actually restored the transcript loadout (e.g. `/tree` navigation, NOT an
+	// explicit `--tools` startup where Pi intentionally skips transcript restore).
 	const setExposurePreservingNonRelayTools = (next: "hidden" | "direct") => {
 		const beforeNonRelay = new Set(pi.getActiveTools().filter((name) => !RELAY_TOOL_NAMES.has(name)));
 		relayTools.setExposure(next);
 		const after = pi.getActiveTools();
 		const revivedNonRelay = after.some((name) => !RELAY_TOOL_NAMES.has(name) && !beforeNonRelay.has(name));
 		if (revivedNonRelay) {
-			for (const pending of findPendingBranchTools(currentCtx, pi)) {
-				preservedPendingTools.add(pending);
+			if (transcriptLoadoutRestored) {
+				for (const pending of findPendingBranchTools(currentCtx, beforeNonRelay)) {
+					preservedPendingTools.add(pending);
+				}
 			}
 			pi.setActiveTools(after.filter((name) => RELAY_TOOL_NAMES.has(name) || beforeNonRelay.has(name)));
 		}
 	};
 
 	const reconcilePreservedPendingTools = () => {
-		if (preservedPendingTools.size === 0) return;
-		const registered = new Set((pi.getAllTools?.() ?? []).map((tool) => tool.name));
+		if (preservedPendingTools.size === 0) {
+			transcriptLoadoutRestored = false;
+			return;
+		}
 		const active = pi.getActiveTools();
 		const activeSet = new Set(active);
-		const readyToAdd: string[] = [];
-		for (const name of [...preservedPendingTools]) {
-			if (!registered.has(name)) continue;
-			preservedPendingTools.delete(name);
-			if (!activeSet.has(name)) {
-				readyToAdd.push(name);
-			}
+		const candidates = [...preservedPendingTools].filter((name) => !activeSet.has(name));
+		// Expire the preserved pending loadout at run start, matching Pi 1.5.2's
+		// `_pendingToolNames.clear()` at run start (`agent-session.js:1511`).
+		preservedPendingTools.clear();
+		transcriptLoadoutRestored = false;
+		if (currentSessionId) {
+			getSharedLifecycle().preservedPendingToolsBySession.delete(currentSessionId);
 		}
-		if (readyToAdd.length > 0) {
-			pi.setActiveTools([...active, ...readyToAdd]);
+		if (candidates.length > 0) {
+			// Additive-only activation: Pi activates candidates that are now
+			// registered, non-hidden, and allowed, while ignoring still-hidden
+			// or disallowed names without clearing any active tools.
+			pi.setActiveTools([...active, ...candidates]);
 		}
 	};
 
@@ -665,18 +752,22 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 	const tryAppendSessionState = (enabled: boolean, notifyOnError: boolean): boolean => {
 		const shared = getSharedLifecycle();
-		// On Pi 0.85.1, once a previous append failed for this session, the
-		// in-memory `leafId` already points to an unsaved entry without rollback;
-		// do not append another entry onto that unsaved parent on disk.
-		const existingFallback = currentSessionId
-			? shared.sessionStateFallback.get(currentSessionId)
-			: undefined;
-		if (existingFallback?.unsafeLegacyLeaf) {
-			if (currentSessionId) {
-				shared.sessionStateFallback.set(currentSessionId, { enabled, unsafeLegacyLeaf: true });
+		// Normalize any legacy bare-boolean record first, then check whether the
+		// current branch still contains an unsaved failed entry on Pi 0.85.1.
+		const existingFallback = getNormalizedSessionFallback(
+			currentSessionId,
+			runtimeCaps.hasSettleCredentialWrites,
+		);
+		if (isCurrentBranchUnsafeLegacy(existingFallback, currentCtx)) {
+			if (currentSessionId && existingFallback) {
+				shared.sessionStateFallback.set(currentSessionId, {
+					...existingFallback,
+					enabled,
+				});
 			}
 			return false;
 		}
+		const leafBeforeAppend = currentCtx?.sessionManager.getLeafId?.() ?? null;
 		try {
 			pi.appendEntry(SESSION_STATE_ENTRY, { enabled } satisfies SessionRelayStateEntry);
 			if (currentSessionId) {
@@ -686,10 +777,25 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		} catch (error) {
 			// Retain an in-process session-scoped fallback across `/reload` so a
 			// failed disk/session write never silently flips this open session back.
+			// On Pi 0.85.1, record the exact unsaved leaf ID (when advanced) so
+			// writes remain blocked on this branch while `/tree` back to a persisted
+			// ancestor or sibling branch can write safely again.
 			if (currentSessionId) {
+				const legacyHost = !runtimeCaps.hasSettleCredentialWrites;
+				const leafAfterAppend = legacyHost ? (currentCtx?.sessionManager.getLeafId?.() ?? null) : null;
+				const priorIds = existingFallback?.failedEntryIds ?? [];
+				const nextFailedIds =
+					legacyHost && typeof leafAfterAppend === "string" && leafAfterAppend !== leafBeforeAppend
+						? [...new Set([...priorIds, leafAfterAppend])]
+						: [...priorIds];
+				const unsafeSessionWide = legacyHost
+					? Boolean(existingFallback?.unsafeSessionWide || nextFailedIds.length === 0)
+					: false;
 				shared.sessionStateFallback.set(currentSessionId, {
 					enabled,
-					unsafeLegacyLeaf: !runtimeCaps.hasSettleCredentialWrites,
+					unsafeLegacyLeaf: legacyHost,
+					failedEntryIds: nextFailedIds.length > 0 ? nextFailedIds : undefined,
+					unsafeSessionWide,
 				});
 			}
 			if (notifyOnError) {
@@ -1161,8 +1267,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		const seq = ++sessionStartSeq;
+		const startReason = (event as { reason?: unknown } | undefined)?.reason;
+		const isReloadStart = startReason === "reload";
 		const prev = worker;
 		clearPendingUiAndTimers();
 		disposeBorderBadge();
@@ -1195,6 +1303,18 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		promptHookActiveForRun = false;
 		sessionToggleInFlight = false;
 		preservedPendingTools.clear();
+		if (isReloadStart) {
+			const carried = shared.preservedPendingToolsBySession.get(incomingSessionId);
+			if (carried && carried.size > 0) {
+				for (const name of carried) preservedPendingTools.add(name);
+				transcriptLoadoutRestored = true;
+			} else {
+				transcriptLoadoutRestored = false;
+			}
+		} else {
+			transcriptLoadoutRestored = false;
+			shared.preservedPendingToolsBySession.clear();
+		}
 		currentEphemeralToken = retainedEphemeralToken;
 		currentPreservedEphemeralKey = retainedEphemeralKey && shared.preservedEphemeralKeys.has(retainedEphemeralKey)
 			? retainedEphemeralKey
@@ -1241,7 +1361,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			},
 		});
 
-		const sessionLookup = readSessionRelayState(ctx, incomingSessionId);
+		const sessionLookup = readSessionRelayState(
+			ctx,
+			incomingSessionId,
+			runtimeCaps.hasSettleCredentialWrites,
+		);
 		const defaultEnabled = loadRelayPreferences().defaultEnabled;
 		const shouldEnable = resolveInitialRelayEnabled(sessionLookup.value, defaultEnabled);
 
@@ -1445,9 +1569,14 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			clearTimeout(treeNavSafetyTimer);
 			treeNavSafetyTimer = undefined;
 		}
-		// Pi's `navigateTree()` runs `_restoreToolsFromTranscript()`, which can
-		// re-expose or deactivate `relay_*` tools from an older branch. Re-align
-		// them immediately with this session's current relay-mode state.
+		// Pi's `navigateTree()` calls `_restoreToolsFromTranscript()`, replacing
+		// any prior branch's pending loadout with the newly selected branch.
+		preservedPendingTools.clear();
+		if (currentSessionId) {
+			getSharedLifecycle().preservedPendingToolsBySession.delete(currentSessionId);
+		}
+		transcriptLoadoutRestored = true;
+		// Re-align `relay_*` tools immediately with this session's current relay state.
 		syncRelayToolVisibility();
 		scheduleFlushHeldNotices();
 	});
@@ -1465,6 +1594,17 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_shutdown", async (event) => {
 		const isReload = (event as { reason?: unknown } | undefined)?.reason === "reload";
+		const sharedForShutdown = getSharedLifecycle();
+		if (isReload && currentSessionId && preservedPendingTools.size > 0) {
+			sharedForShutdown.preservedPendingToolsBySession.set(
+				currentSessionId,
+				new Set(preservedPendingTools),
+			);
+		} else if (!isReload) {
+			sharedForShutdown.preservedPendingToolsBySession.clear();
+		}
+		preservedPendingTools.clear();
+		transcriptLoadoutRestored = false;
 		activeInSession = false;
 		disposeBorderBadge();
 		await disposeWorkerAsync({ preserveEphemeralDir: isReload });

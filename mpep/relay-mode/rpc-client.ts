@@ -28,6 +28,15 @@ export interface RpcEvent {
 	[key: string]: unknown;
 }
 
+interface UnixProcessSnapshot {
+	rootPid: number;
+	rootStartId?: string;
+	pids: Map<number, string>;
+	/** Monotonic `unixSnapshotVersion` when each PID was directly observed by a scan. */
+	pidVersions?: Map<number, number>;
+	pgids: Map<number, Set<number>>;
+}
+
 interface PendingRequest {
 	resolve: (data: unknown) => void;
 	reject: (error: Error) => void;
@@ -77,9 +86,7 @@ export class RelayRpcClient {
 	private stderrTail: string[] = [];
 	private processExited = false;
 	private stopPromise: Promise<void> | undefined;
-	private lastUnixSnapshot:
-		| { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> }
-		| undefined;
+	private lastUnixSnapshot: UnixProcessSnapshot | undefined;
 	private unixSnapshotVersion = 0;
 	private rootStartId: string | undefined;
 	private snapshotRefreshInFlight = false;
@@ -646,12 +653,14 @@ export class RelayRpcClient {
 					this.rootStartId = snap.rootStartId;
 				}
 				// Prune exited historical PIDs ONLY when no newer snapshot was installed
-				// while this async scan was in flight; on a version mismatch, add only
-				// stale-exclusive PIDs without replacing newer start identities or pruning.
+				// while this async scan was in flight; on a version mismatch, pass
+				// `staleStartedVersion` so we only defer to PIDs actually observed by a
+				// newer scan (`observedVersion > startedVersion`), while still updating
+				// stale historical carry-overs from older scans.
 				const isStale = this.unixSnapshotVersion !== startedVersion;
 				const merged = this.installUnixSnapshot(snap, {
 					pruneRows: isStale ? undefined : rows,
-					staleMerge: isStale,
+					staleStartedVersion: isStale ? startedVersion : undefined,
 				});
 				// If the worker exited while this verified scan was in flight, reap
 				// any surviving verified descendants that `proc.on("exit")` missed.
@@ -757,49 +766,72 @@ export class RelayRpcClient {
 	}
 
 	private installUnixSnapshot(
-		incoming: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
+		incoming: UnixProcessSnapshot,
 		options?: {
 			pruneRows?: Array<{ pid: number; ppid: number; pgid: number; startId: string }>;
-			staleMerge?: boolean;
+			staleStartedVersion?: number;
 		},
-	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
+	): UnixProcessSnapshot | undefined {
+		const nextVersion = this.unixSnapshotVersion + 1;
+		const incomingObservedVersion =
+			options?.staleStartedVersion !== undefined ? options.staleStartedVersion : nextVersion;
 		const merged = this.mergeUnixSnapshots(
 			this.lastUnixSnapshot,
 			incoming,
 			options?.pruneRows,
-			options?.staleMerge,
+			options?.staleStartedVersion,
+			incomingObservedVersion,
 		);
 		if (merged && (merged.rootStartId || merged.pids.size > 0 || merged.pgids.size > 0)) {
 			this.lastUnixSnapshot = merged;
-			this.unixSnapshotVersion += 1;
+			this.unixSnapshotVersion = nextVersion;
 			return merged;
 		}
 		return this.lastUnixSnapshot;
 	}
 
 	private mergeUnixSnapshots(
-		a?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
-		b?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
+		a?: UnixProcessSnapshot,
+		b?: UnixProcessSnapshot,
 		liveRows?: Array<{ pid: number; ppid: number; pgid: number; startId: string }>,
-		preserveAStartIds = false,
-	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
-		if (!a) return b;
+		staleStartedVersion?: number,
+		bObservedVersion = this.unixSnapshotVersion + 1,
+	): UnixProcessSnapshot | undefined {
+		if (!a) {
+			if (!b) return undefined;
+			const pidVersions = new Map<number, number>();
+			for (const k of b.pids.keys()) {
+				pidVersions.set(k, b.pidVersions?.get(k) ?? bObservedVersion);
+			}
+			return { ...b, pidVersions };
+		}
 		if (!b) return a;
 		// When a fresh process table is available, prune already-exited entries from
 		// prior scans so long-lived workers do not accumulate dead PIDs unboundedly,
 		// while preserving still-living reparented descendants with verified startIds.
 		const liveByPid = liveRows ? new Map(liveRows.map((r) => [r.pid, r])) : undefined;
 		const pids = new Map<number, string>();
+		const pidVersions = new Map<number, number>();
 		for (const [k, v] of a.pids) {
 			if (!liveByPid || liveByPid.get(k)?.startId === v) {
 				pids.set(k, v);
+				pidVersions.set(k, a.pidVersions?.get(k) ?? 0);
 			}
 		}
 		for (const [k, v] of b.pids) {
-			// When merging an older/stale scan `b` into a newer snapshot `a`, never
-			// overwrite a newer start identity already recorded for the same PID.
-			if (preserveAStartIds && pids.has(k)) continue;
+			// When merging a late async scan `b` (started at `staleStartedVersion`)
+			// into a newer snapshot `a`, preserve `a`'s startId ONLY if a scan newer
+			// than `staleStartedVersion` directly observed PID `k`. Historical PIDs
+			// carried over from scans at or before `staleStartedVersion` must yield
+			// to `b`'s fresher observation (e.g. a reused PID that then reparented).
+			if (staleStartedVersion !== undefined && pids.has(k)) {
+				const existingVersion = pidVersions.get(k) ?? 0;
+				if (existingVersion > staleStartedVersion) {
+					continue;
+				}
+			}
 			pids.set(k, v);
+			pidVersions.set(k, b.pidVersions?.get(k) ?? bObservedVersion);
 		}
 		const pgids = new Map<number, Set<number>>();
 		for (const [pgid, set] of a.pgids) {
@@ -819,7 +851,13 @@ export class RelayRpcClient {
 			for (const p of set) target.add(p);
 			pgids.set(pgid, target);
 		}
-		return { rootPid: a.rootPid, rootStartId: a.rootStartId ?? b.rootStartId, pids, pgids };
+		return {
+			rootPid: a.rootPid,
+			rootStartId: a.rootStartId ?? b.rootStartId,
+			pids,
+			pidVersions,
+			pgids,
+		};
 	}
 
 	private reapUnixSnapshot(snapshot: {

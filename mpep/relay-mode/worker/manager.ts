@@ -142,6 +142,8 @@ export class RelayWorkerManager {
 	private cleanupCompleted = false;
 	private cleanupListeners = new Set<() => void>();
 	private generation = 0;
+	private runGeneration = 0;
+	private pendingStatsHydration = false;
 	private startingClient: RelayRpcClient | undefined;
 	private retiringClient: RelayRpcClient | undefined;
 	private startupPromise: Promise<void> | undefined;
@@ -621,8 +623,20 @@ export class RelayWorkerManager {
 			// so an in-flight turn is never double-counted on `turn_end`.
 			const idleAfterSessionSwitch = switchedSession && state.isStreaming === false;
 			if (!includeStats && !idleAfterSessionSwitch) return;
+			const statsRunGen = this.runGeneration;
+			const statsSessionId = this.meta.sessionId;
 			const stats = await client.getSessionStats();
 			if (this.client !== client) return;
+			if (this.meta.sessionId !== statsSessionId) return;
+			// If a worker run started (or progressed) between `get_state` and
+			// `get_session_stats`, discard this snapshot so an assistant message
+			// persisted at `message_end` is not counted again on `turn_end`, and
+			// re-hydrate once the worker returns to idle.
+			if (this.runGeneration !== statsRunGen || (!includeStats && this.status !== "idle")) {
+				this.pendingStatsHydration = true;
+				return;
+			}
+			this.pendingStatsHydration = false;
 			const contextUsage = stats.contextUsage as { tokens?: unknown; contextWindow?: unknown } | undefined;
 			if (typeof contextUsage?.tokens === "number") {
 				this.contextTokens = contextUsage.tokens;
@@ -657,6 +671,10 @@ export class RelayWorkerManager {
 		if (this.status === next) return;
 		this.status = next;
 		this.hooks.onStateChange();
+		if (next === "idle" && this.pendingStatsHydration && this.client && !this.disposed) {
+			this.pendingStatsHydration = false;
+			void this.refreshStateFromRpc(this.client, { includeStats: true });
+		}
 	}
 
 	private getActiveToolSummary(): string | undefined {
@@ -671,6 +689,7 @@ export class RelayWorkerManager {
 
 		switch (event.type) {
 			case "agent_start": {
+				this.runGeneration += 1;
 				this.touchHeartbeat();
 				this.runStartedAt = Date.now();
 				this.sawAgentEnd = false;
@@ -686,13 +705,18 @@ export class RelayWorkerManager {
 				break;
 			}
 			case "turn_start":
+			case "message_end":
 			case "summarization_retry_scheduled":
 			case "summarization_retry_attempt_start":
 			case "summarization_retry_finished": {
+				if (event.type === "turn_start" || event.type === "message_end") {
+					this.runGeneration += 1;
+				}
 				this.touchHeartbeat();
 				break;
 			}
 			case "turn_end": {
+				this.runGeneration += 1;
 				this.touchHeartbeat();
 				const msg = event.message as Record<string, unknown> | undefined;
 				if (msg && msg.role === "assistant") {
