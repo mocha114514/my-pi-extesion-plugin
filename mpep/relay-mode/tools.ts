@@ -98,16 +98,25 @@ function requireWorker(host: RelayToolsHost, ctx: ExtensionContext): RelayWorker
 	return worker;
 }
 
-export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void {
-	// Register relay tools as `deferred` on Pi >= 1.5 so inactive/default-off
-	// sessions do not activate them on registration or have to call
-	// `pi.setActiveTools()` (which would clear `_pendingToolNames` for lazily
-	// reconnecting MCP servers). Pi 0.85.1 ignores the extra `exposure` field
-	// and falls back to `hideRelayTools()`.
+export interface RelayToolsController {
+	/**
+	 * Switch tool exposure between `"hidden"` (inactive sessions on Pi >= 1.5:
+	 * non-declarable, non-searchable by `tool_search`, non-callable by `codemode`,
+	 * and ineligible during branch restoration so `_pendingToolNames` stays intact)
+	 * and `"direct"` (active relay sessions). Pi 0.85.1 ignores `exposure`.
+	 */
+	setExposure(exposure: "hidden" | "direct"): void;
+}
+
+export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): RelayToolsController {
+	const definitions: Array<Parameters<ExtensionAPI["registerTool"]>[0]> = [];
+	let currentExposure: "hidden" | "direct" = "hidden";
+
 	const registerRelayTool: ExtensionAPI["registerTool"] = (definition) => {
+		definitions.push(definition as Parameters<ExtensionAPI["registerTool"]>[0]);
 		pi.registerTool({
 			...definition,
-			exposure: "deferred",
+			exposure: currentExposure,
 		} as typeof definition);
 	};
 
@@ -319,4 +328,17 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 			};
 		},
 	});
+
+	return {
+		setExposure(next: "hidden" | "direct") {
+			if (next === currentExposure) return;
+			currentExposure = next;
+			for (const definition of definitions) {
+				pi.registerTool({
+					...definition,
+					exposure: next,
+				} as typeof definition);
+			}
+		},
+	};
 }

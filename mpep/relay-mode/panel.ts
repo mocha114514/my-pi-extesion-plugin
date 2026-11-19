@@ -12,6 +12,7 @@
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
+	getKeybindings,
 	Key,
 	matchesKey,
 	truncateToWidth,
@@ -62,18 +63,27 @@ export class RelayModePanel implements Component {
 		if (this.closed) return;
 		const matches = (action: PanelKey): boolean => {
 			if (this.options.matches) return this.options.matches(data, action);
-			switch (action) {
-				case "tui.select.up":
-					return matchesKey(data, Key.up);
-				case "tui.select.down":
-					return matchesKey(data, Key.down);
-				case "tui.select.confirm":
-					return matchesKey(data, Key.enter);
-				case "tui.select.cancel":
-					return matchesKey(data, Key.escape);
+			try {
+				return getKeybindings().matches(data, action);
+			} catch {
+				switch (action) {
+					case "tui.select.up":
+						return matchesKey(data, Key.up);
+					case "tui.select.down":
+						return matchesKey(data, Key.down);
+					case "tui.select.confirm":
+						return matchesKey(data, Key.enter);
+					case "tui.select.cancel":
+						return matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"));
+				}
 			}
 		};
-		if (matches("tui.select.cancel") || data === "q" || data === "Q") {
+		if (
+			matches("tui.select.cancel") ||
+			matchesKey(data, Key.alt("r")) ||
+			data === "q" ||
+			data === "Q"
+		) {
 			this.close();
 		} else if (matchesKey(data, Key.home)) {
 			this.selectedIndex = 0;

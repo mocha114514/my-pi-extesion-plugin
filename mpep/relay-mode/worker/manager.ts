@@ -1325,16 +1325,19 @@ export class RelayWorkerManager {
 				? `\n${capturedNotices.map((n) => `[${n.level}] ${sanitizeControlText(n.message, 500)}`).join("\n")}`
 				: "";
 
-			if (disposition === "handled") {
+			if (disposition === "handled" || (disposition === undefined && commandName !== undefined)) {
 				// Extension slash commands (e.g. ctx.newSession()) can switch the worker's
-				// active session without starting an agent turn; refresh meta promptly so
-				// a subsequent toggle-off or restart resumes the updated session.
+				// active session without starting an agent turn on both Pi 1.5.2 (`handled`)
+				// and Pi 0.85.1 (omitted disposition); refresh meta promptly so a subsequent
+				// toggle-off or restart resumes the updated session.
 				if (this.client === client && client.alive) {
 					await Promise.race([
 						this.refreshStateFromRpc(client),
 						new Promise<void>((resolve) => setTimeout(resolve, 1_500)),
 					]);
 				}
+			}
+			if (disposition === "handled") {
 				return `Handled by a worker extension (check relay_status if it started a background turn).${noticesSuffix}`;
 			}
 			if (disposition === "queued") {
@@ -1656,7 +1659,8 @@ export class RelayWorkerManager {
 		this.cleanupListeners.clear();
 	}
 
-	dispose(sync = false): void {
+	dispose(sync = false, options?: { preserveEphemeralDir?: boolean }): void {
+		const removeEphemeralDir = !options?.preserveEphemeralDir;
 		if (sync) {
 			if (this.cleanupCompleted) return;
 			this.syncDisposed = true;
@@ -1665,7 +1669,7 @@ export class RelayWorkerManager {
 			const hadOwnership = this.dirLock.ownsDirectory;
 			const stopped = this.cleanupClientSync();
 			if (!stopped) {
-				if (this.ephemeral && this.retiringClient && !this.retiringClient.hasExited()) {
+				if (this.ephemeral && removeEphemeralDir && this.retiringClient && !this.retiringClient.hasExited()) {
 					const pid = this.retiringClient.pid();
 					if (pid !== undefined) {
 						spawnDetachedEphemeralReaper({
@@ -1682,17 +1686,23 @@ export class RelayWorkerManager {
 				// Schedule deferred in-process lock/dir finalizer so `/reload`
 				// retains tracking until a stubborn worker actually exits, while
 				// still allowing a later final process-exit `dispose(true)` retry.
-				this.scheduleDeferredDisposalFinalizer(hadOwnership, true);
+				this.scheduleDeferredDisposalFinalizer(hadOwnership, removeEphemeralDir);
 				return;
 			}
-			finalizeWorkerDirectoryOwnership(this.dirLock, this.dir, this.sessionRootDir, this.ephemeral, hadOwnership);
+			finalizeWorkerDirectoryOwnership(
+				this.dirLock,
+				this.dir,
+				this.sessionRootDir,
+				this.ephemeral && removeEphemeralDir,
+				hadOwnership,
+			);
 			this.markCleanupCompleted();
 			return;
 		}
 		if (this.disposed) return;
 		this.disposed = true;
 		this.generation += 1;
-		void this.disposeAsync();
+		void this.disposeAsync(options);
 	}
 
 	private scheduleDeferredDisposalFinalizer(hadOwnership: boolean, removeEphemeralDir = true): void {

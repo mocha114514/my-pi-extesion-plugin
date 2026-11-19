@@ -112,15 +112,24 @@ export function finalizeWorkerDirectoryOwnership(
 export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd: string): boolean {
 	const sessionRoot = path.resolve(launchCwd, mainSessionDir(storageKey));
 	const dir = path.resolve(launchCwd, workerDir(storageKey));
-	if (!fs.existsSync(sessionRoot)) return true;
+	if (!fs.existsSync(dir)) {
+		try {
+			fs.rmdirSync(sessionRoot);
+		} catch {
+			// Parent directory may not exist or may hold unrelated files; leave it alone.
+		}
+		return true;
+	}
 	const lock = new WorkerDirectoryLock(sessionRoot, dir, launchCwd);
 	const acquired = lock.acquireOwnership();
 	if (!acquired.ok) return false;
 	try {
 		finalizeWorkerDirectoryOwnership(lock, dir, sessionRoot, true, true);
-		return !fs.existsSync(sessionRoot);
+		// Treat removal of the owned `worker/` directory as success even if a
+		// non-empty parent directory intentionally remains on disk.
+		return !fs.existsSync(dir);
 	} catch {
 		lock.releaseOwnership();
-		return !fs.existsSync(sessionRoot);
+		return !fs.existsSync(dir);
 	}
 }

@@ -504,6 +504,9 @@ export class RelayRpcClient {
 				? this.collectUnixDescendants(proc.pid)
 				: undefined;
 		if (preAbortSnapshot) {
+			if (!this.rootStartId && preAbortSnapshot.rootStartId) {
+				this.rootStartId = preAbortSnapshot.rootStartId;
+			}
 			this.lastUnixSnapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, preAbortSnapshot);
 		}
 
@@ -632,11 +635,13 @@ export class RelayRpcClient {
 				if (rows.length === 0) return;
 				const snap = this.buildUnixDescendantsSnapshot(rootPid, rows);
 				const stillLive = this.isProcessRunning(proc);
-				// Never trust a late scan whose root PID now belongs to a different
-				// process birth timestamp, or a first-ever scan arriving after the
-				// worker already exited (PID could already have been recycled).
-				if (expectedRootStartId) {
-					if (snap.rootStartId && snap.rootStartId !== expectedRootStartId) return;
+				// Consult the latest verified root identity learned for this exact child
+				// handle (including synchronous pre-abort scans completed while this
+				// async `ps` call was in flight) before rejecting a late scan.
+				const verifiedRootStartId =
+					this.rootStartId ?? expectedRootStartId ?? this.lastUnixSnapshot?.rootStartId;
+				if (verifiedRootStartId) {
+					if (snap.rootStartId && snap.rootStartId !== verifiedRootStartId) return;
 				} else if (snap.rootStartId) {
 					if (!stillLive) return;
 					this.rootStartId = snap.rootStartId;

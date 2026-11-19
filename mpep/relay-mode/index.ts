@@ -51,6 +51,7 @@ interface SharedLifecycleState {
 	retiring: Set<RelayWorkerManager>;
 	preservedEphemeralKeys: Set<string>;
 	ephemeralTokens: Map<string, string>;
+	sessionStateFallback: Map<string, boolean>;
 	activeEphemeralKey: string | undefined;
 	exitListener: (() => void) | undefined;
 	unregisterSigint: (() => void) | undefined;
@@ -68,6 +69,7 @@ function getSharedLifecycle(): SharedLifecycleState {
 			retiring: new Set<RelayWorkerManager>(),
 			preservedEphemeralKeys: new Set<string>(),
 			ephemeralTokens: new Map<string, string>(),
+			sessionStateFallback: new Map<string, boolean>(),
 			activeEphemeralKey: undefined,
 			exitListener: undefined,
 			unregisterSigint: undefined,
@@ -76,6 +78,7 @@ function getSharedLifecycle(): SharedLifecycleState {
 	} else {
 		if (!state.preservedEphemeralKeys) state.preservedEphemeralKeys = new Set<string>();
 		if (!state.ephemeralTokens) state.ephemeralTokens = new Map<string, string>();
+		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, boolean>();
 	}
 	return state;
 }
@@ -132,7 +135,10 @@ function disposeAllGlobalWorkersSync(preserveEphemeralForReload = false): void {
 		state.active = undefined;
 	}
 	for (const target of targets) {
-		target.dispose(true);
+		if (preserveEphemeralForReload && target.ephemeral) {
+			state.preservedEphemeralKeys.add(target.storageKey);
+		}
+		target.dispose(true, { preserveEphemeralDir: preserveEphemeralForReload });
 		if (target.isCleanupCompleted()) {
 			state.retiring.delete(target);
 		} else {
@@ -144,6 +150,7 @@ function disposeAllGlobalWorkersSync(preserveEphemeralForReload = false): void {
 	if (!preserveEphemeralForReload) {
 		state.activeEphemeralKey = undefined;
 		state.ephemeralTokens.clear();
+		state.sessionStateFallback.clear();
 		purgePreservedEphemeralKeys();
 	}
 	maybeDetachGlobalSignalHandlers();
@@ -180,7 +187,16 @@ export function resolveInitialRelayEnabled(
 	return sessionState !== undefined ? sessionState : defaultEnabled;
 }
 
-function readSessionRelayState(ctx: ExtensionContext): boolean | undefined {
+function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): boolean | undefined {
+	// If an earlier write for this exact session failed in this process (e.g.
+	// read-only session store), honor the in-process fallback across `/reload`
+	// so the user's toggle or initial session lock cannot silently flip back.
+	if (sessionId) {
+		const fallback = getSharedLifecycle().sessionStateFallback.get(sessionId);
+		if (typeof fallback === "boolean") {
+			return fallback;
+		}
+	}
 	try {
 		// Read session entries in append order (rather than only the active tree
 		// branch) because relay mode is a session-level toggle: disabling it and
@@ -339,7 +355,9 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 	if (!isPluginEnabled("relay-mode")) {
 		// Even while disabled, strip historical relay-mode reminders/notices from
-		// replayed transcripts so they never direct a non-relay session.
+		// replayed transcripts so they never direct a non-relay session, and clean
+		// up any preserved ephemeral worker state carried over from a reload before
+		// the plugin was disabled.
 		pi.on("context", (event) => {
 			const filtered = event.messages.filter((msg) => {
 				const rec = msg as unknown as { role?: unknown; customType?: unknown };
@@ -347,6 +365,33 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			});
 			if (filtered.length !== event.messages.length) {
 				return { messages: filtered };
+			}
+		});
+		const cleanupDisabledState = (incomingSessionId?: string) => {
+			const shared = getSharedLifecycle();
+			// Drop any preserved ephemeral state not belonging to an active session
+			// (the plugin is disabled, so no session needs preserved worker dirs).
+			shared.activeEphemeralKey = undefined;
+			for (const sid of [...shared.ephemeralTokens.keys()]) {
+				if (!incomingSessionId || sid !== incomingSessionId) {
+					shared.ephemeralTokens.delete(sid);
+				}
+			}
+			for (const sid of [...shared.sessionStateFallback.keys()]) {
+				if (!incomingSessionId || sid !== incomingSessionId) {
+					shared.sessionStateFallback.delete(sid);
+				}
+			}
+			purgePreservedEphemeralKeys();
+			maybeDetachGlobalSignalHandlers();
+		};
+		pi.on("session_start", (_event, ctx) => {
+			cleanupDisabledState(ctx.sessionManager.getSessionId() || undefined);
+		});
+		pi.on("session_shutdown", (event) => {
+			const isReload = (event as { reason?: unknown } | undefined)?.reason === "reload";
+			if (!isReload) {
+				cleanupDisabledState();
 			}
 		});
 		return;
@@ -477,7 +522,13 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		heldNotices.length = 0;
 	};
 
+	const relayTools = registerRelayTools(pi, {
+		isActive: () => activeInSession,
+		getWorker: () => worker,
+	});
+
 	const hideRelayTools = () => {
+		relayTools.setExposure("hidden");
 		const active = pi.getActiveTools();
 		const filtered = active.filter((name) => !RELAY_TOOL_NAMES.has(name));
 		if (filtered.length !== active.length) {
@@ -490,6 +541,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			hideRelayTools();
 			return;
 		}
+		relayTools.setExposure("direct");
 		const active = pi.getActiveTools();
 		const missing = [...RELAY_TOOL_NAMES].filter((name) => !active.includes(name));
 		if (missing.length > 0) {
@@ -497,10 +549,20 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	const tryAppendSessionState = (enabled: boolean, notifyOnError: boolean) => {
+	const tryAppendSessionState = (enabled: boolean, notifyOnError: boolean): boolean => {
+		const shared = getSharedLifecycle();
 		try {
 			pi.appendEntry(SESSION_STATE_ENTRY, { enabled } satisfies SessionRelayStateEntry);
+			if (currentSessionId) {
+				shared.sessionStateFallback.delete(currentSessionId);
+			}
+			return true;
 		} catch (error) {
+			// Retain an in-process session-scoped fallback across `/reload` so a
+			// failed disk/session write never silently flips this open session back.
+			if (currentSessionId) {
+				shared.sessionStateFallback.set(currentSessionId, enabled);
+			}
 			if (notifyOnError) {
 				currentCtx?.ui.notify(
 					t("relay.panel.saveFailed", {
@@ -509,6 +571,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 					"error",
 				);
 			}
+			return false;
 		}
 	};
 
@@ -544,7 +607,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			shared.active = undefined;
 		}
 		if (active) {
-			active.dispose(true);
+			if (preserveEphemeralForReload && active.ephemeral) {
+				shared.preservedEphemeralKeys.add(active.storageKey);
+			}
+			active.dispose(true, { preserveEphemeralDir: preserveEphemeralForReload });
 			if (!active.isCleanupCompleted()) {
 				trackGlobalRetiringWorker(active);
 			}
@@ -586,6 +652,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			if (!preserve) {
 				if (currentSessionId) {
 					shared.ephemeralTokens.delete(currentSessionId);
+					shared.sessionStateFallback.delete(currentSessionId);
 				}
 				shared.activeEphemeralKey = undefined;
 				purgeCurrentPreservedEphemeralDir();
@@ -618,6 +685,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			return false;
 		}
 
+		// Expose relay tools as `direct` (Pi >= 1.5 activates newly exposed tools
+		// via refreshTools while respecting --tools/--exclude-tools and preserving
+		// pending MCP tools; Pi 0.85.1 activates them via setActiveTools below).
+		relayTools.setExposure("direct");
 		const activeTools = pi.getActiveTools();
 		const missingRelayTools = [...RELAY_TOOL_NAMES].filter((name) => !activeTools.includes(name));
 		if (missingRelayTools.length > 0) {
@@ -870,16 +941,14 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Fallback when border widget has not captured a TUI instance yet.
+		// Fallback when border widget has not captured a TUI instance yet:
+		// call ONLY `done()` once (never `handle.hide()` + `done()`, which pops two
+		// overlays on Pi 0.85.1).
 		let fallbackDone: (() => void) | undefined;
-		let fallbackHandle: OverlayHandle | undefined;
 		const closeFallback = () => {
-			if (fallbackHandle) {
-				const h = fallbackHandle;
-				fallbackHandle = undefined;
-				h.hide();
-			}
-			fallbackDone?.();
+			const done = fallbackDone;
+			fallbackDone = undefined;
+			done?.();
 		};
 		closeActivePanel = closeFallback;
 		try {
@@ -890,32 +959,23 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 					return buildPanel(
 						theme,
 						() => hostTui.terminal.rows,
-						() => done(),
+						closeFallback,
 						(data, action) => keys.matches(data, action),
 					);
 				},
 				{
 					overlay: true,
 					overlayOptions,
-					onHandle: (handle) => {
-						fallbackHandle = handle;
-					},
 				},
 			);
 		} finally {
 			if (closeActivePanel === closeFallback) closeActivePanel = undefined;
 			fallbackDone = undefined;
-			fallbackHandle = undefined;
 			panelOpen = false;
 			panelTui = undefined;
 			borderBadge?.sync();
 		}
 	};
-
-	registerRelayTools(pi, {
-		isActive: () => activeInSession,
-		getWorker: () => worker,
-	});
 
 	// Keyboard fallback (Alt+R) for non-fullscreen / mouse-disabled terminals
 	// without registering any foreground slash commands.
@@ -977,6 +1037,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				shared.ephemeralTokens.delete(sid);
 			}
 		}
+		for (const sid of [...shared.sessionStateFallback.keys()]) {
+			if (sid !== incomingSessionId) {
+				shared.sessionStateFallback.delete(sid);
+			}
+		}
 
 		// Wait for any prior worker teardown (from a prior session or toggle-off)
 		// before cleaning stale ephemeral directories or starting a new worker.
@@ -1006,7 +1071,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			},
 		});
 
-		const sessionOverride = readSessionRelayState(ctx);
+		const sessionOverride = readSessionRelayState(ctx, incomingSessionId);
 		const defaultEnabled = loadRelayPreferences().defaultEnabled;
 		const shouldEnable = resolveInitialRelayEnabled(sessionOverride, defaultEnabled);
 
@@ -1014,7 +1079,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			// Record the session's initial inherited state so changing the long-term
 			// default later and running `/reload` never alters this open session.
 			if (sessionOverride === undefined) {
-				tryAppendSessionState(false, false);
+				tryAppendSessionState(false, true);
 			}
 			hideRelayTools();
 			borderBadge?.sync();
@@ -1024,7 +1089,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const tSeq = ++toggleSeq;
 		const activated = await activateSessionRelay(ctx, seq, tSeq, sessionOverride === undefined);
 		if (!activated && sessionOverride === undefined && seq === sessionStartSeq) {
-			tryAppendSessionState(false, false);
+			tryAppendSessionState(false, true);
 		}
 	});
 
@@ -1099,12 +1164,21 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
-		if (!activeInSession || !currentConfig?.relayPrompt) return;
+		if (!activeInSession || !currentConfig?.relayPrompt) {
+			promptHookActiveForRun = false;
+			return;
+		}
 		promptHookActiveForRun = true;
 		const resumeNotice = pendingResumeNotice;
 		pendingResumeNotice = undefined;
+		// Explicitly scope the system-level relay prompt to turns where relay_*
+		// tools remain active so mid-run deactivation does not conflict with
+		// system-priority instructions on subsequent turns of the same run.
+		const conditionalHeader =
+			"[Relay-mode runtime condition: The relay-mode instructions below apply ONLY while relay_* tools are active in this turn. " +
+			"If relay_* tools are unavailable or a runtime notice states that relay mode was disabled mid-run, ignore the relay-mode instructions and answer the user directly.]";
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${currentConfig.relayPrompt}`,
+			systemPrompt: `${event.systemPrompt}\n\n${conditionalHeader}\n\n${currentConfig.relayPrompt}`,
 			...(resumeNotice ? {
 				message: {
 					customType: NOTICE_TYPE,
@@ -1113,6 +1187,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				},
 			} : {}),
 		};
+	});
+
+	pi.on("agent_end", () => {
+		promptHookActiveForRun = false;
 	});
 
 	pi.on("agent_settled", () => {

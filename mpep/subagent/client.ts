@@ -519,6 +519,12 @@ export class RpcSubprocess {
 				process.platform !== "win32" && pid !== undefined
 					? this.collectUnixTreeSnapshot(pid)
 					: null;
+			const leaderPid = pid;
+			let leaderExitedDuringKill = false;
+			const markLeaderExited = () => {
+				leaderExitedDuringKill = true;
+			};
+			proc.once("exit", markLeaderExited);
 			try {
 				if (process.platform === "win32") {
 					if (pid !== undefined) taskkillTree(pid, false);
@@ -535,15 +541,34 @@ export class RpcSubprocess {
 				// Already gone.
 			}
 			const timer = setTimeout(() => {
+				proc.removeListener("exit", markLeaderExited);
 				try {
 					if (process.platform === "win32") {
 						if (pid !== undefined) taskkillTree(pid, true);
-					} else if (pid !== undefined) {
+					} else if (leaderPid !== undefined) {
 						const reaped = unixSnapshot ? this.reapVerifiedUnixSnapshot(unixSnapshot) : false;
-						if (!reaped && this.isLiveChildProc(proc)) {
-							const liveStartId = capturedRootStartId ? this.readUnixStartId(pid) : undefined;
-							if (!capturedRootStartId || liveStartId === undefined || liveStartId === capturedRootStartId) {
-								process.kill(-pid, "SIGKILL");
+						if (!reaped) {
+							if (this.isLiveChildProc(proc)) {
+								const liveStartId = capturedRootStartId ? this.readUnixStartId(leaderPid) : undefined;
+								if (!capturedRootStartId || liveStartId === undefined || liveStartId === capturedRootStartId) {
+									process.kill(-leaderPid, "SIGKILL");
+								}
+							} else if (unixSnapshot === null && leaderExitedDuringKill) {
+								// POSIX invariant: while an orphaned process group still has live
+								// members, its PGID cannot be reused; and any brand-new group with
+								// PGID == leaderPid would require a live leader process at PID == leaderPid.
+								// Therefore, if PID `leaderPid` is ESRCH (not recycled) while PGID `-leaderPid`
+								// is still alive, any surviving members belong exclusively to our exited group.
+								let pidReused = false;
+								try {
+									process.kill(leaderPid, 0);
+									pidReused = true;
+								} catch (err) {
+									pidReused = (err as NodeJS.ErrnoException).code === "EPERM";
+								}
+								if (!pidReused) {
+									process.kill(-leaderPid, "SIGKILL");
+								}
 							}
 						}
 					}
