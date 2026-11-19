@@ -1052,29 +1052,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 	};
 
-	const deactivateSessionRelay = async (
-		expectedSessionSeq: number,
-		expectedToggleSeq: number,
-		persistEntry: boolean,
-	): Promise<void> => {
-		activeInSession = false;
-		currentConfig = undefined;
-		milestones = [];
-		firedMilestones.clear();
-		pendingResumeNotice = undefined;
-		// Keep `promptHookActiveForRun` intact until `agent_settled` so any mid-run
-		// LLM requests know to emit a request-only deactivation override in `context`.
-		hideRelayTools();
-		if (persistEntry) {
-			tryAppendSessionState(false, true);
-		}
-		borderBadge?.sync();
-		await disposeWorkerAsync({ preserveEphemeralDir: true });
-		if (expectedSessionSeq === sessionStartSeq && expectedToggleSeq === toggleSeq) {
-			borderBadge?.sync();
-		}
-	};
-
 	const openRelayModePanel = async (ctx: ExtensionContext): Promise<void> => {
 		if (!ctx.hasUI || ctx.mode !== "tui" || panelOpen) return;
 		const openToken = ++panelOpenSeq;
@@ -1098,19 +1075,18 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				getDefaultEnabled: () => defaultEnabled,
 				isBusy: () => sessionToggleInFlight,
 				onToggleSession: (next) => {
+					// Relay mode is a one-way latch per session: once active, it stays
+					// locked on to protect prompt cache stability and context continuity.
 					const liveCtx = currentCtx;
-					if (!liveCtx || sessionToggleInFlight || next === activeInSession) return;
+					if (!liveCtx || sessionToggleInFlight || !next || activeInSession) return;
 					const expectedSessionSeq = sessionStartSeq;
 					const expectedToggleSeq = ++toggleSeq;
 					sessionToggleInFlight = true;
 					panelTui?.requestRender();
-					const task = next
-						? activateSessionRelay(liveCtx, expectedSessionSeq, expectedToggleSeq, true)
-						: deactivateSessionRelay(expectedSessionSeq, expectedToggleSeq, true);
-					void task
+					void activateSessionRelay(liveCtx, expectedSessionSeq, expectedToggleSeq, true)
 						.catch((error) => {
 							currentCtx?.ui.notify(
-								`Failed to toggle relay mode: ${error instanceof Error ? error.message : String(error)}`,
+								`Failed to enable relay mode: ${error instanceof Error ? error.message : String(error)}`,
 								"error",
 							);
 						})
@@ -1399,26 +1375,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				const rec = msg as unknown as { role?: unknown; customType?: unknown };
 				return !(rec.role === "custom" && (rec.customType === REMIND_TYPE || rec.customType === NOTICE_TYPE));
 			});
-			// If the user disabled relay mode mid-turn after `before_agent_start`
-			// already appended `<relay-mode>` to the active systemPrompt, add a
-			// request-only override so the model immediately stops calling relay_*
-			// tools on remaining turns of this run.
-			if (promptHookActiveForRun) {
-				return {
-					messages: [
-						...filtered,
-						{
-							role: "custom",
-							customType: NOTICE_TYPE,
-							content:
-								"[Relay mode disabled] The user disabled relay mode during this run. " +
-								"Do NOT call any relay_* tools; handle the user's request directly.",
-							display: false,
-							timestamp: Date.now(),
-						} as typeof event.messages[number],
-					],
-				};
-			}
 			if (filtered.length !== event.messages.length) {
 				return { messages: filtered };
 			}
@@ -1469,14 +1425,8 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		promptHookActiveForRun = true;
 		const resumeNotice = pendingResumeNotice;
 		pendingResumeNotice = undefined;
-		// Explicitly scope the system-level relay prompt to turns where relay_*
-		// tools remain active so mid-run deactivation does not conflict with
-		// system-priority instructions on subsequent turns of the same run.
-		const conditionalHeader =
-			"[Relay-mode runtime condition: The relay-mode instructions below apply ONLY while relay_* tools are active in this turn. " +
-			"If relay_* tools are unavailable or a runtime notice states that relay mode was disabled mid-run, ignore the relay-mode instructions and answer the user directly.]";
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n${conditionalHeader}\n\n${currentConfig.relayPrompt}`,
+			systemPrompt: `${event.systemPrompt}\n\n${currentConfig.relayPrompt}`,
 			...(resumeNotice ? {
 				message: {
 					customType: NOTICE_TYPE,

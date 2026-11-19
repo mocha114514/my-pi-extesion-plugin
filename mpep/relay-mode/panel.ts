@@ -3,9 +3,10 @@
  *
  * Triggered by clicking the `relay mode` indicator on the right side of the
  * editor bottom border. Supports both keyboard and mouse interaction and keeps
- * two independent toggles:
- *   1. Current session relay mode (takes effect immediately; disabling stops
- *      the worker gracefully while preserving its session history files).
+ * two controls:
+ *   1. Current session relay mode (one-way latch: once enabled in a session,
+ *      it stays locked on and cannot be turned off to preserve prompt cache
+ *      stability and context continuity).
  *   2. Long-term default for new sessions (persisted to preferences.json;
  *      never alters the currently open window's relay mode state).
  */
@@ -55,6 +56,12 @@ export class RelayModePanel implements Component {
 
 	constructor(options: RelayModePanelOptions) {
 		this.options = options;
+		// When relay mode is already locked on for this session, focus the
+		// long-term default toggle initially while still allowing navigation to
+		// row 0 to read its locked status note.
+		if (options.getSessionEnabled()) {
+			this.selectedIndex = 1;
+		}
 	}
 
 	invalidate(): void {}
@@ -158,18 +165,25 @@ export class RelayModePanel implements Component {
 		const stateWidth = Math.max(visibleWidth(on), visibleWidth(off));
 		const busy = this.options.isBusy();
 
+		const sessionEnabled = this.options.getSessionEnabled();
 		const toggles = [
 			{
 				index: 0,
-				enabled: this.options.getSessionEnabled(),
+				enabled: sessionEnabled,
+				locked: sessionEnabled,
 				label: busy
 					? `${t("relay.panel.sessionToggle")} (${t("relay.panel.updating")})`
-					: t("relay.panel.sessionToggle"),
-				desc: t("relay.panel.sessionDesc"),
+					: sessionEnabled
+						? `${t("relay.panel.sessionToggle")} (${t("relay.panel.sessionLocked")})`
+						: t("relay.panel.sessionToggle"),
+				desc: sessionEnabled
+					? t("relay.panel.sessionDescLocked")
+					: t("relay.panel.sessionDesc"),
 			},
 			{
 				index: 1,
 				enabled: this.options.getDefaultEnabled(),
+				locked: false,
 				label: t("relay.panel.defaultToggle"),
 				desc: t("relay.panel.defaultDesc"),
 			},
@@ -263,8 +277,10 @@ export class RelayModePanel implements Component {
 
 	private activate(): void {
 		if (this.selectedIndex === 0) {
-			if (this.options.isBusy()) return;
-			this.options.onToggleSession(!this.options.getSessionEnabled());
+			// Once enabled in a session, relay mode is intentionally locked on
+			// and cannot be turned off.
+			if (this.options.isBusy() || this.options.getSessionEnabled()) return;
+			this.options.onToggleSession(true);
 		} else if (this.selectedIndex === 1) {
 			this.options.onToggleDefault(!this.options.getDefaultEnabled());
 		} else {
