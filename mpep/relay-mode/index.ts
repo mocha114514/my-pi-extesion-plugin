@@ -20,7 +20,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import type { OverlayHandle } from "@earendil-works/pi-tui";
+import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { t } from "../shared/i18n/index.ts";
@@ -47,12 +47,23 @@ const SLOT = Symbol.for("mpep.relay-mode.dispose.v1");
 const RETIRING_SLOT = Symbol.for("mpep.relay-mode.retiring.v1");
 const WORKER_APIS_SLOT = Symbol.for("mpep.relay-mode.worker-apis.v1");
 
+interface SessionStateFallbackRecord {
+	enabled: boolean;
+	/**
+	 * True on Pi 0.85.1 where a failed `appendEntry()` advances the in-memory
+	 * `leafId` without rolling it back. Retrying `appendEntry()` onto that
+	 * unsaved leaf after `/reload` would persist a child whose parent does not
+	 * exist on disk and disconnect the saved conversation.
+	 */
+	unsafeLegacyLeaf: boolean;
+}
+
 interface SharedLifecycleState {
 	active: RelayWorkerManager | undefined;
 	retiring: Set<RelayWorkerManager>;
 	preservedEphemeralKeys: Set<string>;
 	ephemeralTokens: Map<string, string>;
-	sessionStateFallback: Map<string, boolean>;
+	sessionStateFallback: Map<string, SessionStateFallbackRecord>;
 	activeEphemeralKey: string | undefined;
 	exitListener: (() => void) | undefined;
 	unregisterSigint: (() => void) | undefined;
@@ -70,7 +81,7 @@ function getSharedLifecycle(): SharedLifecycleState {
 			retiring: new Set<RelayWorkerManager>(),
 			preservedEphemeralKeys: new Set<string>(),
 			ephemeralTokens: new Map<string, string>(),
-			sessionStateFallback: new Map<string, boolean>(),
+			sessionStateFallback: new Map<string, SessionStateFallbackRecord>(),
 			activeEphemeralKey: undefined,
 			exitListener: undefined,
 			unregisterSigint: undefined,
@@ -79,7 +90,7 @@ function getSharedLifecycle(): SharedLifecycleState {
 	} else {
 		if (!state.preservedEphemeralKeys) state.preservedEphemeralKeys = new Set<string>();
 		if (!state.ephemeralTokens) state.ephemeralTokens = new Map<string, string>();
-		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, boolean>();
+		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, SessionStateFallbackRecord>();
 	}
 	return state;
 }
@@ -194,14 +205,22 @@ interface SessionRelayStateLookup {
 }
 
 function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): SessionRelayStateLookup {
-	// If an earlier write for this exact session failed in this process (e.g.
-	// temporarily read-only session store), honor the in-process fallback across
-	// `/reload` AND mark `needsPersistence: true` so session_start retries saving
-	// it once storage becomes writable again.
+	// If an earlier write for this exact session failed in this process:
+	// - On Pi >= 1.5 (`unsafeLegacyLeaf: false`), SessionManager rolled back the
+	//   in-memory leaf, so retrying `appendEntry()` once storage recovers is safe.
+	// - On Pi 0.85.1 (`unsafeLegacyLeaf: true`), the failed append left the
+	//   in-memory leaf pointing to an unsaved entry; do NOT retry onto that
+	//   unsaved parent or the transcript branch will disconnect on disk.
 	if (sessionId) {
-		const fallback = getSharedLifecycle().sessionStateFallback.get(sessionId);
-		if (typeof fallback === "boolean") {
-			return { value: fallback, needsPersistence: true };
+		const rawFallback = getSharedLifecycle().sessionStateFallback.get(sessionId) as
+			| SessionStateFallbackRecord
+			| boolean
+			| undefined;
+		if (typeof rawFallback === "boolean") {
+			return { value: rawFallback, needsPersistence: false };
+		}
+		if (rawFallback && typeof rawFallback.enabled === "boolean") {
+			return { value: rawFallback.enabled, needsPersistence: !rawFallback.unsafeLegacyLeaf };
 		}
 	}
 	try {
@@ -223,6 +242,48 @@ function readSessionRelayState(ctx: ExtensionContext, sessionId?: string): Sessi
 		// Fall back to long-term preference if session entries cannot be inspected.
 	}
 	return { value: undefined, needsPersistence: true };
+}
+
+/**
+ * Inspect the current branch's recorded system-message tool diffs to identify
+ * any restored non-relay tools that are not yet registered (e.g. MCP servers
+ * still reconnecting), so pruning a revived allowlisted tool on Pi 1.5.2 can
+ * re-activate those pending tools once they finish registering.
+ */
+function findPendingBranchTools(ctx: ExtensionContext | undefined, pi: ExtensionAPI): string[] {
+	if (!ctx) return [];
+	try {
+		const branch = ctx.sessionManager.getBranch?.() ?? [];
+		const restored = new Set<string>();
+		for (const raw of branch) {
+			const entry = raw as {
+				type?: unknown;
+				message?: {
+					role?: unknown;
+					toolsAdded?: Array<{ name?: unknown }>;
+					toolsRemoved?: Array<{ name?: unknown }>;
+				};
+			};
+			if (entry?.type !== "message" || entry.message?.role !== "system") continue;
+			for (const tool of entry.message.toolsAdded ?? []) {
+				if (typeof tool?.name === "string" && !RELAY_TOOL_NAMES.has(tool.name)) {
+					restored.add(tool.name);
+				}
+			}
+			for (const tool of entry.message.toolsRemoved ?? []) {
+				if (typeof tool?.name === "string") {
+					restored.delete(tool.name);
+				}
+			}
+		}
+		if (restored.size === 0) return [];
+		const registered = new Set(
+			(pi.getAllTools?.() ?? []).map((tool) => tool.name),
+		);
+		return [...restored].filter((name) => !registered.has(name));
+	} catch {
+		return [];
+	}
 }
 
 function detectModelOverridesSupport(): boolean {
@@ -410,9 +471,12 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	let worker: RelayWorkerManager | undefined;
 	let borderBadge: RelayBorderBadgeHandle | undefined;
 	let panelOpen = false;
+	let panelOpenSeq = 0;
+	let activePanelToken = 0;
 	let closeActivePanel: (() => void) | undefined;
 	let sessionToggleInFlight = false;
 	let toggleSeq = 0;
+	const preservedPendingTools = new Set<string>();
 	let retiringDisposalPromise: Promise<void> | undefined;
 	let currentSessionId: string | undefined;
 	let currentEphemeralToken: string | undefined;
@@ -543,13 +607,37 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	// any allowlisted (`--tools`) non-relay tools that were previously disabled.
 	// Capture the pre-toggle non-relay set and prune only unintended revivals so
 	// ordinary sessions without `--tools` still avoid calling `setActiveTools()`.
+	// When pruning IS needed on shipped Pi 1.5.2 (which clears `_pendingToolNames`
+	// on any removal), capture still-unregistered restored branch tools so we can
+	// re-activate them additively once their servers finish connecting.
 	const setExposurePreservingNonRelayTools = (next: "hidden" | "direct") => {
 		const beforeNonRelay = new Set(pi.getActiveTools().filter((name) => !RELAY_TOOL_NAMES.has(name)));
 		relayTools.setExposure(next);
 		const after = pi.getActiveTools();
 		const revivedNonRelay = after.some((name) => !RELAY_TOOL_NAMES.has(name) && !beforeNonRelay.has(name));
 		if (revivedNonRelay) {
+			for (const pending of findPendingBranchTools(currentCtx, pi)) {
+				preservedPendingTools.add(pending);
+			}
 			pi.setActiveTools(after.filter((name) => RELAY_TOOL_NAMES.has(name) || beforeNonRelay.has(name)));
+		}
+	};
+
+	const reconcilePreservedPendingTools = () => {
+		if (preservedPendingTools.size === 0) return;
+		const registered = new Set((pi.getAllTools?.() ?? []).map((tool) => tool.name));
+		const active = pi.getActiveTools();
+		const activeSet = new Set(active);
+		const readyToAdd: string[] = [];
+		for (const name of [...preservedPendingTools]) {
+			if (!registered.has(name)) continue;
+			preservedPendingTools.delete(name);
+			if (!activeSet.has(name)) {
+				readyToAdd.push(name);
+			}
+		}
+		if (readyToAdd.length > 0) {
+			pi.setActiveTools([...active, ...readyToAdd]);
 		}
 	};
 
@@ -577,6 +665,18 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 	const tryAppendSessionState = (enabled: boolean, notifyOnError: boolean): boolean => {
 		const shared = getSharedLifecycle();
+		// On Pi 0.85.1, once a previous append failed for this session, the
+		// in-memory `leafId` already points to an unsaved entry without rollback;
+		// do not append another entry onto that unsaved parent on disk.
+		const existingFallback = currentSessionId
+			? shared.sessionStateFallback.get(currentSessionId)
+			: undefined;
+		if (existingFallback?.unsafeLegacyLeaf) {
+			if (currentSessionId) {
+				shared.sessionStateFallback.set(currentSessionId, { enabled, unsafeLegacyLeaf: true });
+			}
+			return false;
+		}
 		try {
 			pi.appendEntry(SESSION_STATE_ENTRY, { enabled } satisfies SessionRelayStateEntry);
 			if (currentSessionId) {
@@ -587,7 +687,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			// Retain an in-process session-scoped fallback across `/reload` so a
 			// failed disk/session write never silently flips this open session back.
 			if (currentSessionId) {
-				shared.sessionStateFallback.set(currentSessionId, enabled);
+				shared.sessionStateFallback.set(currentSessionId, {
+					enabled,
+					unsafeLegacyLeaf: !runtimeCaps.hasSettleCredentialWrites,
+				});
 			}
 			if (notifyOnError) {
 				currentCtx?.ui.notify(
@@ -868,6 +971,8 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 	const openRelayModePanel = async (ctx: ExtensionContext): Promise<void> => {
 		if (!ctx.hasUI || ctx.mode !== "tui" || panelOpen) return;
+		const openToken = ++panelOpenSeq;
+		activePanelToken = openToken;
 		panelOpen = true;
 		borderBadge?.sync();
 		let defaultEnabled = loadRelayPreferences().defaultEnabled;
@@ -937,10 +1042,26 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 		// Prefer direct TUI overlay handle (`handle.hide()`) so closing our panel
 		// removes ONLY our overlay even if another extension (e.g. `list`) opened a
-		// second overlay on top (Pi 0.85.1's ctx.ui.custom `done()` pops stack top).
-		const tui = borderBadge?.getTui();
+		// second overlay on top. If the border widget has not yet supplied a TUI,
+		// probe synchronously via `setWidget` so legacy Pi 0.85.1 never falls back
+		// to `ctx.ui.custom`'s stack-popping `done()`.
+		let tui: TUI | undefined = borderBadge?.getTui();
+		if (!tui) {
+			try {
+				const probeKey = "mpep-relay-mode-tui-probe";
+				ctx.ui.setWidget(probeKey, (host) => {
+					tui = host;
+					return { render: () => [], invalidate() {} };
+				});
+				ctx.ui.setWidget(probeKey, undefined);
+			} catch {
+				// Ignore probe failures and fall through.
+			}
+		}
+
 		if (tui) {
-			panelTui = tui;
+			const ownedTui = tui;
+			panelTui = ownedTui;
 			let overlay: OverlayHandle | undefined;
 			let closed = false;
 			const closeOverlay = () => {
@@ -948,16 +1069,18 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				closed = true;
 				overlay?.hide();
 				overlay = undefined;
-				if (closeActivePanel === closeOverlay) closeActivePanel = undefined;
-				panelOpen = false;
-				panelTui = undefined;
-				borderBadge?.sync();
-				tui.requestRender();
+				if (activePanelToken === openToken) {
+					if (closeActivePanel === closeOverlay) closeActivePanel = undefined;
+					panelOpen = false;
+					panelTui = undefined;
+					borderBadge?.sync();
+				}
+				ownedTui.requestRender();
 			};
 			closeActivePanel = closeOverlay;
 			try {
-				const panel = buildPanel(ctx.ui.theme, () => tui.terminal.rows, closeOverlay);
-				overlay = tui.showOverlay(panel, overlayOptions);
+				const panel = buildPanel(ctx.ui.theme, () => ownedTui.terminal.rows, closeOverlay);
+				overlay = ownedTui.showOverlay(panel, overlayOptions);
 			} catch (error) {
 				closeOverlay();
 				ctx.ui.notify(
@@ -968,18 +1091,24 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Fallback when border widget has not captured a TUI instance yet:
-		// - On Pi >= 1.5, `done()` closes the overlay by its own handle.
-		// - On Pi 0.85.1, `done()` unconditionally pops the stack top (which can
-		//   remove another overlay above relay), so close strictly via our owned
-		//   `OverlayHandle.hide()` once attached instead of calling `done()`.
+		if (!runtimeCaps.supportsOverlayHandleDone) {
+			// On Pi 0.85.1 without a direct TUI handle, avoid `ctx.ui.custom({ overlay: true })`
+			// whose `done()` pops the global overlay stack top indiscriminately.
+			if (activePanelToken === openToken) {
+				panelOpen = false;
+				panelTui = undefined;
+				borderBadge?.sync();
+			}
+			return;
+		}
+
+		// Pi >= 1.5 fallback (where `done()` closes strictly by its own handle).
 		let fallbackDone: (() => void) | undefined;
-		let fallbackHandle: OverlayHandle | undefined;
 		let fallbackClosed = false;
 		const cleanupFallbackState = () => {
+			if (activePanelToken !== openToken) return;
 			if (closeActivePanel === closeFallback) closeActivePanel = undefined;
 			fallbackDone = undefined;
-			fallbackHandle = undefined;
 			panelOpen = false;
 			const tuiToRender = panelTui;
 			panelTui = undefined;
@@ -989,13 +1118,8 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const closeFallback = () => {
 			if (fallbackClosed) return;
 			fallbackClosed = true;
-			if (!runtimeCaps.supportsOverlayHandleDone && fallbackHandle) {
-				const handle = fallbackHandle;
-				cleanupFallbackState();
-				handle.hide();
-				return;
-			}
 			const done = fallbackDone;
+			fallbackDone = undefined;
 			cleanupFallbackState();
 			done?.();
 		};
@@ -1015,13 +1139,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				{
 					overlay: true,
 					overlayOptions,
-					onHandle: (handle) => {
-						if (fallbackClosed) {
-							handle.hide();
-							return;
-						}
-						fallbackHandle = handle;
-					},
 				},
 			);
 		} finally {
@@ -1077,6 +1194,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		pendingResumeNotice = undefined;
 		promptHookActiveForRun = false;
 		sessionToggleInFlight = false;
+		preservedPendingTools.clear();
 		currentEphemeralToken = retainedEphemeralToken;
 		currentPreservedEphemeralKey = retainedEphemeralKey && shared.preservedEphemeralKeys.has(retainedEphemeralKey)
 			? retainedEphemeralKey
@@ -1141,7 +1259,9 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 
 		const tSeq = ++toggleSeq;
 		const activated = await activateSessionRelay(ctx, seq, tSeq, sessionLookup.needsPersistence);
-		if (!activated && sessionLookup.needsPersistence && seq === sessionStartSeq) {
+		// Only record default-off when the session had NO explicit state yet;
+		// preserve an explicit `enabled: true` fallback across temporary startup failures.
+		if (!activated && sessionLookup.value === undefined && sessionLookup.needsPersistence && seq === sessionStartSeq) {
 			tryAppendSessionState(false, true);
 		}
 	});
@@ -1217,6 +1337,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", (event) => {
+		reconcilePreservedPendingTools();
 		if (!activeInSession || !currentConfig?.relayPrompt) {
 			promptHookActiveForRun = false;
 			return;

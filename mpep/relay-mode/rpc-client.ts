@@ -509,8 +509,7 @@ export class RelayRpcClient {
 			if (!this.rootStartId && preAbortSnapshot.rootStartId) {
 				this.rootStartId = preAbortSnapshot.rootStartId;
 			}
-			this.lastUnixSnapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, preAbortSnapshot);
-			this.unixSnapshotVersion += 1;
+			this.installUnixSnapshot(preAbortSnapshot);
 		}
 
 		let responsive = false;
@@ -537,13 +536,9 @@ export class RelayRpcClient {
 			process.platform !== "win32" && proc.pid !== undefined && this.isProcessRunning(proc)
 				? this.collectUnixDescendants(proc.pid)
 				: undefined;
-		const mergedSnapshot = this.mergeUnixSnapshots(
-			this.mergeUnixSnapshots(this.lastUnixSnapshot, preAbortSnapshot),
-			postAbortSnapshot,
-		);
-		if (mergedSnapshot) {
-			this.lastUnixSnapshot = mergedSnapshot;
-		}
+		const mergedSnapshot = postAbortSnapshot
+			? this.installUnixSnapshot(postAbortSnapshot)
+			: this.lastUnixSnapshot;
 
 		this.handleClose(null);
 		if (!this.isProcessRunning(proc)) {
@@ -651,14 +646,13 @@ export class RelayRpcClient {
 					this.rootStartId = snap.rootStartId;
 				}
 				// Prune exited historical PIDs ONLY when no newer snapshot was installed
-				// while this async scan was in flight; otherwise union verified identities
-				// without pruning descendants discovered by the newer snapshot.
-				const pruneRows = this.unixSnapshotVersion === startedVersion ? rows : undefined;
-				const merged = this.mergeUnixSnapshots(this.lastUnixSnapshot, snap, pruneRows);
-				if (merged && (merged.rootStartId || merged.pids.size > 0 || merged.pgids.size > 0)) {
-					this.lastUnixSnapshot = merged;
-					this.unixSnapshotVersion += 1;
-				}
+				// while this async scan was in flight; on a version mismatch, add only
+				// stale-exclusive PIDs without replacing newer start identities or pruning.
+				const isStale = this.unixSnapshotVersion !== startedVersion;
+				const merged = this.installUnixSnapshot(snap, {
+					pruneRows: isStale ? undefined : rows,
+					staleMerge: isStale,
+				});
 				// If the worker exited while this verified scan was in flight, reap
 				// any surviving verified descendants that `proc.on("exit")` missed.
 				if (!stillLive && merged && (merged.pids.size > 0 || merged.pgids.size > 0)) {
@@ -762,10 +756,32 @@ export class RelayRpcClient {
 		return { rootPid, rootStartId, pids, pgids };
 	}
 
+	private installUnixSnapshot(
+		incoming: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
+		options?: {
+			pruneRows?: Array<{ pid: number; ppid: number; pgid: number; startId: string }>;
+			staleMerge?: boolean;
+		},
+	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
+		const merged = this.mergeUnixSnapshots(
+			this.lastUnixSnapshot,
+			incoming,
+			options?.pruneRows,
+			options?.staleMerge,
+		);
+		if (merged && (merged.rootStartId || merged.pids.size > 0 || merged.pgids.size > 0)) {
+			this.lastUnixSnapshot = merged;
+			this.unixSnapshotVersion += 1;
+			return merged;
+		}
+		return this.lastUnixSnapshot;
+	}
+
 	private mergeUnixSnapshots(
 		a?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
 		b?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
 		liveRows?: Array<{ pid: number; ppid: number; pgid: number; startId: string }>,
+		preserveAStartIds = false,
 	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
 		if (!a) return b;
 		if (!b) return a;
@@ -779,7 +795,12 @@ export class RelayRpcClient {
 				pids.set(k, v);
 			}
 		}
-		for (const [k, v] of b.pids) pids.set(k, v);
+		for (const [k, v] of b.pids) {
+			// When merging an older/stale scan `b` into a newer snapshot `a`, never
+			// overwrite a newer start identity already recorded for the same PID.
+			if (preserveAStartIds && pids.has(k)) continue;
+			pids.set(k, v);
+		}
 		const pgids = new Map<number, Set<number>>();
 		for (const [pgid, set] of a.pgids) {
 			for (const p of set) {
@@ -907,9 +928,8 @@ export class RelayRpcClient {
 	}
 
 	private reapUnixProcessTree(rootPid: number): void {
-		const snapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, this.collectUnixDescendants(rootPid));
+		const snapshot = this.installUnixSnapshot(this.collectUnixDescendants(rootPid));
 		if (snapshot) {
-			this.lastUnixSnapshot = snapshot;
 			this.reapUnixSnapshot(snapshot);
 		}
 		try {

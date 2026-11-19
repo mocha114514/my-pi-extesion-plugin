@@ -102,18 +102,20 @@ export function finalizeWorkerDirectoryOwnership(
 }
 
 /**
- * Errno-aware absence check: returns `true` ONLY when the filesystem explicitly
- * reports `ENOENT` or `ENOTDIR`. Access/I/O errors (such as `EACCES` on a
- * temporarily untraversable parent directory) return `false` so callers retain
- * retry tracking instead of mistaking an inaccessible transcript for deleted.
+ * Errno-aware three-state path probe so callers distinguish:
+ *   - `"absent"`: explicitly missing (`ENOENT` / `ENOTDIR`)
+ *   - `"present"`: accessible on disk
+ *   - `"inaccessible"`: access/I/O error (e.g. `EACCES` on an unsearchable ancestor)
+ *     that must remain retryable instead of throwing or falsely reporting absent.
  */
-function isPathConfirmedAbsent(targetPath: string): boolean {
+function probePathPresence(targetPath: string): "present" | "absent" | "inaccessible" {
 	try {
 		fs.lstatSync(targetPath);
-		return false;
+		return "present";
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException | undefined)?.code;
-		return code === "ENOENT" || code === "ENOTDIR";
+		if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+		return "inaccessible";
 	}
 }
 
@@ -128,7 +130,8 @@ function isPathConfirmedAbsent(targetPath: string): boolean {
 export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd: string): boolean {
 	const sessionRoot = path.resolve(launchCwd, mainSessionDir(storageKey));
 	const dir = path.resolve(launchCwd, workerDir(storageKey));
-	if (isPathConfirmedAbsent(dir)) {
+	const initial = probePathPresence(dir);
+	if (initial === "absent") {
 		try {
 			fs.rmdirSync(sessionRoot);
 		} catch {
@@ -136,16 +139,23 @@ export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd
 		}
 		return true;
 	}
+	if (initial === "inaccessible") {
+		return false;
+	}
 	const lock = new WorkerDirectoryLock(sessionRoot, dir, launchCwd);
-	const acquired = lock.acquireOwnership();
-	if (!acquired.ok) return false;
 	try {
+		const acquired = lock.acquireOwnership();
+		if (!acquired.ok) return false;
 		finalizeWorkerDirectoryOwnership(lock, dir, sessionRoot, true, true);
 		// Treat confirmed removal of the owned `worker/` directory as success even
 		// if a non-empty parent directory intentionally remains on disk.
-		return isPathConfirmedAbsent(dir);
+		return probePathPresence(dir) === "absent";
 	} catch {
-		lock.releaseOwnership();
-		return isPathConfirmedAbsent(dir);
+		try {
+			lock.releaseOwnership();
+		} catch {
+			// Best effort lock release on transient filesystem failure.
+		}
+		return probePathPresence(dir) === "absent";
 	}
 }

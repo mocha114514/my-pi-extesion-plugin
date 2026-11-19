@@ -572,10 +572,12 @@ export class RelayWorkerManager {
 		try {
 			const state = await client.getState();
 			if (this.client !== client) return;
+			const previousSessionId = this.meta.sessionId;
 			const reportedSessionId =
 				typeof state.sessionId === "string" && state.sessionId.trim() ? state.sessionId.trim() : undefined;
 			const reportedSessionFile =
 				typeof state.sessionFile === "string" && state.sessionFile.trim() ? state.sessionFile.trim() : undefined;
+			let switchedSession = false;
 			const isResumableTopLevelSessionFile = (() => {
 				if (!reportedSessionFile) return false;
 				if (!isPathInsideDir(reportedSessionFile, this.dir)) return false;
@@ -597,7 +599,8 @@ export class RelayWorkerManager {
 					this.externalSessionWarnedFor = warningKey;
 					this.hooks.onWakeup(`[Relay worker session drift] ${msg}`);
 				}
-			} else if (reportedSessionId && reportedSessionId !== this.meta.sessionId) {
+			} else if (reportedSessionId && reportedSessionId !== previousSessionId) {
+				switchedSession = true;
 				this.externalSessionWarnedFor = undefined;
 				this.meta.sessionId = reportedSessionId;
 				this.writeMeta(this.meta);
@@ -612,7 +615,12 @@ export class RelayWorkerManager {
 			if (typeof state.thinkingLevel === "string") {
 				this.meta.thinking = state.thinkingLevel;
 			}
-			if (!includeStats) return;
+			// Hydrate session stats when requested OR when an idle worker just
+			// switched to a new session (e.g. via an extension slash command calling
+			// `ctx.newSession()`), while still skipping stats during streaming turns
+			// so an in-flight turn is never double-counted on `turn_end`.
+			const idleAfterSessionSwitch = switchedSession && state.isStreaming === false;
+			if (!includeStats && !idleAfterSessionSwitch) return;
 			const stats = await client.getSessionStats();
 			if (this.client !== client) return;
 			const contextUsage = stats.contextUsage as { tokens?: unknown; contextWindow?: unknown } | undefined;

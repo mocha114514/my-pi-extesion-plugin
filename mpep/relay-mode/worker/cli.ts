@@ -3,6 +3,7 @@
  * inheritance for spawning the symbiotic relay worker process.
  */
 
+import { VERSION as HOST_PI_VERSION } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
@@ -41,36 +42,49 @@ function findPiCoreFile(entryPath: string, fileName: string): string | undefined
 	return undefined;
 }
 
+function isModernPiVersion(version: unknown): boolean {
+	if (typeof version !== "string") return false;
+	const match = version.trim().match(/^(\d+)\.(\d+)/);
+	if (!match) return false;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	return major > 1 || (major === 1 && minor >= 5);
+}
+
 /**
  * Inspect the resolved Pi distribution (supporting both `dist/bundle/cli.js`
  * and `dist/cli.js` layouts) so relay-mode adapts cleanly to Pi 0.85.1 vs 1.5.2.
+ * Falls back to the running host SDK's exported `VERSION` when bundled/standalone
+ * distributions do not ship unpacked `core/agent-session*.js` files on disk.
  */
 export function detectPiRuntimeCapabilities(): PiRuntimeCapabilities {
+	const hostIsModern = isModernPiVersion(HOST_PI_VERSION);
+	const fallbackCaps: PiRuntimeCapabilities = {
+		hasSettleCredentialWrites: hostIsModern,
+		runsBeforeAgentStartOnCustomWakeup: hostIsModern,
+		supportsBuiltinResourcePrefix: hostIsModern,
+		supportsToolExposure: hostIsModern,
+		supportsOverlayHandleDone: hostIsModern,
+	};
 	try {
 		const invocation = getPiInvocation([]);
 		const entry = invocation.args[0];
 		if (!entry || !fs.existsSync(entry)) {
-			return {
-				hasSettleCredentialWrites: true,
-				runsBeforeAgentStartOnCustomWakeup: true,
-				supportsBuiltinResourcePrefix: true,
-				supportsToolExposure: true,
-				supportsOverlayHandleDone: true,
-			};
+			return fallbackCaps;
 		}
 		const realEntry = fs.realpathSync.native?.(entry) ?? fs.realpathSync(entry);
 		const runtimePath = findPiCoreFile(realEntry, "agent-session-runtime.js");
 		const sessionPath = findPiCoreFile(realEntry, "agent-session.js");
 		const hasSettleCredentialWrites = runtimePath
 			? fs.readFileSync(runtimePath, "utf-8").includes("settleCredentialWrites")
-			: true;
+			: hostIsModern;
 		const sessionContent = sessionPath ? fs.readFileSync(sessionPath, "utf-8") : undefined;
 		const runsBeforeAgentStartOnCustomWakeup = sessionContent
 			? sessionContent.includes('messageType: "custom"')
-			: true;
+			: hostIsModern;
 		const supportsToolExposure = sessionContent
 			? sessionContent.includes("_getToolExposure")
-			: true;
+			: hostIsModern;
 		// Pi 1.5.2 introduced `builtin:` in `isLocalPath` and handle-owned custom overlay done().
 		return {
 			hasSettleCredentialWrites,
@@ -80,13 +94,7 @@ export function detectPiRuntimeCapabilities(): PiRuntimeCapabilities {
 			supportsOverlayHandleDone: hasSettleCredentialWrites,
 		};
 	} catch {
-		return {
-			hasSettleCredentialWrites: true,
-			runsBeforeAgentStartOnCustomWakeup: true,
-			supportsBuiltinResourcePrefix: true,
-			supportsToolExposure: true,
-			supportsOverlayHandleDone: true,
-		};
+		return fallbackCaps;
 	}
 }
 
