@@ -90,7 +90,7 @@ function getProjectTrusted(ctx: ExtensionContext): boolean | undefined {
 function getCompactionReserveTokens(ctx: ExtensionContext): number {
 	const trusted = getProjectTrusted(ctx) ?? true;
 	const paths = [
-		join(getAgentDir(), "settings.json"),
+		join(resolve(LAUNCH_CWD, getAgentDir()), "settings.json"),
 		trusted && ctx.cwd ? join(ctx.cwd, ".pi", "settings.json") : null,
 	].filter((p): p is string => Boolean(p));
 
@@ -183,6 +183,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	let currentCtx: ExtensionContext | undefined;
 	let currentConfig: RelayConfig | undefined;
 	let worker: RelayWorkerManager | undefined;
+	const retiringWorkers = new Set<RelayWorkerManager>();
 	let milestones: number[] = [];
 	const firedMilestones = new Set<number>();
 	let pendingResumeNotice: string | undefined;
@@ -318,19 +319,33 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	const disposeWorkerSync = () => {
 		clearPendingUiAndTimers();
 		detachSignalHandlers();
-		const old = worker;
+		const active = worker;
 		worker = undefined;
-		old?.dispose(true);
+		const targets = new Set<RelayWorkerManager>(retiringWorkers);
+		if (active) targets.add(active);
+		retiringWorkers.clear();
+		for (const target of targets) {
+			target.dispose(true);
+		}
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
 	const disposeWorkerAsync = async () => {
 		sessionStartSeq += 1;
 		clearPendingUiAndTimers();
-		detachSignalHandlers();
 		const old = worker;
 		worker = undefined;
-		if (old) await old.disposeAsync();
+		if (old) {
+			retiringWorkers.add(old);
+			try {
+				await old.disposeAsync();
+			} finally {
+				retiringWorkers.delete(old);
+			}
+		}
+		if (!worker && retiringWorkers.size === 0) {
+			detachSignalHandlers();
+		}
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
@@ -353,7 +368,12 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		treeNavInFlight = false;
 
 		if (prev) {
-			await prev.disposeAsync();
+			retiringWorkers.add(prev);
+			try {
+				await prev.disposeAsync();
+			} finally {
+				retiringWorkers.delete(prev);
+			}
 			if (seq !== sessionStartSeq) return;
 		}
 
@@ -442,6 +462,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			availableModels,
 			verifyApiKeyForProvider,
 			legacyWindowsKey,
+			sessionFile,
 		);
 		worker = instance;
 		attachSignalHandlers();

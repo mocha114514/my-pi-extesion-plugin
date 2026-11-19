@@ -23,11 +23,11 @@ import * as fs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import type { RelayConfig } from "./config.ts";
 import { mainSessionDir, sessionsDir, workerDir } from "./paths.ts";
-import { getPiInvocation, RelayRpcClient, type RpcUIResponder } from "./rpc-client.ts";
+import { getPiInvocation, RelayRpcClient, type RpcEvent, type RpcUIResponder } from "./rpc-client.ts";
 import {
 	DELETE_APPROVAL_PREFIX,
 	DELETE_CANCEL_PREFIX,
@@ -54,6 +54,7 @@ export type WorkerStatus =
 export interface WorkerMeta {
 	sessionId: string;
 	cwd: string;
+	mainSessionFile?: string;
 	model?: string;
 	thinking?: string;
 	createdAt: number;
@@ -131,6 +132,7 @@ interface OwnerLock {
 export interface PiRuntimeCapabilities {
 	hasSettleCredentialWrites: boolean;
 	runsBeforeAgentStartOnCustomWakeup: boolean;
+	supportsBuiltinResourcePrefix: boolean;
 }
 
 function findPiCoreFile(entryPath: string, fileName: string): string | undefined {
@@ -159,7 +161,11 @@ export function detectPiRuntimeCapabilities(): PiRuntimeCapabilities {
 		const invocation = getPiInvocation([]);
 		const entry = invocation.args[0];
 		if (!entry || !fs.existsSync(entry)) {
-			return { hasSettleCredentialWrites: true, runsBeforeAgentStartOnCustomWakeup: true };
+			return {
+				hasSettleCredentialWrites: true,
+				runsBeforeAgentStartOnCustomWakeup: true,
+				supportsBuiltinResourcePrefix: true,
+			};
 		}
 		const realEntry = fs.realpathSync.native?.(entry) ?? fs.realpathSync(entry);
 		const runtimePath = findPiCoreFile(realEntry, "agent-session-runtime.js");
@@ -170,9 +176,18 @@ export function detectPiRuntimeCapabilities(): PiRuntimeCapabilities {
 		const runsBeforeAgentStartOnCustomWakeup = sessionPath
 			? fs.readFileSync(sessionPath, "utf-8").includes('messageType: "custom"')
 			: true;
-		return { hasSettleCredentialWrites, runsBeforeAgentStartOnCustomWakeup };
+		// Pi 1.5.2 introduced `builtin:` in `isLocalPath`; Pi 0.85.1 does not treat it as non-local.
+		return {
+			hasSettleCredentialWrites,
+			runsBeforeAgentStartOnCustomWakeup,
+			supportsBuiltinResourcePrefix: hasSettleCredentialWrites,
+		};
 	} catch {
-		return { hasSettleCredentialWrites: true, runsBeforeAgentStartOnCustomWakeup: true };
+		return {
+			hasSettleCredentialWrites: true,
+			runsBeforeAgentStartOnCustomWakeup: true,
+			supportsBuiltinResourcePrefix: true,
+		};
 	}
 }
 
@@ -313,20 +328,39 @@ function isSamePath(a: string, b: string): boolean {
 	return canonicalizeFsPath(a) === canonicalizeFsPath(b);
 }
 
-function resolveCliExtensionSource(source: string, launchCwd: string): string {
-	// Mirror Pi's `resolveExtensionLoadPath` (`utils/paths.ts` with
-	// `normalizeUnicodeSpaces: true`, WITHOUT trimming) so `-e` arguments
-	// resolve to the exact file loaded by foreground Pi and never rebind to a
-	// changed worker cwd.
-	if (/^(?:npm|git|github|https?|ssh|builtin):/i.test(source.trim())) return source;
-	const normalizedSpaces = source.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
-	const normalized = normalizeWindowsShellPath(normalizedSpaces);
+function isCliLocalResourcePath(value: string, supportsBuiltinPrefix: boolean): boolean {
+	// Mirror Pi's `isLocalPath` (`utils/paths.ts`, case-sensitive scheme prefixes).
+	const trimmed = value.trim();
+	if (
+		trimmed.startsWith("npm:") ||
+		trimmed.startsWith("git:") ||
+		trimmed.startsWith("github:") ||
+		trimmed.startsWith("http:") ||
+		trimmed.startsWith("https:") ||
+		trimmed.startsWith("ssh:") ||
+		(supportsBuiltinPrefix && trimmed.startsWith("builtin:"))
+	) {
+		return false;
+	}
+	return true;
+}
+
+function resolveCliExtensionSource(
+	source: string,
+	launchCwd: string,
+	supportsBuiltinPrefix = detectPiRuntimeCapabilities().supportsBuiltinResourcePrefix,
+): string {
+	// Mirror Pi's `resolveCliPaths` -> `resolvePath(value, cwd)` in `main.ts`
+	// (no Unicode-space normalization, case-sensitive `file://` and package
+	// prefixes, and child-side resource loaders keep their own normalization).
+	if (!isCliLocalResourcePath(source, supportsBuiltinPrefix)) return source;
+	const normalized = normalizeWindowsShellPath(source);
 	const home = homedir();
 	if (normalized === "~") return home;
 	if (normalized.startsWith("~/") || (process.platform === "win32" && normalized.startsWith("~\\"))) {
 		return path.join(home, normalized.slice(2));
 	}
-	if (/^file:\/\//i.test(normalized)) {
+	if (/^file:\/\//.test(normalized)) {
 		try {
 			return fileURLToPath(normalized);
 		} catch {
@@ -805,7 +839,7 @@ function findMatchingTopLevelJsonls(dir: string, sessionId: string): string[] {
  * any damaged live file once replaced, and blocks fresh creation if recoverable
  * data cannot be cleanly restored.
  */
-function recoverStaleRebaseBackups(
+export function recoverStaleRebaseBackups(
 	dir: string,
 	targetSessionId: string,
 ): { file?: string; recoveryBlocked?: boolean; reason?: string } {
@@ -842,14 +876,15 @@ function recoverStaleRebaseBackups(
 			.map((full) => ({ path: full, mtimeMs: fs.statSync(full).mtimeMs }))
 			.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-		let validBackup: { path: string; mtimeMs: number; entryCount: number } | undefined;
+		const validBackups: Array<{ path: string; mtimeMs: number; entryCount: number }> = [];
 		for (const c of backupCandidates) {
 			const check = validateJsonlFile(c.path, targetSessionId);
 			if (check.valid) {
-				validBackup = { ...c, entryCount: check.entryCount };
-				break;
+				validBackups.push({ ...c, entryCount: check.entryCount });
 			}
 		}
+		validBackups.sort((a, b) => (b.entryCount - a.entryCount) || (b.mtimeMs - a.mtimeMs));
+		const validBackup = validBackups[0];
 
 		// Scan completed `.rebase-*` stages BEFORE choosing a live file so a
 		// truncated live transcript never prunes a fuller completed staged rebase.
@@ -874,7 +909,7 @@ function recoverStaleRebaseBackups(
 				// Ignore unreadable staging subdir.
 			}
 		}
-		completedStages.sort((a, b) => b.mtimeMs - a.mtimeMs);
+		completedStages.sort((a, b) => (b.entryCount - a.entryCount) || (b.mtimeMs - a.mtimeMs));
 		const newestStage = completedStages[0];
 
 		const minRequiredEntries = Math.max(
@@ -894,9 +929,14 @@ function recoverStaleRebaseBackups(
 		}
 
 		if (!validTopFile) {
+			// Enforce the SAME `minRequiredEntries` floor on backup vs staged replacement
+			// so a newer smaller backup never overrides and prunes a fuller completed stage.
+			const stageQualifies = Boolean(newestStage && newestStage.entryCount >= minRequiredEntries);
+			const backupQualifies = Boolean(validBackup && validBackup.entryCount >= minRequiredEntries);
 			const useStageFirst = Boolean(
+				stageQualifies &&
 				newestStage &&
-				(!validBackup || (newestStage.mtimeMs >= validBackup.mtimeMs && newestStage.entryCount >= validBackup.entryCount)),
+				(!backupQualifies || !validBackup || newestStage.mtimeMs >= validBackup.mtimeMs),
 			);
 
 			let quarantineSeq = 0;
@@ -915,7 +955,7 @@ function recoverStaleRebaseBackups(
 					fs.renameSync(newestStage.path, dest);
 					validTopFile = dest;
 				}
-			} else if (validBackup) {
+			} else if (backupQualifies && validBackup) {
 				const dest = validBackup.path.replace(/\.rebased-\d+\.bak$/, "");
 				if (damagedTopFiles.some((d) => isSamePath(d, dest))) {
 					quarantineFile(dest);
@@ -926,8 +966,8 @@ function recoverStaleRebaseBackups(
 				}
 			}
 
-			// Once we have a valid live transcript, quarantine ALL remaining damaged top-level
-			// files (excluding the newly restored validTopFile itself!).
+			// Only quarantine other damaged top-level files when we actually restored a
+			// replacement meeting `minRequiredEntries`; otherwise preserve every artifact.
 			if (validTopFile) {
 				for (const damaged of damagedTopFiles) {
 					if (isSamePath(damaged, validTopFile)) continue;
@@ -1114,6 +1154,8 @@ export class RelayWorkerManager {
 	private abortRequested = false;
 	private settledAborted: boolean | undefined;
 	private disposed = false;
+	private syncDisposed = false;
+	private cleanupCompleted = false;
 	private generation = 0;
 	private startingClient: RelayRpcClient | undefined;
 	private retiringClient: RelayRpcClient | undefined;
@@ -1126,16 +1168,21 @@ export class RelayWorkerManager {
 	private pendingApprovals = new Map<string, PendingApprovalEntry>();
 	private seenApprovalCalls = new Set<string>();
 	private compactWaiters = new Map<string, (status: string) => void>();
-	private promptErrorWaiter: ((message: string) => void) | undefined;
+	private promptErrorWaiter: ((event: RpcEvent, formatted: string) => void) | undefined;
+	private promptNotifyWaiter: ((level: string, message: string) => void) | undefined;
+	private inflightPromptDispatch: { startedAt: number; abort: (reason: Error) => void } | undefined;
 	private detachListeners: Array<() => void> = [];
 	private readonly ownerId = randomUUID();
 	private ownsDirectory = false;
 	private provisionalLockOwned = false;
 	private hasTrackedLockAttempt = false;
+	private migrationBlockedHolderPid: number | undefined;
 
 	readonly isResumedSession: boolean;
 	readonly mainSessionId: string;
 	private readonly storageKey: string;
+	private readonly legacyWindowsKey: string | undefined;
+	private readonly mainSessionFile: string | undefined;
 	private readonly cwd: string;
 	private readonly launchCwd: string;
 	private readonly config: RelayConfig;
@@ -1148,6 +1195,7 @@ export class RelayWorkerManager {
 	private readonly projectTrusted: boolean | undefined;
 	private readonly ephemeral: boolean;
 	private readonly hooks: RelayWorkerHooks;
+	private readonly sessionRootDir: string;
 	private readonly lockPath: string;
 	private readonly legacyLockPath: string;
 
@@ -1167,9 +1215,12 @@ export class RelayWorkerManager {
 		availableModels: readonly ModelDescriptor[] = [],
 		verifyApiKeyForProvider?: (provider: string, apiKey: string) => Promise<boolean>,
 		legacyWindowsKey?: string,
+		mainSessionFile?: string,
 	) {
 		this.mainSessionId = mainSessionId;
 		this.storageKey = storageKey;
+		this.legacyWindowsKey = legacyWindowsKey;
+		this.mainSessionFile = mainSessionFile;
 		this.cwd = cwd;
 		this.launchCwd = launchCwd;
 		this.config = config;
@@ -1182,8 +1233,9 @@ export class RelayWorkerManager {
 		this.projectTrusted = projectTrusted;
 		this.ephemeral = ephemeral;
 		this.hooks = hooks;
-		this.dir = workerDir(storageKey);
-		this.lockPath = path.join(mainSessionDir(storageKey), LOCK_FILE);
+		this.sessionRootDir = path.resolve(launchCwd, mainSessionDir(storageKey));
+		this.dir = path.resolve(launchCwd, workerDir(storageKey));
+		this.lockPath = path.join(this.sessionRootDir, LOCK_FILE);
 		this.legacyLockPath = path.join(this.dir, LEGACY_LOCK_FILE);
 		if (!ephemeral && legacyWindowsKey && legacyWindowsKey !== storageKey) {
 			this.migrateLegacyWindowsWorkerDir(legacyWindowsKey);
@@ -1193,26 +1245,51 @@ export class RelayWorkerManager {
 		this.isResumedSession = loaded.resumed;
 	}
 
-	private migrateLegacyWindowsWorkerDir(legacyKey: string): void {
-		const targetSession = mainSessionDir(this.storageKey);
-		const legacySession = mainSessionDir(legacyKey);
-		if (fs.existsSync(targetSession) || !fs.existsSync(legacySession)) return;
-		const legacyWorker = workerDir(legacyKey);
-		if (!fs.existsSync(legacyWorker)) return;
-		try {
-			// Skip if a live session currently holds either legacy lock.
-			for (const lockFile of [path.join(legacySession, LOCK_FILE), path.join(legacyWorker, LEGACY_LOCK_FILE)]) {
-				if (!fs.existsSync(lockFile)) continue;
-				const parsed = JSON.parse(fs.readFileSync(lockFile, "utf-8")) as Partial<OwnerLock>;
-				if (this.isLockEntryAlive(parsed) !== undefined) return;
+	private hasWindowsCaseCollision(targetPath: string | undefined): boolean {
+		if (process.platform !== "win32" || !targetPath) return false;
+		let cur = path.resolve(targetPath);
+		for (let depth = 0; depth < 3; depth++) {
+			const parent = path.dirname(cur);
+			const base = path.basename(cur);
+			if (!parent || parent === cur || !base) break;
+			try {
+				const matches = fs.readdirSync(parent).filter((name) => name.toLowerCase() === base.toLowerCase());
+				if (matches.length > 1) return true;
+			} catch {
+				// Ignore unreadable parent.
 			}
-			// Verify stored session directory identity matches this exact directory
-			// (protecting case-sensitive NTFS sibling folders).
+			cur = parent;
+		}
+		return false;
+	}
+
+	private migrateLegacyWindowsWorkerDir(legacyKey: string): boolean {
+		const targetSession = this.sessionRootDir;
+		const legacySession = path.resolve(this.launchCwd, mainSessionDir(legacyKey));
+		if (fs.existsSync(targetSession) || !fs.existsSync(legacySession)) return true;
+		const legacyWorker = path.resolve(this.launchCwd, workerDir(legacyKey));
+		if (!fs.existsSync(legacyWorker)) return true;
+		const legacyLock = path.join(legacySession, LOCK_FILE);
+		const legacyWorkerLock = path.join(legacyWorker, LEGACY_LOCK_FILE);
+
+		const lock = this.acquireLockPair(legacyLock, legacyWorkerLock, legacyWorker);
+		if (!lock.ok) {
+			if (lock.holderPid !== undefined) {
+				this.migrationBlockedHolderPid = lock.holderPid;
+			}
+			return false;
+		}
+		let migrated = false;
+		try {
 			let legacyCwd: string | undefined;
+			let legacyMainSessionFile: string | undefined;
 			const metaPath = path.join(legacyWorker, META_FILE);
 			if (fs.existsSync(metaPath)) {
 				const parsedMeta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Partial<WorkerMeta>;
 				if (typeof parsedMeta.cwd === "string") legacyCwd = parsedMeta.cwd;
+				if (typeof parsedMeta.mainSessionFile === "string" && parsedMeta.mainSessionFile.trim()) {
+					legacyMainSessionFile = parsedMeta.mainSessionFile;
+				}
 			}
 			if (!legacyCwd) {
 				for (const name of fs.readdirSync(legacyWorker)) {
@@ -1225,16 +1302,57 @@ export class RelayWorkerManager {
 				}
 			}
 			if (!legacyCwd || canonicalizeFsPath(legacyCwd) !== canonicalizeFsPath(this.cwd)) {
-				return;
+				return true;
 			}
-			fs.mkdirSync(sessionsDir(), { recursive: true });
+			if (legacyMainSessionFile) {
+				if (
+					!this.mainSessionFile ||
+					canonicalizeFsPath(legacyMainSessionFile) !== canonicalizeFsPath(this.mainSessionFile)
+				) {
+					return true;
+				}
+			} else if (
+				!this.mainSessionFile ||
+				this.hasWindowsCaseCollision(this.mainSessionFile) ||
+				this.hasWindowsCaseCollision(this.cwd)
+			) {
+				// Pre-existing legacy metadata lacked `mainSessionFile`, and case-sensitive
+				// NTFS siblings make the legacy hash ambiguous; preserve the legacy dir.
+				return true;
+			}
+			fs.mkdirSync(path.resolve(this.launchCwd, sessionsDir()), { recursive: true });
 			fs.renameSync(legacySession, targetSession);
+			migrated = true;
+			this.ownsDirectory = true;
+			this.hasTrackedLockAttempt = true;
+			this.migrationBlockedHolderPid = undefined;
+			return true;
 		} catch {
-			// Non-fatal: fall back to clean worker dir if migration fails or races.
+			// Non-fatal unless blocked by live owner; release legacy lock below.
+			return true;
+		} finally {
+			if (!migrated) {
+				this.releaseOwnedFile(legacyWorkerLock);
+				this.releaseOwnedFile(legacyLock);
+			}
 		}
 	}
 
 	private loadOrInitMeta(): { meta: WorkerMeta; resumed: boolean } {
+		if (this.migrationBlockedHolderPid !== undefined) {
+			return {
+				meta: {
+					sessionId: randomUUID(),
+					cwd: this.cwd,
+					mainSessionFile: this.mainSessionFile,
+					model: this.config.model ?? this.inheritModel,
+					thinking: this.config.thinking ?? this.inheritThinking,
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+				},
+				resumed: false,
+			};
+		}
 		fs.mkdirSync(this.dir, { recursive: true });
 		const metaPath = path.join(this.dir, META_FILE);
 		try {
@@ -1251,6 +1369,7 @@ export class RelayWorkerManager {
 				const meta: WorkerMeta = {
 					sessionId: parsed.sessionId,
 					cwd: effectiveCwd,
+					mainSessionFile: this.mainSessionFile ?? (typeof parsed.mainSessionFile === "string" ? parsed.mainSessionFile : undefined),
 					model: this.config.model ?? parsed.model ?? this.inheritModel,
 					thinking: this.config.thinking ?? parsed.thinking ?? this.inheritThinking,
 					createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : Date.now(),
@@ -1267,6 +1386,7 @@ export class RelayWorkerManager {
 			const meta: WorkerMeta = {
 				sessionId: orphan.sessionId,
 				cwd: this.cwd,
+				mainSessionFile: this.mainSessionFile,
 				model: this.config.model ?? this.inheritModel,
 				thinking: this.config.thinking ?? this.inheritThinking,
 				createdAt: Date.now(),
@@ -1277,6 +1397,7 @@ export class RelayWorkerManager {
 		const meta: WorkerMeta = {
 			sessionId: randomUUID(),
 			cwd: this.cwd,
+			mainSessionFile: this.mainSessionFile,
 			model: this.config.model ?? this.inheritModel,
 			thinking: this.config.thinking ?? this.inheritThinking,
 			createdAt: Date.now(),
@@ -1450,9 +1571,9 @@ export class RelayWorkerManager {
 		return false;
 	}
 
-	private readDeadLegacyOwnerId(): string | undefined {
+	private readDeadLegacyOwnerId(legacyLockPath = this.legacyLockPath): string | undefined {
 		try {
-			const raw = fs.readFileSync(this.legacyLockPath, "utf-8");
+			const raw = fs.readFileSync(legacyLockPath, "utf-8");
 			if (!raw.trim()) return undefined;
 			const parsed = JSON.parse(raw) as Partial<OwnerLock>;
 			if (typeof parsed.pid !== "number") return undefined;
@@ -1465,8 +1586,10 @@ export class RelayWorkerManager {
 
 	private acquireLegacyLockExclusive(
 		allowedOwnerIds?: ReadonlySet<string>,
+		legacyLockPath = this.legacyLockPath,
+		workerDirPath = this.dir,
 	): { ok: true } | { ok: false; holderPid?: number } {
-		fs.mkdirSync(this.dir, { recursive: true });
+		fs.mkdirSync(workerDirPath, { recursive: true });
 		const payload = JSON.stringify({
 			ownerId: this.ownerId,
 			pid: process.pid,
@@ -1475,14 +1598,14 @@ export class RelayWorkerManager {
 		} satisfies OwnerLock);
 
 		for (let attempt = 0; attempt < 5; attempt++) {
-			const status = this.linkPrepopulatedFile(this.legacyLockPath, payload);
+			const status = this.linkPrepopulatedFile(legacyLockPath, payload);
 			if (status === "ok") return { ok: true };
 			if (status === "error") return { ok: false };
 
 			let existingOwnerId: string | undefined;
 			let deadTag: string | undefined;
 			try {
-				const raw = fs.readFileSync(this.legacyLockPath, "utf-8");
+				const raw = fs.readFileSync(legacyLockPath, "utf-8");
 				if (!raw.trim()) {
 					this.sleepSync(40);
 					continue;
@@ -1509,13 +1632,13 @@ export class RelayWorkerManager {
 				continue;
 			}
 
-			const reclaimLegacy = `${this.legacyLockPath}.reclaim.${deadTag}`;
+			const reclaimLegacy = `${legacyLockPath}.reclaim.${deadTag}`;
 			if (!this.acquireMarkerExclusive(reclaimLegacy, payload)) {
 				this.sleepSync(25);
 				continue;
 			}
 			try {
-				const recheck = JSON.parse(fs.readFileSync(this.legacyLockPath, "utf-8")) as Partial<OwnerLock>;
+				const recheck = JSON.parse(fs.readFileSync(legacyLockPath, "utf-8")) as Partial<OwnerLock>;
 				if (typeof recheck.pid !== "number") {
 					return { ok: false };
 				}
@@ -1524,7 +1647,7 @@ export class RelayWorkerManager {
 					return { ok: false, holderPid: livePid };
 				}
 				if (recheck.ownerId === existingOwnerId) {
-					fs.unlinkSync(this.legacyLockPath);
+					fs.unlinkSync(legacyLockPath);
 				}
 			} catch {
 				// Leave unverified lock untouched; fail closed on retry/exhaustion.
@@ -1591,6 +1714,22 @@ export class RelayWorkerManager {
 	}
 
 	private acquireOwnership(): { ok: true; continuousOwnership: boolean } | { ok: false; holderPid?: number } {
+		if (this.migrationBlockedHolderPid !== undefined) {
+			this.migrationBlockedHolderPid = undefined;
+			if (!this.ephemeral && this.legacyWindowsKey && this.legacyWindowsKey !== this.storageKey) {
+				if (!this.migrateLegacyWindowsWorkerDir(this.legacyWindowsKey)) {
+					return { ok: false, holderPid: this.migrationBlockedHolderPid };
+				}
+			}
+			if (this.migrationBlockedHolderPid !== undefined) {
+				return { ok: false, holderPid: this.migrationBlockedHolderPid };
+			}
+			const loaded = this.loadOrInitMeta();
+			this.meta = loaded.meta;
+			if (this.ownsDirectory) {
+				return { ok: true, continuousOwnership: false };
+			}
+		}
 		if (this.ownsDirectory) {
 			const current = this.verifyCurrentOwnership();
 			if (current.ok) return { ok: true, continuousOwnership: true };
@@ -1598,10 +1737,23 @@ export class RelayWorkerManager {
 			// Ownership was stolen/lost while cached; continue into full re-acquisition.
 		}
 		this.hasTrackedLockAttempt = true;
-		const lockParent = path.dirname(this.lockPath);
+		const res = this.acquireLockPair(this.lockPath, this.legacyLockPath, this.dir, true);
+		if (res.ok) {
+			this.ownsDirectory = true;
+		}
+		return { ...res, continuousOwnership: false } as { ok: true; continuousOwnership: boolean } | { ok: false; holderPid?: number };
+	}
+
+	private acquireLockPair(
+		lockPath: string,
+		legacyLockPath: string,
+		workerDirPath: string,
+		trackProvisional = false,
+	): { ok: true } | { ok: false; holderPid?: number } {
+		const lockParent = path.dirname(lockPath);
 		fs.mkdirSync(lockParent, { recursive: true });
-		this.cleanupStaleReclaimArtifacts(lockParent, path.basename(this.lockPath));
-		this.cleanupStaleReclaimArtifacts(this.dir, path.basename(this.legacyLockPath));
+		this.cleanupStaleReclaimArtifacts(lockParent, path.basename(lockPath));
+		this.cleanupStaleReclaimArtifacts(workerDirPath, path.basename(legacyLockPath));
 
 		const payload = JSON.stringify({
 			ownerId: this.ownerId,
@@ -1609,28 +1761,27 @@ export class RelayWorkerManager {
 			foregroundPid: process.pid,
 			createdAt: Date.now(),
 		} satisfies OwnerLock);
-		const legacySharedReclaim = `${this.lockPath}.reclaim`;
+		const legacySharedReclaim = `${lockPath}.reclaim`;
 
 		for (let attempt = 0; attempt < 5; attempt++) {
-			const strictLink = this.linkStrictPrepopulatedFile(this.lockPath, payload);
+			const strictLink = this.linkStrictPrepopulatedFile(lockPath, payload);
 			if (strictLink === "error") return { ok: false };
 
 			if (strictLink === "ok") {
-				let legacyRes = this.acquireLegacyLockExclusive();
+				let legacyRes = this.acquireLegacyLockExclusive(undefined, legacyLockPath, workerDirPath);
 				if (!legacyRes.ok && legacyRes.holderPid === undefined) {
 					// Recover a verified dead orphan `worker/owner.lock.json` left after a
 					// crash between primary and legacy lock unlinks.
-					const orphanLegacyId = this.readDeadLegacyOwnerId();
+					const orphanLegacyId = this.readDeadLegacyOwnerId(legacyLockPath);
 					if (orphanLegacyId) {
-						legacyRes = this.acquireLegacyLockExclusive(new Set([orphanLegacyId]));
+						legacyRes = this.acquireLegacyLockExclusive(new Set([orphanLegacyId]), legacyLockPath, workerDirPath);
 					}
 				}
 				if (!legacyRes.ok) {
-					this.releaseOwnedFile(this.lockPath);
+					this.releaseOwnedFile(lockPath);
 					return legacyRes;
 				}
-				this.ownsDirectory = true;
-				return { ok: true, continuousOwnership: false };
+				return { ok: true };
 			}
 
 			if (strictLink === "no_hardlink") {
@@ -1642,22 +1793,21 @@ export class RelayWorkerManager {
 					continue;
 				}
 				try {
-					const fallbackCreate = this.exclusiveCreatePrepopulatedFile(this.lockPath, payload);
+					const fallbackCreate = this.exclusiveCreatePrepopulatedFile(lockPath, payload);
 					if (fallbackCreate === "error") return { ok: false };
 					if (fallbackCreate === "ok") {
-						let legacyRes = this.acquireLegacyLockExclusive();
+						let legacyRes = this.acquireLegacyLockExclusive(undefined, legacyLockPath, workerDirPath);
 						if (!legacyRes.ok && legacyRes.holderPid === undefined) {
-							const orphanLegacyId = this.readDeadLegacyOwnerId();
+							const orphanLegacyId = this.readDeadLegacyOwnerId(legacyLockPath);
 							if (orphanLegacyId) {
-								legacyRes = this.acquireLegacyLockExclusive(new Set([orphanLegacyId]));
+								legacyRes = this.acquireLegacyLockExclusive(new Set([orphanLegacyId]), legacyLockPath, workerDirPath);
 							}
 						}
 						if (!legacyRes.ok) {
-							this.releaseOwnedFile(this.lockPath);
+							this.releaseOwnedFile(lockPath);
 							return legacyRes;
 						}
-						this.ownsDirectory = true;
-						return { ok: true, continuousOwnership: false };
+						return { ok: true };
 					}
 				} finally {
 					this.releaseOwnedFile(legacySharedReclaim);
@@ -1666,7 +1816,7 @@ export class RelayWorkerManager {
 
 			let existingRaw: string;
 			try {
-				existingRaw = fs.readFileSync(this.lockPath, "utf-8");
+				existingRaw = fs.readFileSync(lockPath, "utf-8");
 			} catch {
 				this.sleepSync(15);
 				continue;
@@ -1686,12 +1836,19 @@ export class RelayWorkerManager {
 					if (typeof existing.migratedFromOwnerId === "string" && existing.migratedFromOwnerId.trim()) {
 						retryAllowed.add(existing.migratedFromOwnerId);
 					}
-					const legacyRes = this.acquireLegacyLockExclusive(retryAllowed.size > 0 ? retryAllowed : undefined);
+					const orphanLegacyId = this.readDeadLegacyOwnerId(legacyLockPath);
+					if (orphanLegacyId) retryAllowed.add(orphanLegacyId);
+					const legacyRes = this.acquireLegacyLockExclusive(
+						retryAllowed.size > 0 ? retryAllowed : undefined,
+						legacyLockPath,
+						workerDirPath,
+					);
 					if (!legacyRes.ok) return legacyRes;
-					this.updateLockWorkerPid(undefined, true);
-					this.provisionalLockOwned = false;
-					this.ownsDirectory = true;
-					return { ok: true, continuousOwnership: false };
+					if (trackProvisional) {
+						this.updateLockWorkerPid(undefined, true);
+						this.provisionalLockOwned = false;
+					}
+					return { ok: true };
 				}
 				if (typeof existing.pid !== "number") {
 					this.sleepSync(40);
@@ -1720,7 +1877,7 @@ export class RelayWorkerManager {
 				continue;
 			}
 			try {
-				const reclaimMutex = `${this.lockPath}.reclaim.${deadTag}`;
+				const reclaimMutex = `${lockPath}.reclaim.${deadTag}`;
 				if (!this.acquireMarkerExclusive(reclaimMutex, payload)) {
 					this.sleepSync(25);
 					continue;
@@ -1729,7 +1886,7 @@ export class RelayWorkerManager {
 					let recheckOwnerId: string | undefined;
 					let recheckMigrated: string | undefined;
 					try {
-						const recheckRaw = fs.readFileSync(this.lockPath, "utf-8");
+						const recheckRaw = fs.readFileSync(lockPath, "utf-8");
 						const recheck = JSON.parse(recheckRaw) as Partial<OwnerLock>;
 						recheckOwnerId = typeof recheck.ownerId === "string" ? recheck.ownerId : undefined;
 						recheckMigrated = typeof recheck.migratedFromOwnerId === "string" ? recheck.migratedFromOwnerId : undefined;
@@ -1758,39 +1915,47 @@ export class RelayWorkerManager {
 						createdAt: Date.now(),
 					} satisfies OwnerLock);
 					try {
-						fs.unlinkSync(this.lockPath);
+						fs.unlinkSync(lockPath);
 					} catch (unlinkErr) {
 						if ((unlinkErr as NodeJS.ErrnoException).code !== "ENOENT") {
 							this.sleepSync(15);
 							continue;
 						}
 					}
-					if (this.linkPrepopulatedFile(this.lockPath, takeoverPayload) !== "ok") {
+					if (this.linkPrepopulatedFile(lockPath, takeoverPayload) !== "ok") {
 						continue;
 					}
-					const verified = JSON.parse(fs.readFileSync(this.lockPath, "utf-8")) as Partial<OwnerLock>;
+					const verified = JSON.parse(fs.readFileSync(lockPath, "utf-8")) as Partial<OwnerLock>;
 					if (verified.ownerId !== this.ownerId) {
 						return { ok: false };
 					}
-					this.provisionalLockOwned = true;
+					if (trackProvisional) {
+						this.provisionalLockOwned = true;
+					}
 					const allowedLegacyIds = new Set<string>();
 					if (recheckOwnerId) allowedLegacyIds.add(recheckOwnerId);
 					if (deadOwnerId) allowedLegacyIds.add(deadOwnerId);
 					if (rootLegacyId) allowedLegacyIds.add(rootLegacyId);
-					const legacyRes = this.acquireLegacyLockExclusive(allowedLegacyIds);
+					// Also include any verified dead legacy lock left behind when a previous
+					// acquirer crashed between creating primary `owner.lock` and claiming
+					// `worker/owner.lock.json`.
+					const orphanLegacyId = this.readDeadLegacyOwnerId(legacyLockPath);
+					if (orphanLegacyId) allowedLegacyIds.add(orphanLegacyId);
+					const legacyRes = this.acquireLegacyLockExclusive(allowedLegacyIds, legacyLockPath, workerDirPath);
 					if (!legacyRes.ok) {
 						if (legacyRes.holderPid !== undefined) {
-							this.releaseOwnedFile(this.lockPath);
-							this.provisionalLockOwned = false;
+							this.releaseOwnedFile(lockPath);
+							if (trackProvisional) this.provisionalLockOwned = false;
 						}
 						return legacyRes;
 					}
-					this.updateLockWorkerPid(undefined, true);
-					this.provisionalLockOwned = false;
-					this.ownsDirectory = true;
-					this.cleanupStaleReclaimArtifacts(lockParent, path.basename(this.lockPath), this.ownerId);
-					this.cleanupStaleReclaimArtifacts(this.dir, path.basename(this.legacyLockPath), this.ownerId);
-					return { ok: true, continuousOwnership: false };
+					if (trackProvisional) {
+						this.updateLockWorkerPid(undefined, true);
+						this.provisionalLockOwned = false;
+					}
+					this.cleanupStaleReclaimArtifacts(lockParent, path.basename(lockPath), this.ownerId);
+					this.cleanupStaleReclaimArtifacts(workerDirPath, path.basename(legacyLockPath), this.ownerId);
+					return { ok: true };
 				} finally {
 					this.releaseOwnedFile(reclaimMutex);
 				}
@@ -2028,14 +2193,14 @@ export class RelayWorkerManager {
 		return this.runSpawnWithBarrier(gen, false).then(() => undefined);
 	}
 
-	private runSpawnWithBarrier(expectedGen: number, throwOnFailure: boolean): Promise<boolean> {
-		// Publish `startupPromise` for ALL spawns (start, restart, reset) so
-		// concurrent `relay_send` calls wait until `refreshStateFromRpc` and
-		// `setStatus("idle")` finish before dispatching prompts.
+	private runWithBarrier<T>(fn: () => Promise<T>): Promise<T> {
+		// Publish `startupPromise` for ALL spawns/resets (start, restart, reset)
+		// BEFORE tearing down the prior client so concurrent `relay_send` calls
+		// wait until the new worker is ready instead of racing teardown.
 		const prior = this.startupPromise;
 		const run = (async () => {
 			if (prior) await prior.catch(() => undefined);
-			return this.spawnProcess(expectedGen, throwOnFailure);
+			return fn();
 		})();
 		const barrier = run.then(() => undefined, () => undefined).finally(() => {
 			if (this.startupPromise === barrier) {
@@ -2044,6 +2209,10 @@ export class RelayWorkerManager {
 		});
 		this.startupPromise = barrier;
 		return run;
+	}
+
+	private runSpawnWithBarrier(expectedGen: number, throwOnFailure: boolean): Promise<boolean> {
+		return this.runWithBarrier(() => this.spawnProcess(expectedGen, throwOnFailure));
 	}
 
 	private async spawnProcess(expectedGen = this.generation, throwOnFailure = false): Promise<boolean> {
@@ -2143,24 +2312,31 @@ export class RelayWorkerManager {
 				);
 			}
 		}
+		const absSessionDir = path.resolve(this.launchCwd, this.dir);
+		const absExistingFile = existingFile ? path.resolve(this.launchCwd, existingFile) : undefined;
 		const args = [
 			"--mode", "rpc",
-			"--session-dir", this.dir,
-			...(existingFile ? ["--session", existingFile] : ["--session-id", this.meta.sessionId]),
+			"--session-dir", absSessionDir,
+			...(absExistingFile ? ["--session", absExistingFile] : ["--session-id", this.meta.sessionId]),
 			...inherited.args,
 		];
 
 		this.meta.cwd = this.cwd;
+		this.meta.mainSessionFile = this.mainSessionFile;
 		this.meta.model = model;
 		this.meta.thinking = thinking;
 		if (model && !inherited.modelPinnedByArgs) args.push("--model", model);
 		if (thinking) args.push("--thinking", thinking);
 		this.writeMeta(this.meta);
 
+		const caps = detectPiRuntimeCapabilities();
 		const env: Record<string, string> = {
 			[RELAY_WORKER_ENV]: "1",
 			[DELETE_GUARD_CHILD_ENV]: "1",
-			...(!detectPiRuntimeCapabilities().hasSettleCredentialWrites ? { PI_OFFLINE: "1" } : {}),
+			// Anchor user agent directory to foreground launchCwd so switching
+			// worker cwd never changes the trusted user-extension root.
+			PI_CODING_AGENT_DIR: path.resolve(this.launchCwd, getAgentDir()),
+			...(!caps.hasSettleCredentialWrites ? { PI_OFFLINE: "1" } : {}),
 		};
 		const client = new RelayRpcClient(this.meta.cwd, args, env);
 		this.client = client;
@@ -2437,12 +2613,11 @@ export class RelayWorkerManager {
 					: undefined;
 				const formatted = extName ? `${extName}: ${extErr}` : extErr;
 				this.pushActivity({ type: "event", text: `extension error: ${truncateLine(formatted, 120)}` });
-				if (this.promptErrorWaiter) {
-					this.promptErrorWaiter(formatted);
-				} else if (!this.sawAgentEnd) {
-					this.meta.lastError = formatted;
-					this.hooks.onWakeup(`[Relay worker extension error] ${formatted}`);
+				if (this.promptErrorWaiter?.(event, formatted)) {
+					break;
 				}
+				this.meta.lastError = formatted;
+				this.hooks.onWakeup(`[Relay worker extension error] ${formatted}`);
 				break;
 			}
 			case "agent_settled": {
@@ -2604,6 +2779,17 @@ export class RelayWorkerManager {
 			this.cancelPendingApprovals(cancelledToolCallId);
 			return true;
 		}
+		if (message.method === "notify" && typeof message.message === "string") {
+			const level = typeof message.notifyType === "string" ? message.notifyType : "info";
+			this.touchHeartbeat();
+			this.pushActivity({
+				type: "event",
+				text: `notify (${level}): ${truncateLine(message.message, 160)}`,
+				isError: level === "error",
+			});
+			this.promptNotifyWaiter?.(level, message.message);
+			return true;
+		}
 		if (
 			message.method !== "select" ||
 			typeof message.title !== "string" ||
@@ -2675,7 +2861,15 @@ export class RelayWorkerManager {
 
 	private async checkHeartbeat(): Promise<void> {
 		if (this.disposed || !this.client) return;
-		if (this.status !== "running" && this.status !== "retrying" && this.status !== "compacting") return;
+		const dispatchingPrompt = this.inflightPromptDispatch !== undefined;
+		if (
+			!dispatchingPrompt &&
+			this.status !== "running" &&
+			this.status !== "retrying" &&
+			this.status !== "compacting"
+		) {
+			return;
+		}
 		this.hooks.onStateChange();
 		if (this.pendingApprovals.size > 0) return;
 
@@ -2692,6 +2886,11 @@ export class RelayWorkerManager {
 					this.meta.lastError = "Worker stopped responding to RPC health probes.";
 					this.writeMeta(this.meta);
 					this.setStatus("stalled");
+					this.inflightPromptDispatch?.abort(
+						new Error(
+							"Worker stopped responding to 3 consecutive RPC health probes before acknowledging the prompt; delivery status is unknown. Inspect relay_status before retrying or restarting.",
+						),
+					);
 					this.hooks.onWakeup(
 						`[Relay worker unresponsive] The worker process is alive but stopped responding to 3 consecutive RPC health probes. ` +
 						`Inspect via relay_status and coordinate with the user before calling relay_control({ action: "restart" }).`,
@@ -2702,11 +2901,18 @@ export class RelayWorkerManager {
 		}
 
 		const timeoutMs = this.config.stallTimeoutSeconds * 1000;
-		if (timeoutMs > 0 && !this.silenceWarnedForRun && now - this.lastActivityAt >= timeoutMs) {
+		const silenceStart = this.inflightPromptDispatch
+			? Math.min(this.lastActivityAt, this.inflightPromptDispatch.startedAt)
+			: this.lastActivityAt;
+		if (timeoutMs > 0 && !this.silenceWarnedForRun && now - silenceStart >= timeoutMs) {
 			this.silenceWarnedForRun = true;
-			const silenceSec = Math.round((now - this.lastActivityAt) / 1000);
+			const silenceSec = Math.round((now - silenceStart) / 1000);
 			const activeTool = this.getActiveToolSummary();
-			const activityDesc = activeTool ? ` currently on "${activeTool}"` : "";
+			const activityDesc = activeTool
+				? ` currently on "${activeTool}"`
+				: this.inflightPromptDispatch
+					? " awaiting initial prompt acknowledgement"
+					: "";
 			this.hooks.onWakeup(
 				`[Worker heartbeat silence notice] No new output or tool progress has been received from the worker for ${silenceSec}s` +
 				`${activityDesc}. This is NOT automatically an error — it may simply be running a legitimately slow command or build. ` +
@@ -2852,6 +3058,8 @@ export class RelayWorkerManager {
 			this.assertActive(queuedGen, signal);
 			const trimmed = message.trim();
 			if (!trimmed) throw new Error("Message cannot be empty.");
+			const client = await this.ensureReadyClient(signal);
+			this.assertActive(queuedGen, signal);
 			if (this.status === "waiting_approval") {
 				throw new Error(
 					"Worker is paused waiting for deletion approval. Resolve pending requests via relay_approval first.",
@@ -2862,29 +3070,56 @@ export class RelayWorkerManager {
 					`Worker is currently ${this.status}. Inspect via relay_status or recover with relay_control({ action: "restart" }) first.`,
 				);
 			}
-
-			const client = await this.ensureReadyClient(signal);
-			this.assertActive(queuedGen, signal);
 			this.touchHeartbeat();
 
 			// Pi's RPC `prompt` with streamingBehavior atomically starts if idle or
 			// steers/queues if busy, avoiding TOCTOU races between state check and send.
 			const streamingBehavior: "steer" | "followUp" = mode === "steer" ? "steer" : "followUp";
+			const commandMatch = trimmed.match(/^\/([^\s]+)/);
+			const commandName = commandMatch?.[1];
 			let result: { disposition?: unknown } | undefined;
 			let capturedExtError: string | undefined;
-			const waiter = (errMsg: string) => {
+			const capturedNotices: Array<{ level: string; message: string }> = [];
+			const waiter = (event: RpcEvent, errMsg: string): boolean => {
+				if (!commandName) return false;
+				if (event.event !== "command") return false;
+				if (typeof event.extensionPath === "string" && event.extensionPath !== `command:${commandName}`) {
+					return false;
+				}
 				if (!capturedExtError) capturedExtError = errMsg;
+				return true;
 			};
+			const notifyWaiter = (level: string, notifyMsg: string) => {
+				capturedNotices.push({ level, message: notifyMsg });
+			};
+			const dispatchController = new AbortController();
+			let dispatchError: Error | undefined;
+			const onOuterAbort = () => dispatchController.abort();
+			signal?.addEventListener("abort", onOuterAbort, { once: true });
+			const dispatchMonitor = {
+				startedAt: Date.now(),
+				abort: (reason: Error) => {
+					if (!dispatchError) dispatchError = reason;
+					dispatchController.abort();
+				},
+			};
+			this.inflightPromptDispatch = dispatchMonitor;
 			this.promptErrorWaiter = waiter;
+			this.promptNotifyWaiter = notifyWaiter;
 			try {
-				result = (await client.prompt(trimmed, streamingBehavior, signal)) as { disposition?: unknown } | undefined;
+				result = (await client.prompt(trimmed, streamingBehavior, dispatchController.signal)) as
+					| { disposition?: unknown }
+					| undefined;
 				const disposition = typeof result?.disposition === "string" ? result.disposition : undefined;
 				if (disposition === "handled" && !capturedExtError) {
 					// Give stdout event delivery a brief tick to surface any `extension_error`
-					// emitted alongside an immediately handled extension slash command.
+					// or `notify` emitted alongside an immediately handled extension slash command.
 					await new Promise((resolve) => setTimeout(resolve, 25));
 				}
 			} catch (error) {
+				if (dispatchError) {
+					throw dispatchError;
+				}
 				if (signal?.aborted) {
 					throw new Error(
 						"Operation aborted while awaiting worker acknowledgement; inspect relay_status before re-sending.",
@@ -2892,8 +3127,15 @@ export class RelayWorkerManager {
 				}
 				throw error;
 			} finally {
+				signal?.removeEventListener("abort", onOuterAbort);
+				if (this.inflightPromptDispatch === dispatchMonitor) {
+					this.inflightPromptDispatch = undefined;
+				}
 				if (this.promptErrorWaiter === waiter) {
 					this.promptErrorWaiter = undefined;
+				}
+				if (this.promptNotifyWaiter === notifyWaiter) {
+					this.promptNotifyWaiter = undefined;
 				}
 			}
 			if (capturedExtError) {
@@ -2902,6 +3144,12 @@ export class RelayWorkerManager {
 			const disposition = typeof result?.disposition === "string" ? result.disposition : undefined;
 
 			if (disposition === "handled") {
+				if (capturedNotices.length > 0) {
+					const summary = capturedNotices
+						.map((n) => `[${n.level}] ${sanitizeControlText(n.message, 500)}`)
+						.join("\n");
+					return `Worker handled the message immediately as a command without starting a background agent run.\n${summary}`;
+				}
 				return "Worker handled the message immediately as a command without starting a background agent run.";
 			}
 			if (disposition === "queued") {
@@ -2961,59 +3209,63 @@ export class RelayWorkerManager {
 		}
 
 		if (action === "reset") {
-			const lock = this.acquireOwnership();
-			if (!lock.ok) {
-				const holderDesc = lock.holderPid ? ` (PID ${lock.holderPid})` : "";
-				throw new Error(
-					`Another active Pi session${holderDesc} owns this worker directory; refusing reset.`,
-				);
-			}
 			const gen = ++this.generation;
 			this.assertActive(gen, signal);
-			const stopped = await this.cleanupClient(false);
-			this.assertActive(gen, signal);
-			if (!stopped) {
-				throw new Error(
-					"Previous worker process did not exit cleanly; refusing reset to protect the active transcript.",
-				);
-			}
-			const stillOwned = this.verifyCurrentOwnership();
-			if (!stillOwned.ok) {
-				const holderDesc = stillOwned.holderPid ? ` (PID ${stillOwned.holderPid})` : "";
-				throw new Error(
-					`Worker directory ownership was lost to another Pi session${holderDesc}; refusing reset.`,
-				);
-			}
-			try {
-				for (const entry of fs.readdirSync(this.dir)) {
-					if (entry === LEGACY_LOCK_FILE) continue;
-					fs.rmSync(path.join(this.dir, entry), { recursive: true, force: true });
-				}
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			await this.runWithBarrier(async () => {
+				this.assertActive(gen, signal);
+				const lock = this.acquireOwnership();
+				if (!lock.ok) {
+					const holderDesc = lock.holderPid ? ` (PID ${lock.holderPid})` : "";
 					throw new Error(
-						`Failed to clear previous worker directory (${this.dir}): ${(error as Error).message}`,
+						`Another active Pi session${holderDesc} owns this worker directory; refusing reset.`,
 					);
 				}
-			}
-			this.assertActive(gen, signal);
-			this.recentItems = [];
-			this.finalOutput = "";
-			this.lastMessages = undefined;
-			this.lastStderr = undefined;
-			this.contextTokens = 0;
-			this.turns = 0;
-			this.seenApprovalCalls.clear();
-			this.meta = {
-				sessionId: randomUUID(),
-				cwd: this.cwd,
-				model: this.config.model ?? this.inheritModel,
-				thinking: this.config.thinking ?? this.inheritThinking,
-				createdAt: Date.now(),
-				updatedAt: Date.now(),
-			};
-			this.writeMeta(this.meta);
-			await this.runSpawnWithBarrier(gen, true);
+				const stopped = await this.cleanupClient(false);
+				this.assertActive(gen, signal);
+				if (!stopped) {
+					throw new Error(
+						"Previous worker process did not exit cleanly; refusing reset to protect the active transcript.",
+					);
+				}
+				const stillOwned = this.verifyCurrentOwnership();
+				if (!stillOwned.ok) {
+					const holderDesc = stillOwned.holderPid ? ` (PID ${stillOwned.holderPid})` : "";
+					throw new Error(
+						`Worker directory ownership was lost to another Pi session${holderDesc}; refusing reset.`,
+					);
+				}
+				try {
+					for (const entry of fs.readdirSync(this.dir)) {
+						if (entry === LEGACY_LOCK_FILE) continue;
+						fs.rmSync(path.join(this.dir, entry), { recursive: true, force: true });
+					}
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+						throw new Error(
+							`Failed to clear previous worker directory (${this.dir}): ${(error as Error).message}`,
+						);
+					}
+				}
+				this.assertActive(gen, signal);
+				this.recentItems = [];
+				this.finalOutput = "";
+				this.lastMessages = undefined;
+				this.lastStderr = undefined;
+				this.contextTokens = 0;
+				this.turns = 0;
+				this.seenApprovalCalls.clear();
+				this.meta = {
+					sessionId: randomUUID(),
+					cwd: this.cwd,
+					mainSessionFile: this.mainSessionFile,
+					model: this.config.model ?? this.inheritModel,
+					thinking: this.config.thinking ?? this.inheritThinking,
+					createdAt: Date.now(),
+					updatedAt: Date.now(),
+				};
+				this.writeMeta(this.meta);
+				return this.spawnProcess(gen, true);
+			});
 			this.assertActive(gen, signal);
 			return `Worker history reset; started fresh session ${this.meta.sessionId} (status: ${this.status}).`;
 		}
@@ -3166,10 +3418,11 @@ export class RelayWorkerManager {
 	}
 
 	dispose(sync = false): void {
-		if (this.disposed) return;
-		this.disposed = true;
-		this.generation += 1;
 		if (sync) {
+			if (this.syncDisposed || this.cleanupCompleted) return;
+			this.syncDisposed = true;
+			this.disposed = true;
+			this.generation += 1;
 			const hadOwnership = this.ownsDirectory;
 			const stopped = this.cleanupClientSync();
 			if (!stopped) {
@@ -3181,7 +3434,8 @@ export class RelayWorkerManager {
 				}
 				return;
 			}
-			if (this.ephemeral && hadOwnership) {
+			const verifiedOwned = hadOwnership && this.verifyCurrentOwnership().ok;
+			if (this.ephemeral && verifiedOwned) {
 				try {
 					fs.rmSync(this.dir, { recursive: true, force: true });
 				} catch {
@@ -3189,15 +3443,19 @@ export class RelayWorkerManager {
 				}
 			}
 			this.releaseOwnership();
-			if (this.ephemeral && hadOwnership) {
+			if (this.ephemeral && verifiedOwned) {
 				try {
-					fs.rmSync(mainSessionDir(this.storageKey), { recursive: true, force: true });
+					fs.rmdirSync(this.sessionRootDir);
 				} catch {
-					// Best effort cleanup for --no-session temporary runs.
+					// Best effort cleanup for --no-session temporary runs when empty.
 				}
 			}
+			this.cleanupCompleted = true;
 			return;
 		}
+		if (this.disposed) return;
+		this.disposed = true;
+		this.generation += 1;
 		void this.disposeAsync();
 	}
 
@@ -3225,7 +3483,7 @@ export class RelayWorkerManager {
 			'  if (removeDir === "1") { try { fs.rmSync(dirPath, { recursive: true, force: true }); } catch {} }',
 			'  try { if (fs.existsSync(lockPath) && ownerMatchesOrGone(lockPath)) fs.rmSync(lockPath, { force: true }); } catch {}',
 			'  try { if (fs.existsSync(legacyPath) && ownerMatchesOrGone(legacyPath)) fs.rmSync(legacyPath, { force: true }); } catch {}',
-			'  if (removeDir === "1") { try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch {} }',
+			'  if (removeDir === "1") { try { fs.rmdirSync(sessionDir); } catch {} }',
 			'};',
 			'tick();',
 		].join(" ");
@@ -3240,7 +3498,7 @@ export class RelayWorkerManager {
 					this.lockPath,
 					this.legacyLockPath,
 					this.dir,
-					mainSessionDir(this.storageKey),
+					this.sessionRootDir,
 					hadOwnership ? "1" : "0",
 				],
 				{
@@ -3248,6 +3506,7 @@ export class RelayWorkerManager {
 					stdio: "ignore",
 				},
 			);
+			helper.on("error", () => {});
 			helper.unref();
 		} catch {
 			// Best effort fallback; deferred in-process finalizer still covers reload/switch.
@@ -3276,7 +3535,8 @@ export class RelayWorkerManager {
 				this.retiringClient = undefined;
 			}
 			this.updateLockWorkerPid(undefined);
-			if (this.ephemeral && hadOwnership && this.verifyCurrentOwnership().ok) {
+			const verifiedOwned = hadOwnership && this.verifyCurrentOwnership().ok;
+			if (this.ephemeral && verifiedOwned) {
 				try {
 					fs.rmSync(this.dir, { recursive: true, force: true });
 				} catch {
@@ -3284,13 +3544,14 @@ export class RelayWorkerManager {
 				}
 			}
 			this.releaseOwnership();
-			if (this.ephemeral && hadOwnership) {
+			if (this.ephemeral && verifiedOwned) {
 				try {
-					fs.rmSync(mainSessionDir(this.storageKey), { recursive: true, force: true });
+					fs.rmdirSync(this.sessionRootDir);
 				} catch {
-					// Best effort cleanup for --no-session temporary runs.
+					// Best effort cleanup for --no-session temporary runs when empty.
 				}
 			}
+			this.cleanupCompleted = true;
 		};
 
 		if (retiring) {
@@ -3306,11 +3567,14 @@ export class RelayWorkerManager {
 			this.disposed = true;
 			this.generation += 1;
 		}
+		if (this.syncDisposed || this.cleanupCompleted) return;
 		const hadOwnership = this.ownsDirectory;
 		let stopped = await this.cleanupClient(false, 15_000);
+		if (this.syncDisposed || this.cleanupCompleted) return;
 		if (!stopped && this.ephemeral && this.retiringClient) {
 			// Give a brief post-kill settle window for --no-session before quitting.
 			await new Promise((resolve) => setTimeout(resolve, 250));
+			if (this.syncDisposed || this.cleanupCompleted) return;
 			stopped = this.isClientConfirmedDead(this.retiringClient);
 			if (stopped) {
 				this.retiringClient = undefined;
@@ -3325,7 +3589,8 @@ export class RelayWorkerManager {
 			this.scheduleDeferredDisposalFinalizer(hadOwnership);
 			return;
 		}
-		if (this.ephemeral && hadOwnership) {
+		const verifiedOwned = hadOwnership && this.verifyCurrentOwnership().ok;
+		if (this.ephemeral && verifiedOwned) {
 			try {
 				fs.rmSync(this.dir, { recursive: true, force: true });
 			} catch {
@@ -3333,12 +3598,13 @@ export class RelayWorkerManager {
 			}
 		}
 		this.releaseOwnership();
-		if (this.ephemeral && hadOwnership) {
+		if (this.ephemeral && verifiedOwned) {
 			try {
-				fs.rmSync(mainSessionDir(this.storageKey), { recursive: true, force: true });
+				fs.rmdirSync(this.sessionRootDir);
 			} catch {
-				// Best effort cleanup for --no-session temporary runs.
+				// Best effort cleanup for --no-session temporary runs when empty.
 			}
 		}
+		this.cleanupCompleted = true;
 	}
 }

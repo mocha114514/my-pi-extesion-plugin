@@ -18,6 +18,8 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { getCacheDir } from "../shared/paths.ts";
 
+const LAUNCH_CWD = process.cwd();
+
 /**
  * Resolve a session file path into a stable filesystem-aware identity
  * (handles un-flushed files via their parent dir and lowercases on Windows).
@@ -96,7 +98,7 @@ export function buildLegacyWindowsWorkerSessionKey(
 }
 
 export function relayModeRoot(): string {
-	return join(getCacheDir(), "relay-mode");
+	return resolve(LAUNCH_CWD, getCacheDir(), "relay-mode");
 }
 
 export function configFilePath(): string {

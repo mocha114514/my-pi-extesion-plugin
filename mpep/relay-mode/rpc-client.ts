@@ -9,8 +9,19 @@
 
 import { type ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
+
+function anchorAgentDir(raw: string): string {
+	const home = homedir();
+	let expanded = raw;
+	if (expanded === "~") expanded = home;
+	else if (expanded.startsWith("~/") || (process.platform === "win32" && expanded.startsWith("~\\"))) {
+		expanded = path.join(home, expanded.slice(2));
+	}
+	return path.isAbsolute(expanded) ? path.resolve(expanded) : path.resolve(process.cwd(), expanded);
+}
 
 export interface RpcEvent {
 	type: string;
@@ -116,11 +127,15 @@ export class RelayRpcClient {
 
 	async start(onSpawn?: (pid: number) => void): Promise<void> {
 		const invocation = getPiInvocation(this.args);
+		const spawnEnv: NodeJS.ProcessEnv = this.env ? { ...process.env, ...this.env } : { ...process.env };
+		if (spawnEnv.PI_CODING_AGENT_DIR) {
+			spawnEnv.PI_CODING_AGENT_DIR = anchorAgentDir(spawnEnv.PI_CODING_AGENT_DIR);
+		}
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd: this.cwd,
 			shell: false,
 			stdio: ["pipe", "pipe", "pipe"],
-			env: this.env ? { ...process.env, ...this.env } : process.env,
+			env: spawnEnv,
 			detached: process.platform !== "win32",
 		});
 		this.proc = proc;
@@ -130,6 +145,7 @@ export class RelayRpcClient {
 		this.alive = true;
 		this.processExited = false;
 		this.stopPromise = undefined;
+		let drainTimer: ReturnType<typeof setTimeout> | undefined;
 
 		proc.stdout?.on("data", (chunk: Buffer) => this.handleData(this.stdoutDecoder.write(chunk)));
 		proc.stderr?.on("data", (chunk: Buffer) => {
@@ -141,6 +157,10 @@ export class RelayRpcClient {
 		});
 		proc.on("error", () => {
 			this.processExited = true;
+			if (drainTimer) {
+				clearTimeout(drainTimer);
+				drainTimer = undefined;
+			}
 			this.handleClose(null);
 		});
 		proc.on("exit", (code) => {
@@ -155,16 +175,22 @@ export class RelayRpcClient {
 			this.processExitListeners.clear();
 			// If a grandchild retains stdout, `close` may be delayed indefinitely.
 			// Allow a brief 250ms drain for buffered JSONL responses, then settle
-			// pending requests and notify exit listeners so the foreground never hangs.
+			// pending requests, close inherited pipes, and notify exit listeners.
 			if (this.alive) {
-				const drainTimer = setTimeout(() => {
+				drainTimer = setTimeout(() => {
+					drainTimer = undefined;
 					if (this.alive) this.handleClose(code);
+					this.disposePipes(proc);
 				}, 250);
 				drainTimer.unref?.();
 			}
 		});
 		proc.on("close", (code) => {
 			this.processExited = true;
+			if (drainTimer) {
+				clearTimeout(drainTimer);
+				drainTimer = undefined;
+			}
 			this.handleClose(code);
 		});
 
@@ -204,6 +230,20 @@ export class RelayRpcClient {
 		else stdout.unref?.();
 	}
 
+	private disposePipes(proc: ChildProcess | null): void {
+		if (!proc) return;
+		this.buffer = "";
+		for (const stream of [proc.stdout, proc.stderr]) {
+			if (!stream) continue;
+			try {
+				stream.removeAllListeners("data");
+				stream.destroy();
+			} catch {
+				// Best effort stream cleanup.
+			}
+		}
+	}
+
 	private handleClose(code: number | null): void {
 		if (!this.alive) return;
 		this.alive = false;
@@ -219,8 +259,10 @@ export class RelayRpcClient {
 	}
 
 	private handleData(data: string): void {
+		if (!this.alive) return;
 		this.buffer += data;
 		for (;;) {
+			if (!this.alive) return;
 			const newline = this.buffer.indexOf("\n");
 			if (newline < 0) return;
 			const line = this.buffer.slice(0, newline).trim();
@@ -230,6 +272,7 @@ export class RelayRpcClient {
 	}
 
 	private handleLine(line: string): void {
+		if (!this.alive) return;
 		let message: Record<string, unknown>;
 		try {
 			message = JSON.parse(line) as Record<string, unknown>;
@@ -585,7 +628,7 @@ export class RelayRpcClient {
 			for (const child of byParent.get(cur) ?? []) {
 				if (child.pid === process.pid || pids.has(child.pid)) continue;
 				pids.set(child.pid, child.startId);
-				if (child.pgid > 0 && child.pgid !== process.pid && child.pgid !== rootPid) {
+				if (child.pgid > 0 && child.pgid !== process.pid) {
 					let members = pgids.get(child.pgid);
 					if (!members) {
 						members = new Set<number>();
@@ -693,12 +736,15 @@ export class RelayRpcClient {
 				return Boolean(expectedStart && live && live.startId === expectedStart);
 			});
 			// Also allow killing the group when at least one identity-verified
-			// original snapshot member currently belongs to `pgid`, catching late
-			// reparented descendants in that same detached process group.
+			// original snapshot member (or verified rootPid) currently belongs to
+			// `pgid`, catching late reparented descendants in that process group.
 			const hasVerifiedGroupMember = currentMembers.some((memberPid) => {
-				const expectedStart = snapshot.pids.get(memberPid);
 				const live = liveByPid.get(memberPid);
-				return Boolean(expectedStart && live && live.startId === expectedStart && live.pgid === pgid);
+				if (!live || live.pgid !== pgid) return false;
+				const expectedStart =
+					snapshot.pids.get(memberPid) ??
+					(memberPid === snapshot.rootPid ? snapshot.rootStartId : undefined);
+				return Boolean(expectedStart && live.startId === expectedStart);
 			});
 			if (allVerified || hasVerifiedGroupMember) {
 				try {

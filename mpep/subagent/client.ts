@@ -535,10 +535,13 @@ export class RpcSubprocess {
 					if (process.platform === "win32") {
 						if (pid !== undefined) taskkillTree(pid, true);
 					} else if (pid !== undefined) {
-						if (unixSnapshot) {
-							this.reapVerifiedUnixSnapshot(unixSnapshot);
-						} else if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
-							process.kill(-pid, "SIGKILL");
+						const reaped = unixSnapshot ? this.reapVerifiedUnixSnapshot(unixSnapshot) : false;
+						if (!reaped) {
+							if (this.isLiveChildProc(proc)) {
+								if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
+									process.kill(-pid, "SIGKILL");
+								}
+							}
 						}
 					}
 				} catch {
