@@ -173,10 +173,11 @@ export class RelayRpcClient {
 				}
 			}
 			this.processExitListeners.clear();
-			// If a grandchild retains stdout, `close` may be delayed indefinitely.
-			// Allow a brief 250ms drain for buffered JSONL responses, then settle
-			// pending requests, close inherited pipes, and notify exit listeners.
-			if (this.alive) {
+			// If a grandchild retains stdout/stderr, `close` may be delayed
+			// indefinitely after both unexpected exit AND deliberate shutdown.
+			// Allow a brief 250ms drain, then settle pending requests and close
+			// inherited pipes so file descriptors do not leak across reloads.
+			if (!drainTimer) {
 				drainTimer = setTimeout(() => {
 					drainTimer = undefined;
 					if (this.alive) this.handleClose(code);
@@ -192,6 +193,7 @@ export class RelayRpcClient {
 				drainTimer = undefined;
 			}
 			this.handleClose(code);
+			this.disposePipes(proc);
 		});
 
 		// Wait until the RPC loop answers before unreffing child streams so
@@ -612,7 +614,9 @@ export class RelayRpcClient {
 		const pids = new Map<number, string>();
 		const pgids = new Map<number, Set<number>>();
 		const rows = this.readUnixProcessTable();
-		const rootStartId = rows.find((r) => r.pid === rootPid)?.startId;
+		const rootRow = rows.find((r) => r.pid === rootPid);
+		const rootStartId = rootRow?.startId;
+		const ownPgid = rows.find((r) => r.pid === process.pid)?.pgid;
 		const byParent = new Map<number, Array<{ pid: number; pgid: number; startId: string }>>();
 		for (const row of rows) {
 			let list = byParent.get(row.ppid);
@@ -622,13 +626,33 @@ export class RelayRpcClient {
 			}
 			list.push({ pid: row.pid, pgid: row.pgid, startId: row.startId });
 		}
-		const queue: number[] = [rootPid];
+		const queue: number[] = [];
+		if (rootRow) {
+			queue.push(rootPid);
+			if (rootPid !== process.pid && (ownPgid === undefined || rootPid !== ownPgid)) {
+				let rootGroup = pgids.get(rootPid);
+				if (!rootGroup) {
+					rootGroup = new Set<number>();
+					pgids.set(rootPid, rootGroup);
+				}
+				rootGroup.add(rootPid);
+				// Capture already-reparented helpers still belonging to the
+				// detached worker's process group before rootPid exits.
+				for (const row of rows) {
+					if (row.pgid === rootPid && row.pid !== process.pid && row.pid !== rootPid && !pids.has(row.pid)) {
+						pids.set(row.pid, row.startId);
+						rootGroup.add(row.pid);
+						queue.push(row.pid);
+					}
+				}
+			}
+		}
 		while (queue.length > 0) {
 			const cur = queue.shift()!;
 			for (const child of byParent.get(cur) ?? []) {
 				if (child.pid === process.pid || pids.has(child.pid)) continue;
 				pids.set(child.pid, child.startId);
-				if (child.pgid > 0 && child.pgid !== process.pid) {
+				if (child.pgid > 0 && child.pgid !== process.pid && (ownPgid === undefined || child.pgid !== ownPgid)) {
 					let members = pgids.get(child.pgid);
 					if (!members) {
 						members = new Set<number>();

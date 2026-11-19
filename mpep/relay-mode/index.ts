@@ -29,7 +29,9 @@ import { registerRelayTools } from "./tools.ts";
 import { updateRelayStatusBar } from "./widget.ts";
 import {
 	detectPiRuntimeCapabilities,
+	isSamePath,
 	RELAY_COMPACT_PREFIX,
+	RELAY_TRUSTED_CWD_ENV,
 	RELAY_WORKER_ENV,
 	RelayWorkerManager,
 	type ModelDescriptor,
@@ -137,6 +139,19 @@ function buildPeriodicReminderMessage(remindPrompt: string, reason: string, issu
 
 export default function relayModeExtension(pi: ExtensionAPI): void {
 	if (process.env[RELAY_WORKER_ENV] === "1") {
+		const trustedCwd = process.env[RELAY_TRUSTED_CWD_ENV]?.trim();
+		if (trustedCwd) {
+			// Scope inherited foreground project trust strictly to the exact
+			// foreground cwd rather than using a process-wide `--approve`, so
+			// switching sessions into an untrusted directory inside the worker
+			// still honors that destination's trust decision.
+			pi.on("project_trust", (event) => {
+				if (event.cwd && isSamePath(event.cwd, trustedCwd)) {
+					return { trusted: "yes", remember: false };
+				}
+				return { trusted: "undecided" };
+			});
+		}
 		pi.registerCommand("mpep-relay-compact-idle", {
 			description: "Internal relay-mode command: compact worker only if idle.",
 			handler: async (args, ctx) => {
@@ -316,6 +331,24 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		heldNotices.length = 0;
 	};
 
+	const maybeDetachSignalHandlers = () => {
+		if (!worker && retiringWorkers.size === 0) {
+			detachSignalHandlers();
+		}
+	};
+
+	const trackRetiringWorker = (old: RelayWorkerManager) => {
+		if (old.isCleanupCompleted()) {
+			maybeDetachSignalHandlers();
+			return;
+		}
+		retiringWorkers.add(old);
+		old.onCleanupComplete(() => {
+			retiringWorkers.delete(old);
+			maybeDetachSignalHandlers();
+		});
+	};
+
 	const disposeWorkerSync = () => {
 		clearPendingUiAndTimers();
 		detachSignalHandlers();
@@ -336,16 +369,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const old = worker;
 		worker = undefined;
 		if (old) {
-			retiringWorkers.add(old);
-			try {
-				await old.disposeAsync();
-			} finally {
-				retiringWorkers.delete(old);
-			}
+			trackRetiringWorker(old);
+			await old.disposeAsync();
 		}
-		if (!worker && retiringWorkers.size === 0) {
-			detachSignalHandlers();
-		}
+		maybeDetachSignalHandlers();
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
@@ -358,7 +385,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const seq = ++sessionStartSeq;
 		const prev = worker;
 		clearPendingUiAndTimers();
-		detachSignalHandlers();
 		worker = undefined;
 		updateRelayStatusBar(ctx, undefined);
 
@@ -368,14 +394,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		treeNavInFlight = false;
 
 		if (prev) {
-			retiringWorkers.add(prev);
-			try {
-				await prev.disposeAsync();
-			} finally {
-				retiringWorkers.delete(prev);
-			}
+			trackRetiringWorker(prev);
+			await prev.disposeAsync();
 			if (seq !== sessionStartSeq) return;
 		}
+		maybeDetachSignalHandlers();
 
 		if (!ctx.hasUI || ctx.mode !== "tui") {
 			activeInSession = false;

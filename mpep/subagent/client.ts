@@ -523,7 +523,8 @@ export class RpcSubprocess {
 				if (process.platform === "win32") {
 					if (pid !== undefined) taskkillTree(pid, false);
 				} else if (pid !== undefined) {
-					if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
+					const liveStartId = capturedRootStartId ? this.readUnixStartId(pid) : undefined;
+					if (!capturedRootStartId || liveStartId === undefined || liveStartId === capturedRootStartId) {
 						process.kill(-pid, "SIGTERM"); // own process group (detached spawn)
 					}
 				}
@@ -536,11 +537,10 @@ export class RpcSubprocess {
 						if (pid !== undefined) taskkillTree(pid, true);
 					} else if (pid !== undefined) {
 						const reaped = unixSnapshot ? this.reapVerifiedUnixSnapshot(unixSnapshot) : false;
-						if (!reaped) {
-							if (this.isLiveChildProc(proc)) {
-								if (!capturedRootStartId || this.readUnixStartId(pid) === capturedRootStartId) {
-									process.kill(-pid, "SIGKILL");
-								}
+						if (!reaped && this.isLiveChildProc(proc)) {
+							const liveStartId = capturedRootStartId ? this.readUnixStartId(pid) : undefined;
+							if (!capturedRootStartId || liveStartId === undefined || liveStartId === capturedRootStartId) {
+								process.kill(-pid, "SIGKILL");
 							}
 						}
 					}
