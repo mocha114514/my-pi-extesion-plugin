@@ -104,17 +104,23 @@ export function finalizeWorkerDirectoryOwnership(
 /**
  * Safely remove a preserved `--no-session` ephemeral worker directory on final
  * session shutdown/exit after verifying exclusive lock ownership.
+ *
+ * Returns `true` if the directory is gone (or never existed) and `false` if
+ * ownership could not yet be acquired (for example, a retiring worker is still
+ * releasing its lock) so callers can retain the key and retry later.
  */
-export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd: string): void {
+export function cleanupPreservedEphemeralWorkerDir(storageKey: string, launchCwd: string): boolean {
 	const sessionRoot = path.resolve(launchCwd, mainSessionDir(storageKey));
 	const dir = path.resolve(launchCwd, workerDir(storageKey));
-	if (!fs.existsSync(sessionRoot)) return;
+	if (!fs.existsSync(sessionRoot)) return true;
 	const lock = new WorkerDirectoryLock(sessionRoot, dir, launchCwd);
 	const acquired = lock.acquireOwnership();
-	if (!acquired.ok) return;
+	if (!acquired.ok) return false;
 	try {
 		finalizeWorkerDirectoryOwnership(lock, dir, sessionRoot, true, true);
+		return !fs.existsSync(sessionRoot);
 	} catch {
 		lock.releaseOwnership();
+		return !fs.existsSync(sessionRoot);
 	}
 }

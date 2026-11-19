@@ -20,6 +20,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import type { OverlayHandle } from "@earendil-works/pi-tui";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isPluginEnabled } from "../manager/preferences.ts";
 import { t } from "../shared/i18n/index.ts";
@@ -32,7 +33,6 @@ import { registerRelayTools } from "./tools.ts";
 import { createRelayBorderBadge, updateRelayStatusBar, type RelayBorderBadgeHandle } from "./widget.ts";
 import {
 	cleanupPreservedEphemeralWorkerDir,
-	detectPiRuntimeCapabilities,
 	isSamePath,
 	RELAY_COMPACT_PREFIX,
 	RELAY_TRUSTED_CWD_ENV,
@@ -50,7 +50,9 @@ interface SharedLifecycleState {
 	active: RelayWorkerManager | undefined;
 	retiring: Set<RelayWorkerManager>;
 	preservedEphemeralKeys: Set<string>;
-	exitHookAttached: boolean;
+	ephemeralTokens: Map<string, string>;
+	activeEphemeralKey: string | undefined;
+	exitListener: (() => void) | undefined;
 	unregisterSigint: (() => void) | undefined;
 }
 
@@ -65,14 +67,27 @@ function getSharedLifecycle(): SharedLifecycleState {
 			active: undefined,
 			retiring: new Set<RelayWorkerManager>(),
 			preservedEphemeralKeys: new Set<string>(),
-			exitHookAttached: false,
+			ephemeralTokens: new Map<string, string>(),
+			activeEphemeralKey: undefined,
+			exitListener: undefined,
 			unregisterSigint: undefined,
 		};
 		globals[RETIRING_SLOT] = state;
-	} else if (!state.preservedEphemeralKeys) {
-		state.preservedEphemeralKeys = new Set<string>();
+	} else {
+		if (!state.preservedEphemeralKeys) state.preservedEphemeralKeys = new Set<string>();
+		if (!state.ephemeralTokens) state.ephemeralTokens = new Map<string, string>();
 	}
 	return state;
+}
+
+function purgePreservedEphemeralKeys(keepKey?: string): void {
+	const state = getSharedLifecycle();
+	for (const key of [...state.preservedEphemeralKeys]) {
+		if (keepKey && key === keepKey) continue;
+		if (cleanupPreservedEphemeralWorkerDir(key, LAUNCH_CWD)) {
+			state.preservedEphemeralKeys.delete(key);
+		}
+	}
 }
 
 function maybeDetachGlobalSignalHandlers(): void {
@@ -81,12 +96,13 @@ function maybeDetachGlobalSignalHandlers(): void {
 		state.active ||
 		state.retiring.size > 0 ||
 		state.preservedEphemeralKeys.size > 0 ||
-		!state.exitHookAttached
+		!state.exitListener
 	) {
 		return;
 	}
-	state.exitHookAttached = false;
-	process.off("exit", disposeAllGlobalWorkersSync);
+	const listener = state.exitListener;
+	state.exitListener = undefined;
+	process.off("exit", listener);
 	state.unregisterSigint?.();
 	state.unregisterSigint = undefined;
 }
@@ -95,6 +111,7 @@ function trackGlobalRetiringWorker(target: RelayWorkerManager): void {
 	const state = getSharedLifecycle();
 	if (target.isCleanupCompleted()) {
 		state.retiring.delete(target);
+		purgePreservedEphemeralKeys(state.activeEphemeralKey);
 		maybeDetachGlobalSignalHandlers();
 		return;
 	}
@@ -102,11 +119,12 @@ function trackGlobalRetiringWorker(target: RelayWorkerManager): void {
 	attachGlobalSignalHandlers();
 	target.onCleanupComplete(() => {
 		state.retiring.delete(target);
+		purgePreservedEphemeralKeys(state.activeEphemeralKey);
 		maybeDetachGlobalSignalHandlers();
 	});
 }
 
-function disposeAllGlobalWorkersSync(): void {
+function disposeAllGlobalWorkersSync(preserveEphemeralForReload = false): void {
 	const state = getSharedLifecycle();
 	const targets = new Set<RelayWorkerManager>(state.retiring);
 	if (state.active) {
@@ -123,19 +141,21 @@ function disposeAllGlobalWorkersSync(): void {
 			trackGlobalRetiringWorker(target);
 		}
 	}
-	for (const key of [...state.preservedEphemeralKeys]) {
-		state.preservedEphemeralKeys.delete(key);
-		cleanupPreservedEphemeralWorkerDir(key, LAUNCH_CWD);
+	if (!preserveEphemeralForReload) {
+		state.activeEphemeralKey = undefined;
+		state.ephemeralTokens.clear();
+		purgePreservedEphemeralKeys();
 	}
 	maybeDetachGlobalSignalHandlers();
 }
 
 function attachGlobalSignalHandlers(): void {
 	const state = getSharedLifecycle();
-	if (state.exitHookAttached) return;
-	state.exitHookAttached = true;
-	process.on("exit", disposeAllGlobalWorkersSync);
-	state.unregisterSigint = registerSigintCleanup(disposeAllGlobalWorkersSync);
+	if (state.exitListener) return;
+	const listener = () => disposeAllGlobalWorkersSync(false);
+	state.exitListener = listener;
+	process.on("exit", listener);
+	state.unregisterSigint = registerSigintCleanup(listener);
 }
 
 const COMPACT_PENDING_SLOT = Symbol.for("mpep.compact-forewarn.pending");
@@ -162,9 +182,13 @@ export function resolveInitialRelayEnabled(
 
 function readSessionRelayState(ctx: ExtensionContext): boolean | undefined {
 	try {
-		const branch = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries?.() ?? [];
-		for (let i = branch.length - 1; i >= 0; i--) {
-			const entry = branch[i] as { type?: unknown; customType?: unknown; data?: unknown } | undefined;
+		// Read session entries in append order (rather than only the active tree
+		// branch) because relay mode is a session-level toggle: disabling it and
+		// navigating to a sibling branch must not resurrect an older `enabled: true`
+		// entry on reload.
+		const entries = ctx.sessionManager.getEntries?.() ?? ctx.sessionManager.getBranch?.() ?? [];
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i] as { type?: unknown; customType?: unknown; data?: unknown } | undefined;
 			if (entry?.type === "custom" && entry.customType === SESSION_STATE_ENTRY) {
 				const data = entry.data as Partial<SessionRelayStateEntry> | undefined;
 				if (typeof data?.enabled === "boolean") {
@@ -334,8 +358,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	let worker: RelayWorkerManager | undefined;
 	let borderBadge: RelayBorderBadgeHandle | undefined;
 	let panelOpen = false;
+	let closeActivePanel: (() => void) | undefined;
 	let sessionToggleInFlight = false;
 	let toggleSeq = 0;
+	let retiringDisposalPromise: Promise<void> | undefined;
+	let currentSessionId: string | undefined;
 	let currentEphemeralToken: string | undefined;
 	let currentPreservedEphemeralKey: string | undefined;
 	let milestones: number[] = [];
@@ -362,7 +389,6 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		flushTimer.unref?.();
 	};
 
-	const runtimeCaps = detectPiRuntimeCapabilities();
 	const LEGACY_WAKE_POLICY_RE = /^(?:<relay-mode-wakeup-policy>\n[\s\S]*?\n<\/relay-mode-wakeup-policy>\n\n)+/;
 
 	const sendWakeup = (rawContent: string) => {
@@ -452,26 +478,63 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	};
 
 	const hideRelayTools = () => {
-		const filtered = pi.getActiveTools().filter((name) => !RELAY_TOOL_NAMES.has(name));
-		if (filtered.length !== pi.getActiveTools().length) {
+		const active = pi.getActiveTools();
+		const filtered = active.filter((name) => !RELAY_TOOL_NAMES.has(name));
+		if (filtered.length !== active.length) {
 			pi.setActiveTools(filtered);
 		}
 	};
 
+	const syncRelayToolVisibility = () => {
+		if (!activeInSession) {
+			hideRelayTools();
+			return;
+		}
+		const active = pi.getActiveTools();
+		const missing = [...RELAY_TOOL_NAMES].filter((name) => !active.includes(name));
+		if (missing.length > 0) {
+			pi.setActiveTools([...active, ...missing]);
+		}
+	};
+
+	const tryAppendSessionState = (enabled: boolean, notifyOnError: boolean) => {
+		try {
+			pi.appendEntry(SESSION_STATE_ENTRY, { enabled } satisfies SessionRelayStateEntry);
+		} catch (error) {
+			if (notifyOnError) {
+				currentCtx?.ui.notify(
+					t("relay.panel.saveFailed", {
+						error: error instanceof Error ? error.message : String(error),
+					}),
+					"error",
+				);
+			}
+		}
+	};
+
 	const purgeCurrentPreservedEphemeralDir = () => {
-		if (!currentPreservedEphemeralKey) return;
-		const key = currentPreservedEphemeralKey;
-		currentPreservedEphemeralKey = undefined;
-		getSharedLifecycle().preservedEphemeralKeys.delete(key);
-		cleanupPreservedEphemeralWorkerDir(key, LAUNCH_CWD);
+		const shared = getSharedLifecycle();
+		if (currentPreservedEphemeralKey) {
+			const key = currentPreservedEphemeralKey;
+			currentPreservedEphemeralKey = undefined;
+			if (shared.activeEphemeralKey === key) {
+				shared.activeEphemeralKey = undefined;
+			}
+			// Keep key in `preservedEphemeralKeys` until cleanup succeeds so a
+			// retiring worker releasing its lock later still triggers deletion.
+			shared.preservedEphemeralKeys.add(key);
+		}
+		purgePreservedEphemeralKeys(shared.activeEphemeralKey);
 	};
 
 	const disposeBorderBadge = () => {
+		closeActivePanel?.();
+		closeActivePanel = undefined;
 		borderBadge?.dispose();
 		borderBadge = undefined;
 	};
 
-	const disposeWorkerSync = () => {
+	const disposeWorkerSync = (preserveEphemeralForReload = false) => {
 		clearPendingUiAndTimers();
 		disposeBorderBadge();
 		const active = worker;
@@ -486,8 +549,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				trackGlobalRetiringWorker(active);
 			}
 		}
-		purgeCurrentPreservedEphemeralDir();
-		disposeAllGlobalWorkersSync();
+		if (!preserveEphemeralForReload) {
+			purgeCurrentPreservedEphemeralDir();
+		}
+		disposeAllGlobalWorkersSync(preserveEphemeralForReload);
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
@@ -503,19 +568,38 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		if (old && shared.active === old) {
 			shared.active = undefined;
 		}
-		if (old) {
-			if (preserve && old.ephemeral) {
-				currentPreservedEphemeralKey = old.storageKey;
-				shared.preservedEphemeralKeys.add(old.storageKey);
-				attachGlobalSignalHandlers();
+		const prevDisposal = retiringDisposalPromise;
+		const currentDisposal = (async () => {
+			if (prevDisposal) {
+				await prevDisposal.catch(() => undefined);
 			}
-			trackGlobalRetiringWorker(old);
-			await old.disposeAsync({ preserveEphemeralDir: preserve });
+			if (old) {
+				if (preserve && old.ephemeral) {
+					currentPreservedEphemeralKey = old.storageKey;
+					shared.activeEphemeralKey = old.storageKey;
+					shared.preservedEphemeralKeys.add(old.storageKey);
+					attachGlobalSignalHandlers();
+				}
+				trackGlobalRetiringWorker(old);
+				await old.disposeAsync({ preserveEphemeralDir: preserve });
+			}
+			if (!preserve) {
+				if (currentSessionId) {
+					shared.ephemeralTokens.delete(currentSessionId);
+				}
+				shared.activeEphemeralKey = undefined;
+				purgeCurrentPreservedEphemeralDir();
+			}
+			maybeDetachGlobalSignalHandlers();
+		})();
+		retiringDisposalPromise = currentDisposal;
+		try {
+			await currentDisposal;
+		} finally {
+			if (retiringDisposalPromise === currentDisposal) {
+				retiringDisposalPromise = undefined;
+			}
 		}
-		if (!preserve) {
-			purgeCurrentPreservedEphemeralDir();
-		}
-		maybeDetachGlobalSignalHandlers();
 		updateRelayStatusBar(currentCtx, undefined);
 	};
 
@@ -526,6 +610,14 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		persistEntry: boolean,
 	): Promise<boolean> => {
 		if (!ctx.hasUI || ctx.mode !== "tui") return false;
+		// Wait for any in-flight worker teardown before acquiring locks or changing tools.
+		if (retiringDisposalPromise) {
+			await retiringDisposalPromise.catch(() => undefined);
+		}
+		if (expectedSessionSeq !== sessionStartSeq || expectedToggleSeq !== toggleSeq) {
+			return false;
+		}
+
 		const activeTools = pi.getActiveTools();
 		const missingRelayTools = [...RELAY_TOOL_NAMES].filter((name) => !activeTools.includes(name));
 		if (missingRelayTools.length > 0) {
@@ -546,95 +638,111 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			return false;
 		}
 
-		if (expectedSessionSeq !== sessionStartSeq || expectedToggleSeq !== toggleSeq) {
+		try {
+			const config = loadRelayConfig();
+			const sessionId = ctx.sessionManager.getSessionId() || `pid-${process.pid}`;
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			const ephemeral = !sessionFile;
+			const shared = getSharedLifecycle();
+			if (ephemeral) {
+				if (!currentEphemeralToken) {
+					currentEphemeralToken = shared.ephemeralTokens.get(sessionId) ?? randomUUID().slice(0, 8);
+				}
+				shared.ephemeralTokens.set(sessionId, currentEphemeralToken);
+			}
+			const storageKey = buildWorkerSessionKey(sessionId, sessionFile, currentEphemeralToken);
+			const legacyWindowsKey = !ephemeral ? buildLegacyWindowsWorkerSessionKey(sessionId, sessionFile) : undefined;
+			const inheritModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			const inheritThinking = pi.getThinkingLevel?.() ?? "off";
+			const projectTrusted = getProjectTrusted(ctx);
+			const availableModels: ModelDescriptor[] = (ctx.modelRegistry?.getAll?.() ?? []).map((m) => ({
+				provider: m.provider,
+				id: m.id,
+				authenticated: ctx.modelRegistry?.hasConfiguredAuth?.(m) ?? true,
+			}));
+
+			const verifyApiKeyForProvider = async (provider: string, _apiKey: string): Promise<boolean> => {
+				try {
+					return ctx.modelRegistry?.getProviderAuthStatus?.(provider)?.source === "runtime";
+				} catch {
+					return false;
+				}
+			};
+
+			const instance = new RelayWorkerManager(
+				sessionId,
+				storageKey,
+				ctx.cwd,
+				LAUNCH_CWD,
+				config,
+				inheritModel,
+				inheritThinking,
+				projectTrusted,
+				ephemeral,
+				{
+					onWakeup: (message) => sendWakeup(message),
+					onStateChange: () => {
+						if (worker === instance) {
+							updateRelayStatusBar(currentCtx, instance.getSnapshot());
+						}
+					},
+				},
+				ctx.model?.provider,
+				ctx.model?.id,
+				availableModels,
+				verifyApiKeyForProvider,
+				legacyWindowsKey,
+				sessionFile,
+			);
+
+			// Reclaiming a preserved ephemeral worker directory if the user toggled
+			// relay mode off and back on (or reloaded) within the same `--no-session` run.
+			if (ephemeral) {
+				shared.activeEphemeralKey = storageKey;
+			}
+			if (currentPreservedEphemeralKey === storageKey) {
+				currentPreservedEphemeralKey = undefined;
+				shared.preservedEphemeralKeys.delete(storageKey);
+			}
+
+			currentConfig = config;
+			milestones = buildReminderMilestones(config.remindIntervalPercent);
+			if (config.warning) {
+				ctx.ui.notify(config.warning, "warning");
+			}
+			activeInSession = true;
+			pendingResumeNotice = undefined;
+			firedMilestones.clear();
+			worker = instance;
+			shared.active = instance;
+			attachGlobalSignalHandlers();
+			if (persistEntry) {
+				tryAppendSessionState(true, true);
+			}
+			updateRelayStatusBar(ctx, instance.getSnapshot());
+			borderBadge?.sync();
+			void instance.start();
+
+			if (instance.isResumedSession) {
+				pendingResumeNotice =
+					`[Relay mode resumed] Your symbiotic background worker (session ${instance.getSnapshot().sessionId}) ` +
+					`is warming up in idle standby from the previous session. Use relay_status to check its state or relay_send to continue work.`;
+			}
+			return true;
+		} catch (error) {
+			// Roll back tools and session state cleanly so failed activation never
+			// leaves relay_* tools active without a backing worker.
+			activeInSession = false;
+			currentConfig = undefined;
+			milestones = [];
+			hideRelayTools();
+			borderBadge?.sync();
+			ctx.ui.notify(
+				`Failed to activate relay mode: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
 			return false;
 		}
-
-		const config = loadRelayConfig();
-		currentConfig = config;
-		milestones = buildReminderMilestones(config.remindIntervalPercent);
-		if (config.warning) {
-			ctx.ui.notify(config.warning, "warning");
-		}
-
-		const sessionId = ctx.sessionManager.getSessionId() || `pid-${process.pid}`;
-		const sessionFile = ctx.sessionManager.getSessionFile();
-		const ephemeral = !sessionFile;
-		if (ephemeral && !currentEphemeralToken) {
-			currentEphemeralToken = randomUUID().slice(0, 8);
-		}
-		const storageKey = buildWorkerSessionKey(sessionId, sessionFile, currentEphemeralToken);
-		const legacyWindowsKey = !ephemeral ? buildLegacyWindowsWorkerSessionKey(sessionId, sessionFile) : undefined;
-		const inheritModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-		const inheritThinking = pi.getThinkingLevel?.() ?? "off";
-		const projectTrusted = getProjectTrusted(ctx);
-		const availableModels: ModelDescriptor[] = (ctx.modelRegistry?.getAll?.() ?? []).map((m) => ({
-			provider: m.provider,
-			id: m.id,
-			authenticated: ctx.modelRegistry?.hasConfiguredAuth?.(m) ?? true,
-		}));
-
-		const verifyApiKeyForProvider = async (provider: string, _apiKey: string): Promise<boolean> => {
-			try {
-				return ctx.modelRegistry?.getProviderAuthStatus?.(provider)?.source === "runtime";
-			} catch {
-				return false;
-			}
-		};
-
-		// Reclaiming a preserved ephemeral worker directory if the user toggled
-		// relay mode off and back on within the same `--no-session` run.
-		if (currentPreservedEphemeralKey === storageKey) {
-			currentPreservedEphemeralKey = undefined;
-			getSharedLifecycle().preservedEphemeralKeys.delete(storageKey);
-		}
-
-		const instance = new RelayWorkerManager(
-			sessionId,
-			storageKey,
-			ctx.cwd,
-			LAUNCH_CWD,
-			config,
-			inheritModel,
-			inheritThinking,
-			projectTrusted,
-			ephemeral,
-			{
-				onWakeup: (message) => sendWakeup(message),
-				onStateChange: () => {
-					if (worker === instance) {
-						updateRelayStatusBar(currentCtx, instance.getSnapshot());
-					}
-				},
-			},
-			ctx.model?.provider,
-			ctx.model?.id,
-			availableModels,
-			verifyApiKeyForProvider,
-			legacyWindowsKey,
-			sessionFile,
-		);
-
-		activeInSession = true;
-		pendingResumeNotice = undefined;
-		promptHookActiveForRun = false;
-		firedMilestones.clear();
-		worker = instance;
-		getSharedLifecycle().active = instance;
-		attachGlobalSignalHandlers();
-		if (persistEntry) {
-			pi.appendEntry(SESSION_STATE_ENTRY, { enabled: true } satisfies SessionRelayStateEntry);
-		}
-		updateRelayStatusBar(ctx, instance.getSnapshot());
-		borderBadge?.sync();
-		void instance.start();
-
-		if (instance.isResumedSession) {
-			pendingResumeNotice =
-				`[Relay mode resumed] Your symbiotic background worker (session ${instance.getSnapshot().sessionId}) ` +
-				`is warming up in idle standby from the previous session. Use relay_status to check its state or relay_send to continue work.`;
-		}
-		return true;
 	};
 
 	const deactivateSessionRelay = async (
@@ -647,10 +755,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		milestones = [];
 		firedMilestones.clear();
 		pendingResumeNotice = undefined;
-		promptHookActiveForRun = false;
+		// Keep `promptHookActiveForRun` intact until `agent_settled` so any mid-run
+		// LLM requests know to emit a request-only deactivation override in `context`.
 		hideRelayTools();
 		if (persistEntry) {
-			pi.appendEntry(SESSION_STATE_ENTRY, { enabled: false } satisfies SessionRelayStateEntry);
+			tryAppendSessionState(false, true);
 		}
 		borderBadge?.sync();
 		await disposeWorkerAsync({ preserveEphemeralDir: true });
@@ -666,62 +775,137 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		let defaultEnabled = loadRelayPreferences().defaultEnabled;
 		let panelTui: { requestRender(): void } | undefined;
 
+		const buildPanel = (
+			theme: Pick<ExtensionContext["ui"]["theme"], "fg" | "bold">,
+			rows: () => number,
+			close: () => void,
+			matches?: (data: string, action: "tui.select.up" | "tui.select.down" | "tui.select.confirm" | "tui.select.cancel") => boolean,
+		) =>
+			new RelayModePanel({
+				theme,
+				rows,
+				matches,
+				getSessionEnabled: () => activeInSession,
+				getDefaultEnabled: () => defaultEnabled,
+				isBusy: () => sessionToggleInFlight,
+				onToggleSession: (next) => {
+					const liveCtx = currentCtx;
+					if (!liveCtx || sessionToggleInFlight || next === activeInSession) return;
+					const expectedSessionSeq = sessionStartSeq;
+					const expectedToggleSeq = ++toggleSeq;
+					sessionToggleInFlight = true;
+					panelTui?.requestRender();
+					const task = next
+						? activateSessionRelay(liveCtx, expectedSessionSeq, expectedToggleSeq, true)
+						: deactivateSessionRelay(expectedSessionSeq, expectedToggleSeq, true);
+					void task
+						.catch((error) => {
+							currentCtx?.ui.notify(
+								`Failed to toggle relay mode: ${error instanceof Error ? error.message : String(error)}`,
+								"error",
+							);
+						})
+						.finally(() => {
+							if (expectedToggleSeq === toggleSeq) {
+								sessionToggleInFlight = false;
+							}
+							borderBadge?.sync();
+							panelTui?.requestRender();
+						});
+				},
+				onToggleDefault: (next) => {
+					try {
+						saveRelayPreferences({ defaultEnabled: next });
+						defaultEnabled = next;
+					} catch (error) {
+						currentCtx?.ui.notify(
+							t("relay.panel.saveFailed", {
+								error: error instanceof Error ? error.message : String(error),
+							}),
+							"error",
+						);
+					}
+					panelTui?.requestRender();
+				},
+				close,
+			});
+
+		const overlayOptions = {
+			anchor: "center" as const,
+			width: 68,
+			maxHeight: "80%" as const,
+			margin: { left: 1, right: 1 },
+		};
+
+		// Prefer direct TUI overlay handle (`handle.hide()`) so closing our panel
+		// removes ONLY our overlay even if another extension (e.g. `list`) opened a
+		// second overlay on top (Pi 0.85.1's ctx.ui.custom `done()` pops stack top).
+		const tui = borderBadge?.getTui();
+		if (tui) {
+			panelTui = tui;
+			let overlay: OverlayHandle | undefined;
+			let closed = false;
+			const closeOverlay = () => {
+				if (closed) return;
+				closed = true;
+				overlay?.hide();
+				overlay = undefined;
+				if (closeActivePanel === closeOverlay) closeActivePanel = undefined;
+				panelOpen = false;
+				panelTui = undefined;
+				borderBadge?.sync();
+				tui.requestRender();
+			};
+			closeActivePanel = closeOverlay;
+			try {
+				const panel = buildPanel(ctx.ui.theme, () => tui.terminal.rows, closeOverlay);
+				overlay = tui.showOverlay(panel, overlayOptions);
+			} catch (error) {
+				closeOverlay();
+				ctx.ui.notify(
+					`Failed to open relay mode panel: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+			}
+			return;
+		}
+
+		// Fallback when border widget has not captured a TUI instance yet.
+		let fallbackDone: (() => void) | undefined;
+		let fallbackHandle: OverlayHandle | undefined;
+		const closeFallback = () => {
+			if (fallbackHandle) {
+				const h = fallbackHandle;
+				fallbackHandle = undefined;
+				h.hide();
+			}
+			fallbackDone?.();
+		};
+		closeActivePanel = closeFallback;
 		try {
 			await ctx.ui.custom<void>(
-				(tui, theme, keys, done) => {
-					panelTui = tui;
-					return new RelayModePanel({
+				(hostTui, theme, keys, done) => {
+					panelTui = hostTui;
+					fallbackDone = done;
+					return buildPanel(
 						theme,
-						rows: () => tui.terminal.rows,
-						matches: (data, action) => keys.matches(data, action),
-						getSessionEnabled: () => activeInSession,
-						getDefaultEnabled: () => defaultEnabled,
-						isBusy: () => sessionToggleInFlight,
-						onToggleSession: (next) => {
-							if (sessionToggleInFlight || next === activeInSession) return;
-							const expectedSessionSeq = sessionStartSeq;
-							const expectedToggleSeq = ++toggleSeq;
-							sessionToggleInFlight = true;
-							panelTui?.requestRender();
-							const task = next
-								? activateSessionRelay(ctx, expectedSessionSeq, expectedToggleSeq, true)
-								: deactivateSessionRelay(expectedSessionSeq, expectedToggleSeq, true);
-							void task.finally(() => {
-								if (expectedToggleSeq === toggleSeq) {
-									sessionToggleInFlight = false;
-								}
-								borderBadge?.sync();
-								panelTui?.requestRender();
-							});
-						},
-						onToggleDefault: (next) => {
-							try {
-								saveRelayPreferences({ defaultEnabled: next });
-								defaultEnabled = next;
-							} catch (error) {
-								ctx.ui.notify(
-									t("relay.panel.saveFailed", {
-										error: error instanceof Error ? error.message : String(error),
-									}),
-									"error",
-								);
-							}
-							panelTui?.requestRender();
-						},
-						close: () => done(),
-					});
+						() => hostTui.terminal.rows,
+						() => done(),
+						(data, action) => keys.matches(data, action),
+					);
 				},
 				{
 					overlay: true,
-					overlayOptions: {
-						anchor: "center",
-						width: 68,
-						maxHeight: "80%",
-						margin: { left: 1, right: 1 },
+					overlayOptions,
+					onHandle: (handle) => {
+						fallbackHandle = handle;
 					},
 				},
 			);
 		} finally {
+			if (closeActivePanel === closeFallback) closeActivePanel = undefined;
+			fallbackDone = undefined;
+			fallbackHandle = undefined;
 			panelOpen = false;
 			panelTui = undefined;
 			borderBadge?.sync();
@@ -731,6 +915,21 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	registerRelayTools(pi, {
 		isActive: () => activeInSession,
 		getWorker: () => worker,
+	});
+
+	// Keyboard fallback (Alt+R) for non-fullscreen / mouse-disabled terminals
+	// without registering any foreground slash commands.
+	pi.registerShortcut("alt+r", {
+		description: t("relay.panel.title"),
+		handler: (ctx) => {
+			currentCtx = ctx;
+			if (!ctx.hasUI || ctx.mode !== "tui") return;
+			if (panelOpen) {
+				closeActivePanel?.();
+			} else {
+				void openRelayModePanel(ctx);
+			}
+		},
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -745,7 +944,18 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 		updateRelayStatusBar(ctx, undefined);
 
+		const incomingSessionId = ctx.sessionManager.getSessionId() || `pid-${process.pid}`;
+		const incomingSessionFile = ctx.sessionManager.getSessionFile();
+		const incomingEphemeral = !incomingSessionFile;
+		const retainedEphemeralToken = incomingEphemeral
+			? shared.ephemeralTokens.get(incomingSessionId)
+			: undefined;
+		const retainedEphemeralKey = retainedEphemeralToken
+			? buildWorkerSessionKey(incomingSessionId, undefined, retainedEphemeralToken)
+			: undefined;
+
 		currentCtx = ctx;
+		currentSessionId = incomingSessionId;
 		activeInSession = false;
 		currentConfig = undefined;
 		milestones = [];
@@ -755,14 +965,32 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		pendingResumeNotice = undefined;
 		promptHookActiveForRun = false;
 		sessionToggleInFlight = false;
-		currentEphemeralToken = undefined;
-		purgeCurrentPreservedEphemeralDir();
+		currentEphemeralToken = retainedEphemeralToken;
+		currentPreservedEphemeralKey = retainedEphemeralKey && shared.preservedEphemeralKeys.has(retainedEphemeralKey)
+			? retainedEphemeralKey
+			: undefined;
+		shared.activeEphemeralKey = retainedEphemeralKey;
+		// Remove stale ephemeral tokens from earlier sessions while keeping the
+		// current session's token across same-session `/reload`.
+		for (const sid of [...shared.ephemeralTokens.keys()]) {
+			if (sid !== incomingSessionId || !incomingEphemeral) {
+				shared.ephemeralTokens.delete(sid);
+			}
+		}
 
+		// Wait for any prior worker teardown (from a prior session or toggle-off)
+		// before cleaning stale ephemeral directories or starting a new worker.
+		const pendingDisposal = retiringDisposalPromise;
+		if (pendingDisposal) {
+			await pendingDisposal.catch(() => undefined);
+			if (seq !== sessionStartSeq) return;
+		}
 		if (prev) {
 			trackGlobalRetiringWorker(prev);
 			await prev.disposeAsync();
 			if (seq !== sessionStartSeq) return;
 		}
+		purgePreservedEphemeralKeys(retainedEphemeralKey);
 		maybeDetachGlobalSignalHandlers();
 
 		if (!ctx.hasUI || ctx.mode !== "tui") {
@@ -783,13 +1011,21 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const shouldEnable = resolveInitialRelayEnabled(sessionOverride, defaultEnabled);
 
 		if (!shouldEnable) {
+			// Record the session's initial inherited state so changing the long-term
+			// default later and running `/reload` never alters this open session.
+			if (sessionOverride === undefined) {
+				tryAppendSessionState(false, false);
+			}
 			hideRelayTools();
 			borderBadge?.sync();
 			return;
 		}
 
 		const tSeq = ++toggleSeq;
-		await activateSessionRelay(ctx, seq, tSeq, false);
+		const activated = await activateSessionRelay(ctx, seq, tSeq, sessionOverride === undefined);
+		if (!activated && sessionOverride === undefined && seq === sessionStartSeq) {
+			tryAppendSessionState(false, false);
+		}
 	});
 
 	pi.on("context", (event) => {
@@ -801,6 +1037,26 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				const rec = msg as unknown as { role?: unknown; customType?: unknown };
 				return !(rec.role === "custom" && (rec.customType === REMIND_TYPE || rec.customType === NOTICE_TYPE));
 			});
+			// If the user disabled relay mode mid-turn after `before_agent_start`
+			// already appended `<relay-mode>` to the active systemPrompt, add a
+			// request-only override so the model immediately stops calling relay_*
+			// tools on remaining turns of this run.
+			if (promptHookActiveForRun) {
+				return {
+					messages: [
+						...filtered,
+						{
+							role: "custom",
+							customType: NOTICE_TYPE,
+							content:
+								"[Relay mode disabled] The user disabled relay mode during this run. " +
+								"Do NOT call any relay_* tools; handle the user's request directly.",
+							display: false,
+							timestamp: Date.now(),
+						} as typeof event.messages[number],
+					],
+				};
+			}
 			if (filtered.length !== event.messages.length) {
 				return { messages: filtered };
 			}
@@ -820,11 +1076,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		});
 		const baseMessages = changed ? cleaned : event.messages;
 
-		// On Pi 0.85.1, idle custom-message wake-up runs skip `before_agent_start`
-		// and clear prior system-prompt overrides at `agent_settled`. Inject a
-		// request-only policy message for any run where `before_agent_start` did not
-		// execute, keeping persisted transcripts and compaction free of duplicated copies.
-		if (!runtimeCaps.runsBeforeAgentStartOnCustomWakeup && !promptHookActiveForRun && currentConfig?.relayPrompt) {
+		// Inject a request-only policy message whenever `before_agent_start` did
+		// not run with relay mode active (e.g. Pi 0.85.1 custom wakeups OR the user
+		// enabled relay mode mid-turn), keeping persisted transcripts clean.
+		if (!promptHookActiveForRun && currentConfig?.relayPrompt) {
 			return {
 				messages: [
 					...baseMessages,
@@ -939,6 +1194,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			clearTimeout(treeNavSafetyTimer);
 			treeNavSafetyTimer = undefined;
 		}
+		// Pi's `navigateTree()` runs `_restoreToolsFromTranscript()`, which can
+		// re-expose or deactivate `relay_*` tools from an older branch. Re-align
+		// them immediately with this session's current relay-mode state.
+		syncRelayToolVisibility();
 		scheduleFlushHeldNotices();
 	});
 
@@ -953,16 +1212,20 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (event) => {
+		const isReload = (event as { reason?: unknown } | undefined)?.reason === "reload";
 		activeInSession = false;
 		disposeBorderBadge();
-		await disposeWorkerAsync();
+		await disposeWorkerAsync({ preserveEphemeralDir: isReload });
 		currentCtx = undefined;
 	});
 
 	installations[SLOT] = () => {
+		// Called when `/reload` installs a fresh extension instance; preserve any
+		// same-session `--no-session` ephemeral dir so the reloaded instance can
+		// reclaim it (and purge it on switch/exit if the session changed).
 		activeInSession = false;
-		disposeWorkerSync();
+		disposeWorkerSync(true);
 		currentCtx = undefined;
 		if (installations[SLOT] !== undefined) delete installations[SLOT];
 	};

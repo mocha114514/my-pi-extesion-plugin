@@ -104,6 +104,7 @@ export interface RelayBorderBadgeOptions {
 
 export interface RelayBorderBadgeHandle {
 	sync(): void;
+	getTui(): TUI | undefined;
 	dispose(): void;
 }
 
@@ -183,6 +184,9 @@ export function createRelayBorderBadge(
 			border?.sync();
 			syncTimer();
 			tui?.requestRender();
+		},
+		getTui() {
+			return disposed ? undefined : tui;
 		},
 		dispose() {
 			if (disposed) return;

@@ -38,6 +38,7 @@ import {
 import {
 	HEARTBEAT_TICK_MS,
 	isPathInsideDir,
+	isSamePath,
 	isPidAlive,
 	LEGACY_LOCK_FILE,
 	MAX_ACTIVITY_ITEMS,
@@ -571,10 +572,21 @@ export class RelayWorkerManager {
 				typeof state.sessionId === "string" && state.sessionId.trim() ? state.sessionId.trim() : undefined;
 			const reportedSessionFile =
 				typeof state.sessionFile === "string" && state.sessionFile.trim() ? state.sessionFile.trim() : undefined;
-			if (reportedSessionFile && !isPathInsideDir(reportedSessionFile, this.dir)) {
+			const isResumableTopLevelSessionFile = (() => {
+				if (!reportedSessionFile) return false;
+				if (!isPathInsideDir(reportedSessionFile, this.dir)) return false;
+				if (!isSamePath(path.dirname(reportedSessionFile), this.dir)) return false;
+				const base = path.basename(reportedSessionFile);
+				if (!base.endsWith(".jsonl")) return false;
+				if (reportedSessionId) {
+					return base === `${reportedSessionId}.jsonl` || base.endsWith(`_${reportedSessionId}.jsonl`) || base.includes(reportedSessionId);
+				}
+				return true;
+			})();
+			if (reportedSessionFile && !isResumableTopLevelSessionFile) {
 				const warningKey = `${reportedSessionId ?? ""}:${reportedSessionFile}`;
 				const msg =
-					`Worker switched to an external session outside its isolated directory (${reportedSessionFile}); ` +
+					`Worker switched to a non-resumable or external session path (${reportedSessionFile}); ` +
 					`restart will return to the isolated relay session.`;
 				this.meta.lastError = msg;
 				if (this.externalSessionWarnedFor !== warningKey) {
@@ -1314,6 +1326,15 @@ export class RelayWorkerManager {
 				: "";
 
 			if (disposition === "handled") {
+				// Extension slash commands (e.g. ctx.newSession()) can switch the worker's
+				// active session without starting an agent turn; refresh meta promptly so
+				// a subsequent toggle-off or restart resumes the updated session.
+				if (this.client === client && client.alive) {
+					await Promise.race([
+						this.refreshStateFromRpc(client),
+						new Promise<void>((resolve) => setTimeout(resolve, 1_500)),
+					]);
+				}
 				return `Handled by a worker extension (check relay_status if it started a background turn).${noticesSuffix}`;
 			}
 			if (disposition === "queued") {
@@ -1716,11 +1737,21 @@ export class RelayWorkerManager {
 
 	async disposeAsync(options?: { preserveEphemeralDir?: boolean }): Promise<void> {
 		const removeEphemeralDir = !options?.preserveEphemeralDir;
+		const liveClientForRefresh = !removeEphemeralDir && !this.disposed ? this.client : undefined;
 		if (!this.disposed) {
 			this.disposed = true;
 			this.generation += 1;
 		}
 		if (this.syncDisposed || this.cleanupCompleted) return;
+		if (liveClientForRefresh?.alive) {
+			// Best-effort bounded metadata sync before preserving worker history on
+			// mid-session toggle-off or /reload so any in-worker session switch is saved.
+			await Promise.race([
+				this.refreshStateFromRpc(liveClientForRefresh),
+				new Promise<void>((resolve) => setTimeout(resolve, 1_000)),
+			]);
+			if (this.syncDisposed || this.cleanupCompleted) return;
+		}
 		const hadOwnership = this.dirLock.ownsDirectory;
 		let stopped = await this.cleanupClient(false, 15_000);
 		if (this.syncDisposed || this.cleanupCompleted) return;

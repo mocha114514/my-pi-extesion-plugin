@@ -166,8 +166,12 @@ export function normalizeWindowsShellPath(filePath: string): string {
 }
 
 export function isPathInsideDir(targetPath: string, baseDir: string): boolean {
-	const rel = path.relative(canonicalizeFsPath(baseDir), canonicalizeFsPath(targetPath));
-	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+	const canonBase = canonicalizeFsPath(baseDir);
+	const canonTarget = canonicalizeFsPath(targetPath);
+	// Preserve exact case from canonicalizeFsPath() so case-sensitive NTFS
+	// sibling directories on Windows cannot fold into `baseDir` via path.relative().
+	const prefix = canonBase.endsWith(path.sep) ? canonBase : `${canonBase}${path.sep}`;
+	return canonTarget.length > prefix.length && canonTarget.startsWith(prefix);
 }
 
 export function isSamePath(a: string, b: string): boolean {

@@ -70,10 +70,15 @@ export class WorkerDirectoryLock {
 			let legacyMainSessionFile: string | undefined;
 			const metaPath = path.join(legacyWorker, META_FILE);
 			if (fs.existsSync(metaPath)) {
-				const parsedMeta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Partial<WorkerMeta>;
-				if (typeof parsedMeta.cwd === "string") legacyCwd = parsedMeta.cwd;
-				if (typeof parsedMeta.mainSessionFile === "string" && parsedMeta.mainSessionFile.trim()) {
-					legacyMainSessionFile = parsedMeta.mainSessionFile;
+				try {
+					const parsedMeta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as Partial<WorkerMeta>;
+					if (typeof parsedMeta.cwd === "string") legacyCwd = parsedMeta.cwd;
+					if (typeof parsedMeta.mainSessionFile === "string" && parsedMeta.mainSessionFile.trim()) {
+						legacyMainSessionFile = parsedMeta.mainSessionFile;
+					}
+				} catch {
+					// Corrupted legacy metadata falls back to JSONL header scanning below
+					// instead of tripping transient renameSync retry blocking.
 				}
 			}
 			if (!legacyCwd) {

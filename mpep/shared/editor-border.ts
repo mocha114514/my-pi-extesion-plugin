@@ -145,6 +145,15 @@ function mountEditor(editor: CustomEditor): BorderMount {
 			return originalRenderBottom.call(this, width, hidden);
 		}
 		const available = width - suffixWidth;
+		// When the editor is scrolled and hides lines below, yield the bottom
+		// border back to Pi's native `↓ N more` scroll indicator if sharing the
+		// row would truncate the scroll indicator itself.
+		if (hidden > 0) {
+			const minScrollWidth = visibleWidth(` ↓ ${hidden} more `) + 2;
+			if (available < minScrollWidth && width >= minScrollWidth) {
+				return originalRenderBottom.call(this, width, hidden);
+			}
+		}
 		const base = originalRenderBottom.call(this, available, hidden);
 		const clipped = truncateToWidth(base, available, "");
 		const padding = Math.max(0, available - visibleWidth(clipped));

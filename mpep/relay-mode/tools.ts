@@ -99,7 +99,19 @@ function requireWorker(host: RelayToolsHost, ctx: ExtensionContext): RelayWorker
 }
 
 export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void {
-	pi.registerTool({
+	// Register relay tools as `deferred` on Pi >= 1.5 so inactive/default-off
+	// sessions do not activate them on registration or have to call
+	// `pi.setActiveTools()` (which would clear `_pendingToolNames` for lazily
+	// reconnecting MCP servers). Pi 0.85.1 ignores the extra `exposure` field
+	// and falls back to `hideRelayTools()`.
+	const registerRelayTool: ExtensionAPI["registerTool"] = (definition) => {
+		pi.registerTool({
+			...definition,
+			exposure: "deferred",
+		} as typeof definition);
+	};
+
+	registerRelayTool({
 		name: "relay_send",
 		label: "Relay Send",
 		description:
@@ -145,7 +157,7 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 		},
 	});
 
-	pi.registerTool({
+	registerRelayTool({
 		name: "relay_status",
 		label: "Relay Status",
 		description:
@@ -227,7 +239,7 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 		},
 	});
 
-	pi.registerTool({
+	registerRelayTool({
 		name: "relay_control",
 		label: "Relay Control",
 		description:
@@ -258,7 +270,7 @@ export function registerRelayTools(pi: ExtensionAPI, host: RelayToolsHost): void
 		},
 	});
 
-	pi.registerTool({
+	registerRelayTool({
 		name: "relay_approval",
 		label: "Relay Approval",
 		description:

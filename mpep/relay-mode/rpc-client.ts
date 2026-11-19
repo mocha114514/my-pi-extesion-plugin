@@ -80,6 +80,7 @@ export class RelayRpcClient {
 	private lastUnixSnapshot:
 		| { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> }
 		| undefined;
+	private rootStartId: string | undefined;
 	private snapshotRefreshInFlight = false;
 
 	alive = false;
@@ -143,6 +144,8 @@ export class RelayRpcClient {
 			detached: process.platform !== "win32",
 		});
 		this.proc = proc;
+		this.rootStartId = undefined;
+		this.lastUnixSnapshot = undefined;
 		if (typeof proc.pid === "number") {
 			onSpawn?.(proc.pid);
 			this.refreshUnixSnapshotAsync();
@@ -614,6 +617,7 @@ export class RelayRpcClient {
 		const proc = this.proc;
 		if (!this.isProcessRunning(proc) || proc.pid === undefined) return;
 		const rootPid = proc.pid;
+		const expectedRootStartId = this.rootStartId;
 		const psBin = ["/bin/ps", "/usr/bin/ps"].find((p) => fs.existsSync(p));
 		if (!psBin) return;
 		this.snapshotRefreshInFlight = true;
@@ -627,8 +631,24 @@ export class RelayRpcClient {
 				const rows = this.parseUnixProcessTable(stdout);
 				if (rows.length === 0) return;
 				const snap = this.buildUnixDescendantsSnapshot(rootPid, rows);
-				if (snap.rootStartId || snap.pids.size > 0 || snap.pgids.size > 0) {
-					this.lastUnixSnapshot = this.mergeUnixSnapshots(this.lastUnixSnapshot, snap);
+				const stillLive = this.isProcessRunning(proc);
+				// Never trust a late scan whose root PID now belongs to a different
+				// process birth timestamp, or a first-ever scan arriving after the
+				// worker already exited (PID could already have been recycled).
+				if (expectedRootStartId) {
+					if (snap.rootStartId && snap.rootStartId !== expectedRootStartId) return;
+				} else if (snap.rootStartId) {
+					if (!stillLive) return;
+					this.rootStartId = snap.rootStartId;
+				}
+				const merged = this.mergeUnixSnapshots(this.lastUnixSnapshot, snap, rows);
+				if (merged && (merged.rootStartId || merged.pids.size > 0 || merged.pgids.size > 0)) {
+					this.lastUnixSnapshot = merged;
+				}
+				// If the worker exited while this verified scan was in flight, reap
+				// any surviving verified descendants that `proc.on("exit")` missed.
+				if (!stillLive && merged && (merged.pids.size > 0 || merged.pgids.size > 0)) {
+					this.reapUnixSnapshot(merged);
 				}
 			},
 		);
@@ -731,19 +751,40 @@ export class RelayRpcClient {
 	private mergeUnixSnapshots(
 		a?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
 		b?: { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> },
+		liveRows?: Array<{ pid: number; ppid: number; pgid: number; startId: string }>,
 	): { rootPid: number; rootStartId?: string; pids: Map<number, string>; pgids: Map<number, Set<number>> } | undefined {
 		if (!a) return b;
 		if (!b) return a;
-		const pids = new Map(a.pids);
+		// When a fresh process table is available, prune already-exited entries from
+		// prior scans so long-lived workers do not accumulate dead PIDs unboundedly,
+		// while preserving still-living reparented descendants with verified startIds.
+		const liveByPid = liveRows ? new Map(liveRows.map((r) => [r.pid, r])) : undefined;
+		const pids = new Map<number, string>();
+		for (const [k, v] of a.pids) {
+			if (!liveByPid || liveByPid.get(k)?.startId === v) {
+				pids.set(k, v);
+			}
+		}
 		for (const [k, v] of b.pids) pids.set(k, v);
 		const pgids = new Map<number, Set<number>>();
-		for (const [pgid, set] of a.pgids) pgids.set(pgid, new Set(set));
+		for (const [pgid, set] of a.pgids) {
+			for (const p of set) {
+				if (p === a.rootPid || pids.has(p)) {
+					let target = pgids.get(pgid);
+					if (!target) {
+						target = new Set<number>();
+						pgids.set(pgid, target);
+					}
+					target.add(p);
+				}
+			}
+		}
 		for (const [pgid, set] of b.pgids) {
 			const target = pgids.get(pgid) ?? new Set<number>();
 			for (const p of set) target.add(p);
 			pgids.set(pgid, target);
 		}
-		return { rootPid: a.rootPid, rootStartId: b.rootStartId ?? a.rootStartId, pids, pgids };
+		return { rootPid: a.rootPid, rootStartId: a.rootStartId ?? b.rootStartId, pids, pgids };
 	}
 
 	private reapUnixSnapshot(snapshot: {

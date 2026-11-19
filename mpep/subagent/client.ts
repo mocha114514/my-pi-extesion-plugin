@@ -525,11 +525,10 @@ export class RpcSubprocess {
 				} else if (pid !== undefined) {
 					const liveStartId = capturedRootStartId ? this.readUnixStartId(pid) : undefined;
 					if (!capturedRootStartId || liveStartId === undefined || liveStartId === capturedRootStartId) {
-						// When `ps` is unavailable (`unixSnapshot === null`), we cannot
-						// verify descendant identities after the leader exits; force-kill
-						// the process group immediately while Node still confirms `proc`
-						// owns `pid`, so surviving helpers cannot escape escalation.
-						process.kill(-pid, unixSnapshot === null ? "SIGKILL" : "SIGTERM");
+						// Always send SIGTERM first (even when `ps` is unavailable) so Pi's
+						// own SIGTERM handler can cleanly kill any detached Bash tool subtrees
+						// it tracks before the 1.5s SIGKILL escalation runs.
+						process.kill(-pid, "SIGTERM");
 					}
 				}
 			} catch {
