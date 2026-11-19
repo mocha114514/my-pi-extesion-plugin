@@ -105,6 +105,10 @@ export function configFilePath(): string {
 	return join(relayModeRoot(), "relay-mode.md");
 }
 
+export function preferencesFilePath(): string {
+	return join(relayModeRoot(), "preferences.json");
+}
+
 export function sessionsDir(): string {
 	return join(relayModeRoot(), "sessions");
 }

@@ -13,7 +13,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { formatCompactDuration } from "../shared/duration.ts";
 import { formatLatestTurns, formatNodeDetail, formatTreeIndex } from "./tree.ts";
-import type { RelayWorkerManager } from "./worker.ts";
+import type { RelayWorkerManager } from "./worker/index.ts";
 
 export interface RelayToolsHost {
 	isActive(): boolean;

@@ -18,8 +18,10 @@ interface BorderStatus {
 interface EditorInternals {
 	workingStatusIndicator?: BorderStatus;
 	ctrlCPending?: boolean;
+	renderedVisibleLineCount?: number;
 	borderColor(text: string): string;
 	renderTopBorder(width: number, hiddenLineCount: number): string;
+	renderBottomBorder(width: number, hiddenLineCount: number): string;
 }
 
 interface LayoutBox {
@@ -35,7 +37,7 @@ export interface EditorAnchor {
 }
 
 export interface EditorBorderContribution {
-	position: "idle-left" | "right";
+	position: "idle-left" | "right" | "bottom-right";
 	label(): string;
 	onClick?(event: TuiMouseEvent): void;
 }
@@ -73,7 +75,7 @@ function findEditor(components: readonly Component[]): CustomEditor | undefined 
 
 function restoreMethod(
 	editor: CustomEditor,
-	name: "renderTopBorder" | "handleMouse",
+	name: "renderTopBorder" | "renderBottomBorder" | "handleMouse",
 	wrapper: unknown,
 	descriptor: PropertyDescriptor | undefined,
 ): boolean {
@@ -88,11 +90,14 @@ function mountEditor(editor: CustomEditor): BorderMount {
 	if (existing) return existing;
 	const internals = editor as unknown as EditorInternals;
 	const originalRender = internals.renderTopBorder;
+	const originalRenderBottom = internals.renderBottomBorder;
 	const originalMouse = editor.handleMouse;
 	const renderDescriptor = Object.getOwnPropertyDescriptor(editor, "renderTopBorder");
+	const bottomDescriptor = Object.getOwnPropertyDescriptor(editor, "renderBottomBorder");
 	const mouseDescriptor = Object.getOwnPropertyDescriptor(editor, "handleMouse");
 	const contributions = new Map<symbol, EditorBorderContribution>();
 	let hit: { start: number; end: number; contribution: EditorBorderContribution } | undefined;
+	let bottomHit: { row: number; start: number; end: number; contribution: EditorBorderContribution } | undefined;
 
 	const render = function (this: EditorInternals, width: number, hidden: number): string {
 		hit = undefined;
@@ -127,20 +132,54 @@ function mountEditor(editor: CustomEditor): BorderMount {
 		return clipped + this.borderColor("─".repeat(padding) + " ") + rightLabel + this.borderColor(" ──");
 	};
 
+	const renderBottom = function (this: EditorInternals, width: number, hidden: number): string {
+		bottomHit = undefined;
+		if (contributions.size === 0) {
+			return originalRenderBottom.call(this, width, hidden);
+		}
+		const bottomRight = [...contributions.values()].findLast(value => value.position === "bottom-right");
+		const label = bottomRight?.label() ?? "";
+		const labelWidth = visibleWidth(label);
+		const suffixWidth = labelWidth + 4;
+		if (!bottomRight || labelWidth <= 0 || width < suffixWidth + 5) {
+			return originalRenderBottom.call(this, width, hidden);
+		}
+		const available = width - suffixWidth;
+		const base = originalRenderBottom.call(this, available, hidden);
+		const clipped = truncateToWidth(base, available, "");
+		const padding = Math.max(0, available - visibleWidth(clipped));
+		const visibleRows = typeof this.renderedVisibleLineCount === "number" && this.renderedVisibleLineCount >= 0
+			? this.renderedVisibleLineCount
+			: 1;
+		// Row 0 is the top border, rows 1..visibleRows are editor content lines,
+		// so the bottom border always occupies row `visibleRows + 1` even when
+		// autocomplete renders additional rows beneath it.
+		bottomHit = {
+			row: visibleRows + 1,
+			start: available + 1,
+			end: available + 1 + labelWidth,
+			contribution: bottomRight,
+		};
+		return clipped + this.borderColor("─".repeat(padding) + " ") + label + this.borderColor(" ──");
+	};
+
 	const handleMouse = function (
 		this: CustomEditor,
 		event: TuiMouseEvent,
 	): TuiMouseEventResult | undefined {
-		if (
-			hit && event.button === "left" && event.y === 0 &&
-			event.x >= hit.start && event.x < hit.end && hit.contribution.onClick
-		) {
+		const target =
+			hit && event.y === 0 && event.x >= hit.start && event.x < hit.end
+				? hit
+				: bottomHit && event.y === bottomHit.row && event.x >= bottomHit.start && event.x < bottomHit.end
+					? bottomHit
+					: undefined;
+		if (target && event.button === "left" && target.contribution.onClick) {
 			// Claim the press before fullscreen word selection sees it. Otherwise a
 			// quick second click inside the label may copy text instead of toggling.
 			if (event.type === "press") return { handled: true, capture: true, focus: false };
 			if (event.type === "release" || event.type === "drag") return { handled: true, focus: false };
 			if (event.type === "click") {
-				hit.contribution.onClick(event);
+				target.contribution.onClick(event);
 				return { handled: true, focus: false };
 			}
 		}
@@ -148,18 +187,29 @@ function mountEditor(editor: CustomEditor): BorderMount {
 	};
 
 	internals.renderTopBorder = render;
+	internals.renderBottomBorder = renderBottom;
 	editor.handleMouse = handleMouse;
 	const mount: BorderMount = {
 		contributions,
 		remove(token) {
-			if (hit?.contribution === contributions.get(token)) hit = undefined;
+			const removed = contributions.get(token);
+			if (hit?.contribution === removed) hit = undefined;
+			if (bottomHit?.contribution === removed) bottomHit = undefined;
 			contributions.delete(token);
 			if (contributions.size > 0) return;
 			hit = undefined;
-			// Restore both hooks together. If another extension wrapped either one,
+			bottomHit = undefined;
+			// Restore all hooks together. If another extension wrapped any one,
 			// leave a dormant mount so later attachment reuses that wrapper chain.
-			if (internals.renderTopBorder !== render || editor.handleMouse !== handleMouse) return;
+			if (
+				internals.renderTopBorder !== render ||
+				internals.renderBottomBorder !== renderBottom ||
+				editor.handleMouse !== handleMouse
+			) {
+				return;
+			}
 			restoreMethod(editor, "renderTopBorder", render, renderDescriptor);
+			restoreMethod(editor, "renderBottomBorder", renderBottom, bottomDescriptor);
 			restoreMethod(editor, "handleMouse", handleMouse, mouseDescriptor);
 			mounts.delete(editor);
 		},
