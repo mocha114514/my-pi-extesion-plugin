@@ -568,9 +568,12 @@ export class RelayWorkerManager {
 
 	private async refreshStateFromRpc(
 		client: RelayRpcClient,
-		options?: { includeStats?: boolean },
+		options?: { includeStats?: boolean; requireIdle?: boolean; retryBudget?: number },
 	): Promise<void> {
 		const includeStats = options?.includeStats !== false;
+		const requireIdle = options?.requireIdle === true;
+		const retryBudget = options?.retryBudget ?? 1;
+		const genBefore = this.runGeneration;
 		try {
 			const state = await client.getState();
 			if (this.client !== client) return;
@@ -617,23 +620,40 @@ export class RelayWorkerManager {
 			if (typeof state.thinkingLevel === "string") {
 				this.meta.thinking = state.thinkingLevel;
 			}
+			const workerStreaming = Boolean(state.isStreaming);
+			// Deferred idle-only retries must never sample stats while a run is
+			// actively streaming (an assistant `message_end` may already be on disk
+			// before `turn_end` increments `this.turns`).
+			if (requireIdle && workerStreaming) {
+				this.pendingStatsHydration = true;
+				return;
+			}
 			// Hydrate session stats when requested OR when an idle worker just
 			// switched to a new session (e.g. via an extension slash command calling
 			// `ctx.newSession()`), while still skipping stats during streaming turns
 			// so an in-flight turn is never double-counted on `turn_end`.
 			const idleAfterSessionSwitch = switchedSession && state.isStreaming === false;
 			if (!includeStats && !idleAfterSessionSwitch) return;
-			const statsRunGen = this.runGeneration;
 			const statsSessionId = this.meta.sessionId;
 			const stats = await client.getSessionStats();
 			if (this.client !== client) return;
 			if (this.meta.sessionId !== statsSessionId) return;
-			// If a worker run started (or progressed) between `get_state` and
-			// `get_session_stats`, discard this snapshot so an assistant message
-			// persisted at `message_end` is not counted again on `turn_end`, and
-			// re-hydrate once the worker returns to idle.
-			if (this.runGeneration !== statsRunGen || (!includeStats && this.status !== "idle")) {
-				this.pendingStatsHydration = true;
+			// If actual run activity occurred across `get_state` / `get_session_stats`,
+			// discard this snapshot so an assistant message persisted at `message_end`
+			// is never counted again on `turn_end`. Defer until quiescent if running,
+			// or resample directly if already quiescent (e.g. `idle` or `error`).
+			const strictIdleStats = requireIdle || !includeStats;
+			const quiescent = this.status === "idle" || this.status === "error";
+			if (strictIdleStats && (this.runGeneration !== genBefore || !quiescent)) {
+				if (quiescent && retryBudget > 0) {
+					void this.refreshStateFromRpc(client, {
+						includeStats: true,
+						requireIdle: true,
+						retryBudget: retryBudget - 1,
+					});
+				} else {
+					this.pendingStatsHydration = true;
+				}
 				return;
 			}
 			this.pendingStatsHydration = false;
@@ -671,9 +691,9 @@ export class RelayWorkerManager {
 		if (this.status === next) return;
 		this.status = next;
 		this.hooks.onStateChange();
-		if (next === "idle" && this.pendingStatsHydration && this.client && !this.disposed) {
+		if ((next === "idle" || next === "error") && this.pendingStatsHydration && this.client && !this.disposed) {
 			this.pendingStatsHydration = false;
-			void this.refreshStateFromRpc(this.client, { includeStats: true });
+			void this.refreshStateFromRpc(this.client, { includeStats: true, requireIdle: true });
 		}
 	}
 
@@ -709,8 +729,15 @@ export class RelayWorkerManager {
 			case "summarization_retry_scheduled":
 			case "summarization_retry_attempt_start":
 			case "summarization_retry_finished": {
-				if (event.type === "turn_start" || event.type === "message_end") {
+				// Advance `runGeneration` only on real run activity (not passive custom
+				// messages emitted via `message_end` while idle).
+				if (event.type === "turn_start") {
 					this.runGeneration += 1;
+				} else if (event.type === "message_end") {
+					const role = (event.message as { role?: unknown } | undefined)?.role;
+					if (role === "assistant") {
+						this.runGeneration += 1;
+					}
 				}
 				this.touchHeartbeat();
 				break;

@@ -76,6 +76,13 @@ interface SharedLifecycleState {
 	preservedEphemeralKeys: Set<string>;
 	ephemeralTokens: Map<string, string>;
 	sessionStateFallback: Map<string, SessionStateFallbackRecord | boolean>;
+	/**
+	 * Track unsaved Pi 0.85.1 leaf entry IDs independently from
+	 * `sessionStateFallback` so that a successful retry on another persisted
+	 * branch clears the pending value while still remembering the broken
+	 * in-memory entry ID if the user navigates back to it via `/tree`.
+	 */
+	unsafeLegacyLeafIdsBySession: Map<string, Set<string>>;
 	preservedPendingToolsBySession: Map<string, Set<string>>;
 	activeEphemeralKey: string | undefined;
 	exitListener: (() => void) | undefined;
@@ -95,6 +102,7 @@ function getSharedLifecycle(): SharedLifecycleState {
 			preservedEphemeralKeys: new Set<string>(),
 			ephemeralTokens: new Map<string, string>(),
 			sessionStateFallback: new Map<string, SessionStateFallbackRecord | boolean>(),
+			unsafeLegacyLeafIdsBySession: new Map<string, Set<string>>(),
 			preservedPendingToolsBySession: new Map<string, Set<string>>(),
 			activeEphemeralKey: undefined,
 			exitListener: undefined,
@@ -105,6 +113,7 @@ function getSharedLifecycle(): SharedLifecycleState {
 		if (!state.preservedEphemeralKeys) state.preservedEphemeralKeys = new Set<string>();
 		if (!state.ephemeralTokens) state.ephemeralTokens = new Map<string, string>();
 		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, SessionStateFallbackRecord | boolean>();
+		if (!state.unsafeLegacyLeafIdsBySession) state.unsafeLegacyLeafIdsBySession = new Map<string, Set<string>>();
 		if (!state.preservedPendingToolsBySession) state.preservedPendingToolsBySession = new Map<string, Set<string>>();
 	}
 	return state;
@@ -249,22 +258,50 @@ function getNormalizedSessionFallback(
 }
 
 /**
+ * Record an unsaved Pi 0.85.1 entry ID in the session-scoped hazard set so it
+ * survives subsequent successful retries on other persisted branches.
+ */
+function recordUnsafeLegacyLeafId(sessionId: string | undefined, leafId: string): void {
+	if (!sessionId || !leafId) return;
+	const map = getSharedLifecycle().unsafeLegacyLeafIdsBySession;
+	let set = map.get(sessionId);
+	if (!set) {
+		set = new Set<string>();
+		map.set(sessionId, set);
+	}
+	set.add(leafId);
+}
+
+/**
  * Determine whether appending to the current branch on Pi 0.85.1 would attach
  * a child to an unsaved in-memory entry created by an earlier failed append.
- * Navigating (`/tree`) back to a persisted ancestor or sibling branch clears
- * the hazard for that branch so subsequent writes succeed safely.
+ * Checks both the active fallback record AND the durable session-scoped set of
+ * failed entry IDs so navigating (`/tree`) back to a previously failed node
+ * remains guarded even after a later write succeeded on a persisted branch.
  */
 function isCurrentBranchUnsafeLegacy(
+	sessionId: string | undefined,
 	record: SessionStateFallbackRecord | undefined,
 	ctx: ExtensionContext | undefined,
 ): boolean {
-	if (!record?.unsafeLegacyLeaf) return false;
-	if (record.unsafeSessionWide || !record.failedEntryIds || record.failedEntryIds.length === 0) {
+	if (record?.unsafeLegacyLeaf && record.unsafeSessionWide) {
 		return true;
+	}
+	const failedSet = new Set<string>();
+	if (sessionId) {
+		const tracked = getSharedLifecycle().unsafeLegacyLeafIdsBySession.get(sessionId);
+		if (tracked) {
+			for (const id of tracked) failedSet.add(id);
+		}
+	}
+	if (record?.unsafeLegacyLeaf && record.failedEntryIds) {
+		for (const id of record.failedEntryIds) failedSet.add(id);
+	}
+	if (failedSet.size === 0) {
+		return Boolean(record?.unsafeLegacyLeaf);
 	}
 	if (!ctx) return true;
 	try {
-		const failedSet = new Set(record.failedEntryIds);
 		const branch = ctx.sessionManager.getBranch?.() ?? [];
 		for (const entry of branch) {
 			const id = (entry as { id?: unknown } | undefined)?.id;
@@ -293,10 +330,10 @@ function readSessionRelayState(
 	// - On Pi >= 1.5 (`unsafeLegacyLeaf: false`), SessionManager rolled back the
 	//   in-memory leaf, so retrying `appendEntry()` once storage recovers is safe.
 	// - On Pi 0.85.1 (`unsafeLegacyLeaf: true`), allow retrying ONLY when the
-	//   current branch no longer contains the unsaved failed entry (e.g. after `/tree`).
+	//   current branch no longer contains any unsaved failed entry (e.g. after `/tree`).
 	const fallback = getNormalizedSessionFallback(sessionId, hostRollsBackFailedAppend);
 	if (fallback) {
-		const blockedOnBranch = isCurrentBranchUnsafeLegacy(fallback, ctx);
+		const blockedOnBranch = isCurrentBranchUnsafeLegacy(sessionId, fallback, ctx);
 		return { value: fallback.enabled, needsPersistence: !blockedOnBranch };
 	}
 	try {
@@ -323,13 +360,16 @@ function readSessionRelayState(
 /**
  * Replay the current branch's recorded system-message tool deltas (matching Pi's
  * `transcript.ts` order: `toolsRemoved` before `toolsAdded` so schema/description
- * updates to the same tool name retain the tool) and return restored non-relay
- * tools that are not yet active (including both still-unregistered MCP tools and
- * registered-but-`hidden` disabled MCP tools awaiting reconnection).
+ * updates to the same tool name retain the tool) and return ONLY still-pending
+ * non-relay candidates: tools that are either not yet registered OR registered
+ * with `exposure === "hidden"` (e.g. disconnected MCP servers). Explicitly
+ * excludes registered, non-hidden tools (such as built-ins deliberately disabled
+ * by the user before toggling relay mode).
  */
 function findPendingBranchTools(
 	ctx: ExtensionContext | undefined,
-	activeNonRelay: ReadonlySet<string>,
+	pi: ExtensionAPI,
+	activeOrRevivedNonRelay: ReadonlySet<string>,
 ): string[] {
 	if (!ctx) return [];
 	try {
@@ -358,7 +398,19 @@ function findPendingBranchTools(
 			}
 		}
 		if (restored.size === 0) return [];
-		return [...restored].filter((name) => !activeNonRelay.has(name));
+		const exposureByName = new Map<string, string | undefined>();
+		for (const tool of pi.getAllTools?.() ?? []) {
+			exposureByName.set(tool.name, (tool as { exposure?: string }).exposure);
+		}
+		return [...restored].filter((name) => {
+			if (activeOrRevivedNonRelay.has(name)) return false;
+			// If the tool is already registered and NOT hidden, it is a visible tool
+			// that was deliberately deactivated—never classify it as pending.
+			if (exposureByName.has(name) && exposureByName.get(name) !== "hidden") {
+				return false;
+			}
+			return true;
+		});
 	} catch {
 		return [];
 	}
@@ -500,6 +552,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	installations[SLOT]?.();
 
 	if (!isPluginEnabled("relay-mode")) {
+		// While the extension is disabled, branch navigations or runs may occur
+		// unobserved; immediately discard any carried pending-tool handoff so a
+		// later re-enable + `/reload` never replays stale tool names.
+		getSharedLifecycle().preservedPendingToolsBySession.clear();
 		// Even while disabled, strip historical relay-mode reminders/notices from
 		// replayed transcripts so they never direct a non-relay session, and clean
 		// up any preserved ephemeral worker state carried over from a reload before
@@ -518,6 +574,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			// Drop any preserved ephemeral state not belonging to an active session
 			// (the plugin is disabled, so no session needs preserved worker dirs).
 			shared.activeEphemeralKey = undefined;
+			shared.preservedPendingToolsBySession.clear();
 			for (const sid of [...shared.ephemeralTokens.keys()]) {
 				if (!incomingSessionId || sid !== incomingSessionId) {
 					shared.ephemeralTokens.delete(sid);
@@ -526,6 +583,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 			for (const sid of [...shared.sessionStateFallback.keys()]) {
 				if (!incomingSessionId || sid !== incomingSessionId) {
 					shared.sessionStateFallback.delete(sid);
+				}
+			}
+			for (const sid of [...shared.unsafeLegacyLeafIdsBySession.keys()]) {
+				if (!incomingSessionId || sid !== incomingSessionId) {
+					shared.unsafeLegacyLeafIdsBySession.delete(sid);
 				}
 			}
 			purgePreservedEphemeralKeys();
@@ -697,7 +759,10 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		const revivedNonRelay = after.some((name) => !RELAY_TOOL_NAMES.has(name) && !beforeNonRelay.has(name));
 		if (revivedNonRelay) {
 			if (transcriptLoadoutRestored) {
-				for (const pending of findPendingBranchTools(currentCtx, beforeNonRelay)) {
+				const activeOrRevivedNonRelay = new Set(
+					after.filter((name) => !RELAY_TOOL_NAMES.has(name)),
+				);
+				for (const pending of findPendingBranchTools(currentCtx, pi, activeOrRevivedNonRelay)) {
 					preservedPendingTools.add(pending);
 				}
 			}
@@ -753,16 +818,22 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 	const tryAppendSessionState = (enabled: boolean, notifyOnError: boolean): boolean => {
 		const shared = getSharedLifecycle();
 		// Normalize any legacy bare-boolean record first, then check whether the
-		// current branch still contains an unsaved failed entry on Pi 0.85.1.
+		// current branch contains any unsaved failed entry on Pi 0.85.1 (including
+		// IDs remembered from earlier failures even after a retry succeeded elsewhere).
 		const existingFallback = getNormalizedSessionFallback(
 			currentSessionId,
 			runtimeCaps.hasSettleCredentialWrites,
 		);
-		if (isCurrentBranchUnsafeLegacy(existingFallback, currentCtx)) {
-			if (currentSessionId && existingFallback) {
+		if (isCurrentBranchUnsafeLegacy(currentSessionId, existingFallback, currentCtx)) {
+			if (currentSessionId) {
+				const trackedIds = shared.unsafeLegacyLeafIdsBySession.get(currentSessionId);
 				shared.sessionStateFallback.set(currentSessionId, {
-					...existingFallback,
 					enabled,
+					unsafeLegacyLeaf: true,
+					failedEntryIds: trackedIds && trackedIds.size > 0
+						? [...trackedIds]
+						: existingFallback?.failedEntryIds,
+					unsafeSessionWide: existingFallback?.unsafeSessionWide,
 				});
 			}
 			return false;
@@ -771,23 +842,27 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		try {
 			pi.appendEntry(SESSION_STATE_ENTRY, { enabled } satisfies SessionRelayStateEntry);
 			if (currentSessionId) {
+				// Clear only the pending fallback value; keep `unsafeLegacyLeafIdsBySession`
+				// intact so navigating back to an earlier failed node via `/tree` stays guarded.
 				shared.sessionStateFallback.delete(currentSessionId);
 			}
 			return true;
 		} catch (error) {
 			// Retain an in-process session-scoped fallback across `/reload` so a
 			// failed disk/session write never silently flips this open session back.
-			// On Pi 0.85.1, record the exact unsaved leaf ID (when advanced) so
-			// writes remain blocked on this branch while `/tree` back to a persisted
-			// ancestor or sibling branch can write safely again.
+			// On Pi 0.85.1, record the exact unsaved leaf ID (when advanced) both in
+			// the fallback record and in `unsafeLegacyLeafIdsBySession` so writes
+			// stay blocked on that node even if another branch later writes safely.
 			if (currentSessionId) {
 				const legacyHost = !runtimeCaps.hasSettleCredentialWrites;
 				const leafAfterAppend = legacyHost ? (currentCtx?.sessionManager.getLeafId?.() ?? null) : null;
-				const priorIds = existingFallback?.failedEntryIds ?? [];
-				const nextFailedIds =
-					legacyHost && typeof leafAfterAppend === "string" && leafAfterAppend !== leafBeforeAppend
-						? [...new Set([...priorIds, leafAfterAppend])]
-						: [...priorIds];
+				if (legacyHost && typeof leafAfterAppend === "string" && leafAfterAppend !== leafBeforeAppend) {
+					recordUnsafeLegacyLeafId(currentSessionId, leafAfterAppend);
+				}
+				const trackedIds = shared.unsafeLegacyLeafIdsBySession.get(currentSessionId);
+				const nextFailedIds = trackedIds && trackedIds.size > 0
+					? [...trackedIds]
+					: [...(existingFallback?.failedEntryIds ?? [])];
 				const unsafeSessionWide = legacyHost
 					? Boolean(existingFallback?.unsafeSessionWide || nextFailedIds.length === 0)
 					: false;
@@ -888,6 +963,7 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 				if (currentSessionId) {
 					shared.ephemeralTokens.delete(currentSessionId);
 					shared.sessionStateFallback.delete(currentSessionId);
+					shared.unsafeLegacyLeafIdsBySession.delete(currentSessionId);
 				}
 				shared.activeEphemeralKey = undefined;
 				purgeCurrentPreservedEphemeralDir();
@@ -1306,6 +1382,11 @@ export default function relayModeExtension(pi: ExtensionAPI): void {
 		for (const sid of [...shared.sessionStateFallback.keys()]) {
 			if (sid !== incomingSessionId) {
 				shared.sessionStateFallback.delete(sid);
+			}
+		}
+		for (const sid of [...shared.unsafeLegacyLeafIdsBySession.keys()]) {
+			if (sid !== incomingSessionId) {
+				shared.unsafeLegacyLeafIdsBySession.delete(sid);
 			}
 		}
 

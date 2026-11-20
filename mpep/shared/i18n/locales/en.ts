@@ -302,6 +302,7 @@ export const en = {
   "relay.status.abnormal": "Relay: {status}",
   "relay.panel.title": "Relay Mode",
   "relay.panel.sessionToggle": "Current session relay mode",
+  "relay.panel.sessionOneWayTag": "cannot turn off",
   "relay.panel.sessionDesc": "Applies to this session immediately. Note: once enabled in a session, relay mode stays locked on and cannot be turned off.",
   "relay.panel.sessionDescLocked": "Relay mode is active in this session and cannot be turned off, preserving context continuity and prompt cache stability.",
   "relay.panel.sessionLocked": "locked",

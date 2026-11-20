@@ -175,7 +175,7 @@ export class RelayModePanel implements Component {
 					? `${t("relay.panel.sessionToggle")} (${t("relay.panel.updating")})`
 					: sessionEnabled
 						? `${t("relay.panel.sessionToggle")} (${t("relay.panel.sessionLocked")})`
-						: t("relay.panel.sessionToggle"),
+						: `${t("relay.panel.sessionToggle")} (${t("relay.panel.sessionOneWayTag")})`,
 				desc: sessionEnabled
 					? t("relay.panel.sessionDescLocked")
 					: t("relay.panel.sessionDesc"),
