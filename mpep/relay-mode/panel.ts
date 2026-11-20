@@ -237,16 +237,31 @@ export class RelayModePanel implements Component {
 				if (framed && visibleWidth(tagText) <= compactInteriorWidth) {
 					return { heading: `${head}${baseLabel}`, extraTagLines: [{ text: tagText, compact: true }] };
 				}
-				const wrapped = wrapTextWithAnsi(tagText, compactInteriorWidth);
+				// Drop outer parentheses when the bare warning text fits cleanly on one
+				// compact row (e.g. 20×9 where `cannot turn off` is 15 cells <= 16).
+				if (visibleWidth(tag) <= compactInteriorWidth) {
+					return {
+						heading: `${head}${baseLabel}`,
+						extraTagLines: [{ text: tag, compact: framed && visibleWidth(tag) > innerWidth }],
+					};
+				}
+				const wrapped = wrapTextWithAnsi(tag, compactInteriorWidth);
 				if (wrapped.length <= spareRows) {
 					return {
 						heading: `${head}${baseLabel}`,
 						extraTagLines: wrapped.map((line) => ({ text: line, compact: framed })),
 					};
 				}
+				const kept = wrapped.slice(0, spareRows);
+				const overflow = wrapped.slice(spareRows).join(" ");
+				kept[kept.length - 1] = truncateToWidth(
+					`${kept[kept.length - 1]!} ${overflow}`,
+					compactInteriorWidth,
+					"…",
+				);
 				return {
 					heading: `${head}${baseLabel}`,
-					extraTagLines: wrapped.slice(0, spareRows).map((line) => ({ text: line, compact: framed })),
+					extraTagLines: kept.map((line) => ({ text: line, compact: framed })),
 				};
 			}
 			const suffix = ` (${tag})`;
