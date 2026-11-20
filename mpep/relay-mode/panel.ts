@@ -192,25 +192,45 @@ export class RelayModePanel implements Component {
 			},
 		];
 
+		// Base rows without any wrapped tag/description lines:
+		// header (1) + 2 toggle headings (2) + separator (framed?1:0) + Done (1) + bottom border (framed?1:0).
+		const minimalBaseLines = 1 + 2 + (framed ? 1 : 0) + 1 + (framed ? 1 : 0);
+		const canUseExtraTagLine = minimalBaseLines + 1 <= maxLines;
+
 		// Format a toggle heading so critical trailing tags (such as the
-		// irreversible-enable warning) keep priority over the base label on
-		// narrow compact terminals where description lines are omitted.
-		const formatHeading = (prefix: string, badge: string, baseLabel: string, tag?: string): string => {
+		// irreversible-enable warning) keep priority on narrow compact terminals.
+		// When both the label and tag cannot fit on one line, move the complete
+		// tag onto a dedicated second line if a spare row exists instead of
+		// dropping the session label or clipping the warning.
+		const formatHeading = (
+			prefix: string,
+			badge: string,
+			baseLabel: string,
+			tag?: string,
+		): { heading: string; extraTagLine?: string } => {
 			const head = `${prefix}${badge} `;
-			if (!tag) return `${head}${baseLabel}`;
+			if (!tag) return { heading: `${head}${baseLabel}` };
 			const full = `${head}${baseLabel} (${tag})`;
-			if (visibleWidth(full) <= innerWidth) return full;
+			if (visibleWidth(full) <= innerWidth) return { heading: full };
 			const suffix = ` (${tag})`;
 			const labelBudget = innerWidth - visibleWidth(head) - visibleWidth(suffix);
 			if (labelBudget >= 4) {
-				return `${head}${truncateToWidth(baseLabel, labelBudget, "…")}${suffix}`;
+				return { heading: `${head}${truncateToWidth(baseLabel, labelBudget, "…")}${suffix}` };
+			}
+			if (canUseExtraTagLine) {
+				const tagText = `(${tag})`;
+				const indentForTag = visibleWidth(tagText) + 2 <= innerWidth ? "  " : "";
+				return {
+					heading: `${head}${baseLabel}`,
+					extraTagLine: `${indentForTag}${tagText}`,
+				};
 			}
 			const compactSuffix = `(${tag})`;
 			const compactBudget = innerWidth - visibleWidth(head) - visibleWidth(compactSuffix);
 			if (compactBudget >= 2) {
-				return `${head}${truncateToWidth(baseLabel, compactBudget, "…")}${compactSuffix}`;
+				return { heading: `${head}${truncateToWidth(baseLabel, compactBudget, "…")}${compactSuffix}` };
 			}
-			return `${head}${compactSuffix}`;
+			return { heading: `${head}${compactSuffix}` };
 		};
 
 		// Compute wrapped descriptions up front so we can gracefully degrade
@@ -223,17 +243,19 @@ export class RelayModePanel implements Component {
 			const prefix = this.selectedIndex === item.index ? "→ " : "  ";
 			const indent = " ".repeat(Math.min(Math.max(0, innerWidth - 1), visibleWidth(prefix) + visibleWidth(badge) + 1));
 			const descBudget = Math.max(1, innerWidth - indent.length);
+			const formatted = formatHeading(prefix, badge, item.baseLabel, item.priorityTag);
 			return {
 				...item,
-				heading: formatHeading(prefix, badge, item.baseLabel, item.priorityTag),
+				heading: formatted.heading,
+				extraTagLine: formatted.extraTagLine,
 				indent,
 				wrappedDesc: wrapTextWithAnsi(item.desc, descBudget),
 				singleDesc: truncateToWidth(item.desc, descBudget, "…"),
 			};
 		});
 
-		// Base rows: header (1) + 2 toggle headings (2) + separator (framed?1:0) + Done (1) + bottom border (framed?1:0).
-		const baseLines = 1 + 2 + (framed ? 1 : 0) + 1 + (framed ? 1 : 0);
+		const extraTagLines = items.reduce((sum, item) => sum + (item.extraTagLine ? 1 : 0), 0);
+		const baseLines = minimalBaseLines + extraTagLines;
 		const fullDescLines = items[0]!.wrappedDesc.length + items[1]!.wrappedDesc.length;
 		let descMode: "full" | "single" | "none" = "full";
 		let includeSpacer = true;
@@ -263,6 +285,10 @@ export class RelayModePanel implements Component {
 			const headingColor = selected ? "accent" : item.enabled ? "success" : "text";
 			this.hitRows.set(lines.length, item.index);
 			lines.push(frame(theme.fg(headingColor, item.heading)));
+			if (item.extraTagLine) {
+				this.hitRows.set(lines.length, item.index);
+				lines.push(frame(theme.fg(headingColor, item.extraTagLine)));
+			}
 
 			if (descMode === "full") {
 				for (const wrapped of item.wrappedDesc) {

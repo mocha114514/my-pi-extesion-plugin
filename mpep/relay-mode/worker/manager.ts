@@ -144,6 +144,7 @@ export class RelayWorkerManager {
 	private generation = 0;
 	private runGeneration = 0;
 	private pendingStatsHydration = false;
+	private statsHydrationBackoffMs = 250;
 	private startingClient: RelayRpcClient | undefined;
 	private retiringClient: RelayRpcClient | undefined;
 	private startupPromise: Promise<void> | undefined;
@@ -672,6 +673,7 @@ export class RelayWorkerManager {
 				return;
 			}
 			this.pendingStatsHydration = false;
+			this.statsHydrationBackoffMs = 250;
 			if (this.statsHydrationTimer) {
 				clearTimeout(this.statsHydrationTimer);
 				this.statsHydrationTimer = undefined;
@@ -689,7 +691,16 @@ export class RelayWorkerManager {
 				this.turns = stats.assistantMessages;
 			}
 		} catch {
-			// State hydration is best-effort.
+			// Preserve `pendingStatsHydration` across transient RPC timeouts/errors
+			// and re-arm a coalesced backoff retry while the same client stays quiescent.
+			if (this.pendingStatsHydration && this.client === client && !this.disposed) {
+				const quiescent = this.status === "idle" || this.status === "error";
+				if (quiescent) {
+					const delay = this.statsHydrationBackoffMs;
+					this.statsHydrationBackoffMs = Math.min(this.statsHydrationBackoffMs * 2, 5_000);
+					this.schedulePendingStatsHydration(client, delay);
+				}
+			}
 		}
 	}
 
@@ -712,7 +723,8 @@ export class RelayWorkerManager {
 			this.statsHydrationTimer = undefined;
 			if (this.disposed || this.client !== client || !this.pendingStatsHydration) return;
 			if (this.status !== "idle" && this.status !== "error") return;
-			this.pendingStatsHydration = false;
+			// Keep `pendingStatsHydration` set until `refreshStateFromRpc` actually
+			// applies a valid snapshot so transient RPC failures remain recoverable.
 			void this.refreshStateFromRpc(client, { includeStats: true, requireIdle: true });
 		}, delayMs);
 		this.statsHydrationTimer.unref?.();
@@ -723,11 +735,11 @@ export class RelayWorkerManager {
 		this.status = next;
 		this.hooks.onStateChange();
 		if ((next === "idle" || next === "error") && this.pendingStatsHydration && this.client && !this.disposed) {
-			this.pendingStatsHydration = false;
 			if (this.statsHydrationTimer) {
 				clearTimeout(this.statsHydrationTimer);
 				this.statsHydrationTimer = undefined;
 			}
+			this.statsHydrationBackoffMs = 250;
 			void this.refreshStateFromRpc(this.client, { includeStats: true, requireIdle: true });
 		}
 	}
