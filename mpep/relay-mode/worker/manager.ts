@@ -693,12 +693,15 @@ export class RelayWorkerManager {
 		} catch {
 			// Preserve `pendingStatsHydration` across transient RPC timeouts/errors
 			// and re-arm a coalesced backoff retry while the same client stays quiescent.
+			// Advance backoff ONLY when this call actually arms a new timer so
+			// overlapping failures do not skip intermediate retry intervals.
 			if (this.pendingStatsHydration && this.client === client && !this.disposed) {
 				const quiescent = this.status === "idle" || this.status === "error";
 				if (quiescent) {
 					const delay = this.statsHydrationBackoffMs;
-					this.statsHydrationBackoffMs = Math.min(this.statsHydrationBackoffMs * 2, 5_000);
-					this.schedulePendingStatsHydration(client, delay);
+					if (this.schedulePendingStatsHydration(client, delay)) {
+						this.statsHydrationBackoffMs = Math.min(this.statsHydrationBackoffMs * 2, 5_000);
+					}
 				}
 			}
 		}
@@ -717,8 +720,8 @@ export class RelayWorkerManager {
 		this.probeFailStreak = 0;
 	}
 
-	private schedulePendingStatsHydration(client: RelayRpcClient, delayMs = 250): void {
-		if (this.disposed || this.client !== client || this.statsHydrationTimer) return;
+	private schedulePendingStatsHydration(client: RelayRpcClient, delayMs = 250): boolean {
+		if (this.disposed || this.client !== client || this.statsHydrationTimer) return false;
 		this.statsHydrationTimer = setTimeout(() => {
 			this.statsHydrationTimer = undefined;
 			if (this.disposed || this.client !== client || !this.pendingStatsHydration) return;
@@ -728,6 +731,7 @@ export class RelayWorkerManager {
 			void this.refreshStateFromRpc(client, { includeStats: true, requireIdle: true });
 		}, delayMs);
 		this.statsHydrationTimer.unref?.();
+		return true;
 	}
 
 	private setStatus(next: WorkerStatus): void {

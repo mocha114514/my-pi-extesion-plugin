@@ -51,7 +51,6 @@ export class RelayModePanel implements Component {
 	private contentLeft = 0;
 	private contentRight = 0;
 	private closed = false;
-	private lastClickedIndex: number | undefined;
 	private readonly options: RelayModePanelOptions;
 
 	constructor(options: RelayModePanelOptions) {
@@ -125,10 +124,12 @@ export class RelayModePanel implements Component {
 			return { handled: true, focus: true, render: false };
 		}
 		if (event.type === "click") {
-			if ((event.clickCount ?? 1) > 1 && this.lastClickedIndex === index) {
+			// Suppress multi-click continuations (`clickCount > 1`) unconditionally
+			// so a double-click cannot activate a different row that shifted under
+			// the pointer after the first click reflowed the modal.
+			if ((event.clickCount ?? 1) > 1) {
 				return { handled: true, render: false };
 			}
-			this.lastClickedIndex = index;
 			this.selectedIndex = index;
 			this.activate();
 			// If activate() closed the panel (e.g. clicking Done), do not reclaim
@@ -157,6 +158,16 @@ export class RelayModePanel implements Component {
 			const clipped = truncateToWidth(text, innerWidth, "…");
 			return framed
 				? `${border("│")} ${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))} ${border("│")}`
+				: clipped;
+		};
+		// Compact frame without the 1-cell horizontal padding, used only when a
+		// standalone warning tag fits inside the box interior (`width - 2`) but
+		// would otherwise be clipped by `innerWidth` (`width - 4`).
+		const compactInteriorWidth = framed ? Math.max(1, width - 2) : innerWidth;
+		const frameCompact = (text: string) => {
+			const clipped = truncateToWidth(text, compactInteriorWidth, "…");
+			return framed
+				? `${border("│")}${clipped}${" ".repeat(Math.max(0, compactInteriorWidth - visibleWidth(clipped)))}${border("│")}`
 				: clipped;
 		};
 
@@ -195,42 +206,60 @@ export class RelayModePanel implements Component {
 		// Base rows without any wrapped tag/description lines:
 		// header (1) + 2 toggle headings (2) + separator (framed?1:0) + Done (1) + bottom border (framed?1:0).
 		const minimalBaseLines = 1 + 2 + (framed ? 1 : 0) + 1 + (framed ? 1 : 0);
-		const canUseExtraTagLine = minimalBaseLines + 1 <= maxLines;
+		const spareRows = Math.max(0, maxLines - minimalBaseLines);
 
-		// Format a toggle heading so critical trailing tags (such as the
-		// irreversible-enable warning) keep priority on narrow compact terminals.
-		// When both the label and tag cannot fit on one line, move the complete
-		// tag onto a dedicated second line if a spare row exists instead of
-		// dropping the session label or clipping the warning.
+		// Format a toggle heading so both the session label and critical trailing
+		// tags (such as the irreversible-enable warning) remain readable on narrow
+		// terminals. When the combined heading does not fit on one line, prefer a
+		// dedicated tag row whenever a spare row is available instead of severely
+		// abbreviating the session label; reclaim frame padding or wrap within
+		// available rows if the terminal is narrower than the tag itself.
 		const formatHeading = (
 			prefix: string,
 			badge: string,
 			baseLabel: string,
 			tag?: string,
-		): { heading: string; extraTagLine?: string } => {
+		): { heading: string; extraTagLines: Array<{ text: string; compact?: boolean }> } => {
 			const head = `${prefix}${badge} `;
-			if (!tag) return { heading: `${head}${baseLabel}` };
+			if (!tag) return { heading: `${head}${baseLabel}`, extraTagLines: [] };
 			const full = `${head}${baseLabel} (${tag})`;
-			if (visibleWidth(full) <= innerWidth) return { heading: full };
+			if (visibleWidth(full) <= innerWidth) {
+				return { heading: full, extraTagLines: [] };
+			}
+			if (spareRows >= 1) {
+				const tagText = `(${tag})`;
+				if (visibleWidth(tagText) + 2 <= innerWidth) {
+					return { heading: `${head}${baseLabel}`, extraTagLines: [{ text: `  ${tagText}` }] };
+				}
+				if (visibleWidth(tagText) <= innerWidth) {
+					return { heading: `${head}${baseLabel}`, extraTagLines: [{ text: tagText }] };
+				}
+				if (framed && visibleWidth(tagText) <= compactInteriorWidth) {
+					return { heading: `${head}${baseLabel}`, extraTagLines: [{ text: tagText, compact: true }] };
+				}
+				const wrapped = wrapTextWithAnsi(tagText, compactInteriorWidth);
+				if (wrapped.length <= spareRows) {
+					return {
+						heading: `${head}${baseLabel}`,
+						extraTagLines: wrapped.map((line) => ({ text: line, compact: framed })),
+					};
+				}
+				return {
+					heading: `${head}${baseLabel}`,
+					extraTagLines: wrapped.slice(0, spareRows).map((line) => ({ text: line, compact: framed })),
+				};
+			}
 			const suffix = ` (${tag})`;
 			const labelBudget = innerWidth - visibleWidth(head) - visibleWidth(suffix);
 			if (labelBudget >= 4) {
-				return { heading: `${head}${truncateToWidth(baseLabel, labelBudget, "…")}${suffix}` };
-			}
-			if (canUseExtraTagLine) {
-				const tagText = `(${tag})`;
-				const indentForTag = visibleWidth(tagText) + 2 <= innerWidth ? "  " : "";
-				return {
-					heading: `${head}${baseLabel}`,
-					extraTagLine: `${indentForTag}${tagText}`,
-				};
+				return { heading: `${head}${truncateToWidth(baseLabel, labelBudget, "…")}${suffix}`, extraTagLines: [] };
 			}
 			const compactSuffix = `(${tag})`;
 			const compactBudget = innerWidth - visibleWidth(head) - visibleWidth(compactSuffix);
 			if (compactBudget >= 2) {
-				return { heading: `${head}${truncateToWidth(baseLabel, compactBudget, "…")}${compactSuffix}` };
+				return { heading: `${head}${truncateToWidth(baseLabel, compactBudget, "…")}${compactSuffix}`, extraTagLines: [] };
 			}
-			return { heading: `${head}${compactSuffix}` };
+			return { heading: `${head}${compactSuffix}`, extraTagLines: [] };
 		};
 
 		// Compute wrapped descriptions up front so we can gracefully degrade
@@ -247,15 +276,15 @@ export class RelayModePanel implements Component {
 			return {
 				...item,
 				heading: formatted.heading,
-				extraTagLine: formatted.extraTagLine,
+				extraTagLines: formatted.extraTagLines,
 				indent,
 				wrappedDesc: wrapTextWithAnsi(item.desc, descBudget),
 				singleDesc: truncateToWidth(item.desc, descBudget, "…"),
 			};
 		});
 
-		const extraTagLines = items.reduce((sum, item) => sum + (item.extraTagLine ? 1 : 0), 0);
-		const baseLines = minimalBaseLines + extraTagLines;
+		const extraTagLineCount = items.reduce((sum, item) => sum + item.extraTagLines.length, 0);
+		const baseLines = minimalBaseLines + extraTagLineCount;
 		const fullDescLines = items[0]!.wrappedDesc.length + items[1]!.wrappedDesc.length;
 		let descMode: "full" | "single" | "none" = "full";
 		let includeSpacer = true;
@@ -285,9 +314,13 @@ export class RelayModePanel implements Component {
 			const headingColor = selected ? "accent" : item.enabled ? "success" : "text";
 			this.hitRows.set(lines.length, item.index);
 			lines.push(frame(theme.fg(headingColor, item.heading)));
-			if (item.extraTagLine) {
+			for (const tagLine of item.extraTagLines) {
 				this.hitRows.set(lines.length, item.index);
-				lines.push(frame(theme.fg(headingColor, item.extraTagLine)));
+				lines.push(
+					tagLine.compact
+						? frameCompact(theme.fg(headingColor, tagLine.text))
+						: frame(theme.fg(headingColor, tagLine.text)),
+				);
 			}
 
 			if (descMode === "full") {
