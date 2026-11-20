@@ -166,16 +166,18 @@ export class RelayModePanel implements Component {
 		const busy = this.options.isBusy();
 
 		const sessionEnabled = this.options.getSessionEnabled();
+		const sessionTag = busy
+			? t("relay.panel.updating")
+			: sessionEnabled
+				? t("relay.panel.sessionLocked")
+				: t("relay.panel.sessionOneWayTag");
 		const toggles = [
 			{
 				index: 0,
 				enabled: sessionEnabled,
 				locked: sessionEnabled,
-				label: busy
-					? `${t("relay.panel.sessionToggle")} (${t("relay.panel.updating")})`
-					: sessionEnabled
-						? `${t("relay.panel.sessionToggle")} (${t("relay.panel.sessionLocked")})`
-						: `${t("relay.panel.sessionToggle")} (${t("relay.panel.sessionOneWayTag")})`,
+				baseLabel: t("relay.panel.sessionToggle"),
+				priorityTag: sessionTag,
 				desc: sessionEnabled
 					? t("relay.panel.sessionDescLocked")
 					: t("relay.panel.sessionDesc"),
@@ -184,10 +186,32 @@ export class RelayModePanel implements Component {
 				index: 1,
 				enabled: this.options.getDefaultEnabled(),
 				locked: false,
-				label: t("relay.panel.defaultToggle"),
+				baseLabel: t("relay.panel.defaultToggle"),
+				priorityTag: undefined as string | undefined,
 				desc: t("relay.panel.defaultDesc"),
 			},
 		];
+
+		// Format a toggle heading so critical trailing tags (such as the
+		// irreversible-enable warning) keep priority over the base label on
+		// narrow compact terminals where description lines are omitted.
+		const formatHeading = (prefix: string, badge: string, baseLabel: string, tag?: string): string => {
+			const head = `${prefix}${badge} `;
+			if (!tag) return `${head}${baseLabel}`;
+			const full = `${head}${baseLabel} (${tag})`;
+			if (visibleWidth(full) <= innerWidth) return full;
+			const suffix = ` (${tag})`;
+			const labelBudget = innerWidth - visibleWidth(head) - visibleWidth(suffix);
+			if (labelBudget >= 4) {
+				return `${head}${truncateToWidth(baseLabel, labelBudget, "…")}${suffix}`;
+			}
+			const compactSuffix = `(${tag})`;
+			const compactBudget = innerWidth - visibleWidth(head) - visibleWidth(compactSuffix);
+			if (compactBudget >= 2) {
+				return `${head}${truncateToWidth(baseLabel, compactBudget, "…")}${compactSuffix}`;
+			}
+			return `${head}${compactSuffix}`;
+		};
 
 		// Compute wrapped descriptions up front so we can gracefully degrade
 		// spacing/hint/descriptions when terminal height is tight while keeping
@@ -201,8 +225,7 @@ export class RelayModePanel implements Component {
 			const descBudget = Math.max(1, innerWidth - indent.length);
 			return {
 				...item,
-				badge,
-				prefix,
+				heading: formatHeading(prefix, badge, item.baseLabel, item.priorityTag),
 				indent,
 				wrappedDesc: wrapTextWithAnsi(item.desc, descBudget),
 				singleDesc: truncateToWidth(item.desc, descBudget, "…"),
@@ -237,10 +260,9 @@ export class RelayModePanel implements Component {
 
 		for (const item of items) {
 			const selected = this.selectedIndex === item.index;
-			const heading = `${item.prefix}${item.badge} ${item.label}`;
 			const headingColor = selected ? "accent" : item.enabled ? "success" : "text";
 			this.hitRows.set(lines.length, item.index);
-			lines.push(frame(theme.fg(headingColor, heading)));
+			lines.push(frame(theme.fg(headingColor, item.heading)));
 
 			if (descMode === "full") {
 				for (const wrapped of item.wrappedDesc) {

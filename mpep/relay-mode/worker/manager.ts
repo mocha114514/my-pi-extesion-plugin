@@ -152,6 +152,7 @@ export class RelayWorkerManager {
 	private opQueue: Promise<unknown> = Promise.resolve();
 	private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	private settleTimer: ReturnType<typeof setTimeout> | undefined;
+	private statsHydrationTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly approvals = new WorkerApprovalBroker();
 	private compactWaiters = new Map<string, (status: string) => void>();
 	private promptErrorWaiter: ((event: RpcEvent, formatted: string) => void) | undefined;
@@ -621,11 +622,18 @@ export class RelayWorkerManager {
 				this.meta.thinking = state.thinkingLevel;
 			}
 			const workerStreaming = Boolean(state.isStreaming);
+			const quiescent = this.status === "idle" || this.status === "error";
 			// Deferred idle-only retries must never sample stats while a run is
 			// actively streaming (an assistant `message_end` may already be on disk
 			// before `turn_end` increments `this.turns`).
 			if (requireIdle && workerStreaming) {
 				this.pendingStatsHydration = true;
+				// If the manager itself is currently quiescent (e.g. Pi 1.5.2 is
+				// preparing a run that may fail before emitting `agent_start`),
+				// schedule a coalesced recheck so the flag is never stranded.
+				if (quiescent) {
+					this.schedulePendingStatsHydration(client);
+				}
 				return;
 			}
 			// Hydrate session stats when requested OR when an idle worker just
@@ -638,14 +646,15 @@ export class RelayWorkerManager {
 			const stats = await client.getSessionStats();
 			if (this.client !== client) return;
 			if (this.meta.sessionId !== statsSessionId) return;
-			// If actual run activity occurred across `get_state` / `get_session_stats`,
-			// discard this snapshot so an assistant message persisted at `message_end`
-			// is never counted again on `turn_end`. Defer until quiescent if running,
-			// or resample directly if already quiescent (e.g. `idle` or `error`).
+			// Always reject stats whenever real run activity (`runGeneration`)
+			// crossed `get_state` / `get_session_stats` (even on ordinary startup or
+			// post-compaction refreshes) so an assistant message persisted at
+			// `message_end` is never double-counted on `turn_end`.
 			const strictIdleStats = requireIdle || !includeStats;
-			const quiescent = this.status === "idle" || this.status === "error";
-			if (strictIdleStats && (this.runGeneration !== genBefore || !quiescent)) {
-				if (quiescent && retryBudget > 0) {
+			const nowQuiescent = this.status === "idle" || this.status === "error";
+			const generationChanged = this.runGeneration !== genBefore;
+			if (generationChanged || (strictIdleStats && !nowQuiescent)) {
+				if (nowQuiescent && retryBudget > 0) {
 					void this.refreshStateFromRpc(client, {
 						includeStats: true,
 						requireIdle: true,
@@ -653,10 +662,20 @@ export class RelayWorkerManager {
 					});
 				} else {
 					this.pendingStatsHydration = true;
+					// When already quiescent (no future transition into idle/error is
+					// guaranteed), schedule a coalesced delayed recheck so deferred
+					// stats hydration can never stall indefinitely.
+					if (nowQuiescent) {
+						this.schedulePendingStatsHydration(client);
+					}
 				}
 				return;
 			}
 			this.pendingStatsHydration = false;
+			if (this.statsHydrationTimer) {
+				clearTimeout(this.statsHydrationTimer);
+				this.statsHydrationTimer = undefined;
+			}
 			const contextUsage = stats.contextUsage as { tokens?: unknown; contextWindow?: unknown } | undefined;
 			if (typeof contextUsage?.tokens === "number") {
 				this.contextTokens = contextUsage.tokens;
@@ -687,12 +706,28 @@ export class RelayWorkerManager {
 		this.probeFailStreak = 0;
 	}
 
+	private schedulePendingStatsHydration(client: RelayRpcClient, delayMs = 250): void {
+		if (this.disposed || this.client !== client || this.statsHydrationTimer) return;
+		this.statsHydrationTimer = setTimeout(() => {
+			this.statsHydrationTimer = undefined;
+			if (this.disposed || this.client !== client || !this.pendingStatsHydration) return;
+			if (this.status !== "idle" && this.status !== "error") return;
+			this.pendingStatsHydration = false;
+			void this.refreshStateFromRpc(client, { includeStats: true, requireIdle: true });
+		}, delayMs);
+		this.statsHydrationTimer.unref?.();
+	}
+
 	private setStatus(next: WorkerStatus): void {
 		if (this.status === next) return;
 		this.status = next;
 		this.hooks.onStateChange();
 		if ((next === "idle" || next === "error") && this.pendingStatsHydration && this.client && !this.disposed) {
 			this.pendingStatsHydration = false;
+			if (this.statsHydrationTimer) {
+				clearTimeout(this.statsHydrationTimer);
+				this.statsHydrationTimer = undefined;
+			}
 			void this.refreshStateFromRpc(this.client, { includeStats: true, requireIdle: true });
 		}
 	}
@@ -1186,6 +1221,10 @@ export class RelayWorkerManager {
 		if (this.settleTimer) {
 			clearTimeout(this.settleTimer);
 			this.settleTimer = undefined;
+		}
+		if (this.statsHydrationTimer) {
+			clearTimeout(this.statsHydrationTimer);
+			this.statsHydrationTimer = undefined;
 		}
 		this.cancelPendingApprovals();
 		for (const detach of this.detachListeners) detach();

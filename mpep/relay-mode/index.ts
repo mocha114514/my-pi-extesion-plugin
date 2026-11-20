@@ -113,7 +113,17 @@ function getSharedLifecycle(): SharedLifecycleState {
 		if (!state.preservedEphemeralKeys) state.preservedEphemeralKeys = new Set<string>();
 		if (!state.ephemeralTokens) state.ephemeralTokens = new Map<string, string>();
 		if (!state.sessionStateFallback) state.sessionStateFallback = new Map<string, SessionStateFallbackRecord | boolean>();
-		if (!state.unsafeLegacyLeafIdsBySession) state.unsafeLegacyLeafIdsBySession = new Map<string, Set<string>>();
+		if (!state.unsafeLegacyLeafIdsBySession) {
+			state.unsafeLegacyLeafIdsBySession = new Map<string, Set<string>>();
+			// Live-upgrade migration: seed the new hazard map from any structured
+			// fallback records already retained in `sessionStateFallback` before
+			// any read or retry can overwrite or delete them.
+			for (const [sid, raw] of state.sessionStateFallback) {
+				if (raw && typeof raw === "object" && Array.isArray(raw.failedEntryIds) && raw.failedEntryIds.length > 0) {
+					state.unsafeLegacyLeafIdsBySession.set(sid, new Set(raw.failedEntryIds));
+				}
+			}
+		}
 		if (!state.preservedPendingToolsBySession) state.preservedPendingToolsBySession = new Map<string, Set<string>>();
 	}
 	return state;
@@ -252,6 +262,13 @@ function getNormalizedSessionFallback(
 		return migrated;
 	}
 	if (raw && typeof raw.enabled === "boolean") {
+		if (raw.unsafeLegacyLeaf && Array.isArray(raw.failedEntryIds)) {
+			for (const id of raw.failedEntryIds) {
+				if (typeof id === "string" && id) {
+					recordUnsafeLegacyLeafId(sessionId, id);
+				}
+			}
+		}
 		return raw;
 	}
 	return undefined;
